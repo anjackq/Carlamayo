@@ -12,7 +12,7 @@ IMG_HEIGHT = 1080
 IMG_WIDTH = 1920
 IMG_CHANNELS = 3
 # Offscreen Epic rendering can flicker heavily with CARLA camera postprocess bloom/exposure.
-CAMERA_ENABLE_POSTPROCESS_EFFECTS = False
+CAMERA_ENABLE_POSTPROCESS_EFFECTS = True
 NUM_HISTORY = 16
 NUM_FRAMES = 4
 NUM_TRAJ_SAMPLES = 1
