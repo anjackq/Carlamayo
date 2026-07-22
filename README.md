@@ -44,6 +44,79 @@ The closed-loop runner supports `normal`, `navigation`, and `vqa` modes through
 - [Navigation Mode](docs/navigation-mode.md)
 - [VQA Mode](docs/vqa-mode.md)
 
+### Current Safe Closed-Loop Baseline
+
+The current prototype implements a conservative, auditable closed-loop baseline:
+
+- Each accepted observation contains one exact CARLA snapshot and four images
+  with the same frame ID and simulation timestamp. The canonical Alpamayo camera
+  order is front-left, front-wide, front-right, and front-tele, with camera IDs
+  `[0, 1, 2, 6]` and nominal FOVs `[120, 120, 120, 30]` degrees.
+- A selected 64-point Alpamayo trajectory is validated and transformed from the
+  source ego pose into fixed CARLA world coordinates once. Its waypoints retain
+  the source-simulation timestamps `+0.1` through `+6.4` seconds; the path is not
+  re-anchored as the ego vehicle moves.
+- The controller follows monotonic progress along that fixed-world path. Speed
+  comes from timestamped waypoint spacing, and a stationary or repeated terminal
+  tail can produce a real deceleration and full stop. Missing, malformed,
+  misaligned, stale, or exhausted plans command braking instead of throttle.
+- A stop-only safety shield checks the path and nearby vehicles/pedestrians using
+  the exact CARLA snapshot. An unsafe result, unknown input, or adapter failure
+  applies a latched emergency brake and is recorded separately from the
+  controller request.
+- With `--telemetry-jsonl PATH`, every proposal is auditable through an
+  `alpamayo_proposal` event containing the full, untruncated CoC text, its SHA-256
+  digest, source identity, and candidate trajectory. The same JSONL stream links
+  that proposal ID to validation events and to tick events containing the
+  controller request, final applied control, and safety-override reasons.
+
+The runner defaults to synchronous inference; `--async` is opt-in. In normal and
+navigation modes, inference is scheduled no more often than once per 1.0 second
+of CARLA simulation time after the initial four-frame warm-up. Synchronous model
+inference blocks the next world tick, so wall-clock time may be much longer while
+simulation-time source age remains stable.
+
+A bounded, telemetry-enabled baseline run is:
+
+```bash
+python carlamayo_closed_loop.py \
+  --telemetry-jsonl runs/baseline/runtime.jsonl \
+  --max-episode-seconds 60
+```
+
+#### Closed-Loop Artifacts
+
+| Artifact | Default location |
+|----------|------------------|
+| Recorded front-wide view (H.264 when `ffmpeg` is available) | `./carla_alpamayo_closed_loop_result.mp4` |
+| Live JPEG preview | `./carla_alpamayo_closed_loop_latest.jpg` |
+| Recorded Pygame window, with `--pygame-ui` | `./carla_alpamayo_closed_loop_result_pygame_ui.mp4` |
+| Runtime and full-CoC audit log | The path passed to `--telemetry-jsonl` |
+
+Set `CARLAMAYO_OUTPUT_VIDEO` and `CARLAMAYO_LIVE_PREVIEW_IMAGE` to move the video
+and preview. The provided Slurm script writes the video, preview, and
+`runtime.jsonl` under `/home/aqiu/carlamayo-runs/<SLURM_JOB_ID>/`; its CARLA server
+log remains in the repository root as `carla-server-<SLURM_JOB_ID>.log`.
+
+#### Important Limitations
+
+This remains a research integration prototype, not a production autonomous-
+driving stack. In particular:
+
+- there is no destination-aware route planner or automatic route-to-prompt
+  generation;
+- traffic lights, stop signs, right-of-way, and other traffic rules are not
+  handled as driving policy;
+- `NUM_TRAJ_SAMPLES` is currently `1`, so multi-candidate safety ranking and
+  rerouting around hazards are not implemented;
+- the safety shield is a privileged CARLA-ground-truth integration layer, not an
+  onboard perception system or evidence that Alpamayo itself made a safe choice;
+- the current video/Pygame overlay labels `ALPAMAYO PROPOSAL`,
+  `CONTROLLER EXECUTION`, and `SAFETY OVERRIDE`, but the planned four-camera,
+  CoC, BEV, and telemetry dashboard is not yet complete; and
+- the deterministic fixed-route CARLA release gate in the implementation plan
+  has not yet been run and passed.
+
 ## Project Structure
 
 ```
@@ -64,7 +137,9 @@ The closed-loop runner supports `normal`, `navigation`, and `vqa` modes through
 └── requirements-carla.txt       # CARLA 0.9.16 data-collection/runtime packages.
 ```
 
-Generated data and videos such as `carla_data/` and `carla_alpamayo_*.mp4` are ignored by git.
+Generated data, the standard video/preview patterns, and `runs/` are ignored by
+git. Put telemetry and other large runtime artifacts under `runs/` (or outside
+the repository) to keep them out of commits.
 
 ## Troubleshooting
 

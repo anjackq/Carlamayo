@@ -4,12 +4,74 @@ import math
 import queue
 import random
 import time
+from dataclasses import dataclass, field
+from typing import Any
 
 import carla
 import cv2
 import numpy as np
 
 from . import config as cfg
+from .data_collection import ExactFrameCollector
+from .geometry import (
+    camera_intrinsic_matrix,
+    carla_relative_rotation_to_model,
+    pose_matrix_from_components,
+    pose_matrix_from_state,
+    pose_matrix_from_transform,
+    world_points_to_model_ego,
+)
+from .runtime_types import SynchronizedObservation
+
+
+EXPECTED_ALPAMAYO_CAMERA_IDS = (0, 1, 2, 6)
+EXPECTED_ALPAMAYO_CAMERA_NAMES = (
+    "cam_front_left",
+    "cam_front_wide",
+    "cam_front_right",
+    "cam_front_tele",
+)
+EXPECTED_ALPAMAYO_CAMERA_FOVS = (120.0, 120.0, 120.0, 30.0)
+
+
+@dataclass(frozen=True)
+class CARLATickContext:
+    """Snapshot-backed state for one successful synchronous CARLA tick."""
+
+    frame_id: int
+    simulation_time_s: float
+    delta_seconds: float
+    snapshot: Any = field(repr=False, compare=False)
+    actor_snapshot: Any = field(repr=False, compare=False)
+    ego_transform: Any = field(repr=False, compare=False)
+    ego_velocity: Any = field(repr=False, compare=False)
+
+
+def _validated_camera_specs():
+    specs = tuple(dict(spec) for spec in cfg.CAMERA_SPECS)
+    names = tuple(spec["name"] for spec in specs)
+    camera_ids = tuple(int(spec["alpamayo_id"]) for spec in specs)
+    camera_fovs = tuple(float(spec["fov"]) for spec in specs)
+    if len(specs) != cfg.NUM_CAMERAS:
+        raise ValueError("CAMERA_SPECS length must match NUM_CAMERAS")
+    if len(set(names)) != len(names):
+        raise ValueError("CAMERA_SPECS camera names must be unique")
+    if len(set(camera_ids)) != len(camera_ids):
+        raise ValueError("CAMERA_SPECS Alpamayo IDs must be unique")
+    if camera_ids != EXPECTED_ALPAMAYO_CAMERA_IDS:
+        raise ValueError(
+            "CAMERA_SPECS must use Alpamayo camera IDs [0, 1, 2, 6] "
+            "in left/wide/right/tele order"
+        )
+    if names != EXPECTED_ALPAMAYO_CAMERA_NAMES:
+        raise ValueError(
+            "CAMERA_SPECS must use left/wide/right/tele camera names in model order"
+        )
+    if camera_fovs != EXPECTED_ALPAMAYO_CAMERA_FOVS:
+        raise ValueError(
+            "CAMERA_SPECS must use nominal Alpamayo FOVs [120, 120, 120, 30]"
+        )
+    return specs
 
 
 def is_allowed_npc_vehicle_blueprint(blueprint):
@@ -32,7 +94,15 @@ class CARLAInterface:
         self.world = None
         self.ego_vehicle = None
         self.sensors = {}
+        # ``sensor_queues`` is retained for compatibility with callers that
+        # inject legacy per-camera queues. Normal operation uses one shared,
+        # frame-aware collector so camera packets can never be mixed by dequeue
+        # order.
         self.sensor_queues = {}
+        self.camera_collector = ExactFrameCollector(
+            queue_size=max(16, cfg.NUM_CAMERAS * 4),
+            max_pending_frames=4,
+        )
         self.collision_events = []
         self.spawn_collision_count = 0
         # The spawn-local counter drives RespawnMonitor, the detail list is a
@@ -44,14 +114,17 @@ class CARLAInterface:
         self.npc_walker_ids = []
         self.npc_walker_controller_ids = []
         self.tm_port = 8000
-
-        self.camera_configs = {
-            "cam_front_left": {"x": 1.0, "y": -0.5, "z": 2.4, "pitch": 0.0, "yaw": -60.0, "fov": 120},
-            "cam_front_wide": {"x": 1.5, "y": 0.0, "z": 2.4, "pitch": 0.0, "yaw": 0.0, "fov": 95},
-            "cam_front_right": {"x": 1.0, "y": 0.5, "z": 2.4, "pitch": 0.0, "yaw": 60.0, "fov": 120},
-            "cam_front_tele": {"x": 1.5, "y": 0.0, "z": 2.4, "pitch": 0.0, "yaw": 0.0, "fov": 30},
-        }
-        self.camera_order = ["cam_front_left", "cam_front_wide", "cam_front_right", "cam_front_tele"]
+        self.camera_specs = _validated_camera_specs()
+        self.camera_configs = {spec["name"]: dict(spec) for spec in self.camera_specs}
+        self.camera_order = [spec["name"] for spec in self.camera_specs]
+        self.camera_ids = tuple(int(spec["alpamayo_id"]) for spec in self.camera_specs)
+        self._last_tick_context = None
+        self._last_camera_packets = None
+        self._accepted_camera_bundles = 0
+        self._missing_camera_bundles = 0
+        self._camera_frame_mismatches = 0
+        self._camera_timestamp_mismatches = 0
+        self._history_sequence_resets = 0
 
     def connect(self, host="localhost", port=2000):
         print(f"Connecting to CARLA at {host}:{port}...")
@@ -212,6 +285,8 @@ class CARLAInterface:
         self.ego_vehicle.set_target_angular_velocity(carla.Vector3D())
         self.apply_control(0.0, 0.0, 1.0)
         self.history_buffer.clear()
+        self._last_tick_context = None
+        self._last_camera_packets = None
         self.reset_collision_history()
         self.flush_camera_queues()
         return spawn_point
@@ -219,7 +294,8 @@ class CARLAInterface:
     def setup_cameras(self):
         print("Setting up cameras...")
         bp_lib = self.world.get_blueprint_library()
-        for name, cfg_cam in self.camera_configs.items():
+        for name in self.camera_order:
+            cfg_cam = self.camera_configs[name]
             print(f"  - spawning {name}")
             cam_bp = bp_lib.find("sensor.camera.rgb")
             cam_bp.set_attribute("image_size_x", str(cfg.IMG_WIDTH))
@@ -230,10 +306,13 @@ class CARLAInterface:
 
             transform = carla.Transform(
                 carla.Location(x=cfg_cam["x"], y=cfg_cam["y"], z=cfg_cam["z"]),
-                carla.Rotation(pitch=cfg_cam["pitch"], yaw=cfg_cam["yaw"]),
+                carla.Rotation(
+                    roll=cfg_cam.get("roll", 0.0),
+                    pitch=cfg_cam["pitch"],
+                    yaw=cfg_cam["yaw"],
+                ),
             )
             sensor = self.world.spawn_actor(cam_bp, transform, attach_to=self.ego_vehicle)
-            self.sensor_queues[name] = queue.Queue()
             sensor.listen(lambda data, n=name: self._camera_callback(data, n))
             self.sensors[name] = sensor
             time.sleep(0.2)
@@ -285,75 +364,309 @@ class CARLAInterface:
         self.spawn_collision_count = 0
 
     def flush_camera_queues(self):
+        self.camera_collector.clear()
         for sensor_queue in self.sensor_queues.values():
             while True:
                 try:
                     sensor_queue.get_nowait()
                 except queue.Empty:
                     break
+        self._last_camera_packets = None
 
     def _camera_callback(self, image, name):
-        if not self.sensor_queues[name].full():
-            self.sensor_queues[name].put(image)
+        self.camera_collector.put(image.frame, name, image)
 
-    def get_camera_images(self):
+    @staticmethod
+    def _decode_camera_image(data):
+        height = int(getattr(data, "height", cfg.IMG_HEIGHT))
+        width = int(getattr(data, "width", cfg.IMG_WIDTH))
+        array = np.frombuffer(data.raw_data, dtype=np.uint8)
+        expected_size = height * width * 4
+        if array.size != expected_size:
+            raise ValueError(
+                f"Camera frame contains {array.size} bytes; expected {expected_size} "
+                f"for {width}x{height} BGRA"
+            )
+        array = array.reshape((height, width, 4))[:, :, :3]
+        return cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+
+    def _collect_camera_packets(self, frame_id, timeout):
+        target_frame = int(frame_id)
+        if self._last_camera_packets is not None:
+            cached_frame, cached_packets = self._last_camera_packets
+            if cached_frame == target_frame:
+                return cached_packets
+
+        packets = self.camera_collector.collect(
+            target_frame,
+            self.camera_order,
+            timeout=timeout,
+        )
+        missing = [name for name in self.camera_order if name not in packets]
+        if missing:
+            self._missing_camera_bundles += 1
+            raise TimeoutError(
+                f"Missing camera frames for CARLA frame {target_frame}: {missing}"
+            )
+
+        for name, packet in packets.items():
+            packet_frame = int(getattr(packet, "frame", target_frame))
+            if packet_frame != target_frame:
+                self._camera_frame_mismatches += 1
+                raise RuntimeError(
+                    f"Camera {name} returned frame {packet_frame}; expected {target_frame}"
+                )
+
+        ordered = {name: packets[name] for name in self.camera_order}
+        self._last_camera_packets = (target_frame, ordered)
+        self._accepted_camera_bundles += 1
+        return ordered
+
+    def _get_legacy_camera_images(self, timeout):
+        """Read old per-camera queues when no tick context is available."""
+
         images = []
         missing = []
         for name in self.camera_order:
+            sensor_queue = self.sensor_queues.get(name)
+            if sensor_queue is None:
+                missing.append(name)
+                continue
             try:
-                data = self.sensor_queues[name].get(timeout=1.0)
-                array = np.frombuffer(data.raw_data, dtype=np.uint8)
-                array = array.reshape((cfg.IMG_HEIGHT, cfg.IMG_WIDTH, 4))[:, :, :3]
-                array = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
-                images.append(array)
+                images.append(self._decode_camera_image(sensor_queue.get(timeout=timeout)))
             except queue.Empty:
                 missing.append(name)
         if missing:
             raise TimeoutError(f"Missing camera frames: {missing}")
-        return np.array(images)
+        return np.stack(images, axis=0)
 
-    def get_ego_state(self):
-        transform = self.ego_vehicle.get_transform()
-        velocity = self.ego_vehicle.get_velocity()
-        return {
+    def get_camera_images(self, frame_id=None, timeout=1.0):
+        """Return canonical RGB cameras for one exact CARLA frame.
+
+        Omitting ``frame_id`` targets the most recent :meth:`tick` context. The
+        legacy independent-queue path is retained only for callers that have not
+        ticked this interface and explicitly populated ``sensor_queues``.
+        """
+
+        if isinstance(frame_id, CARLATickContext):
+            frame_id = frame_id.frame_id
+        if frame_id is None and self._last_tick_context is not None:
+            frame_id = self._last_tick_context.frame_id
+        if frame_id is None:
+            return self._get_legacy_camera_images(timeout)
+
+        packets = self._collect_camera_packets(frame_id, timeout)
+        return np.stack(
+            [self._decode_camera_image(packets[name]) for name in self.camera_order],
+            axis=0,
+        )
+
+    @staticmethod
+    def _state_from_transform(transform, velocity, *, frame_id=None, simulation_time_s=None):
+        velocity_world = np.array(
+            [velocity.x, velocity.y, velocity.z],
+            dtype=np.float64,
+        )
+        state = {
             "x": transform.location.x,
             "y": transform.location.y,
             "z": transform.location.z,
             "roll": transform.rotation.roll,
             "pitch": transform.rotation.pitch,
             "yaw": transform.rotation.yaw,
-            "speed": math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2),
+            "speed": float(np.linalg.norm(velocity_world)),
+            "pose_world": pose_matrix_from_transform(transform),
+            "velocity_world": velocity_world,
         }
+        if frame_id is not None:
+            state["frame_id"] = int(frame_id)
+        if simulation_time_s is not None:
+            state["simulation_time_s"] = float(simulation_time_s)
+        return state
+
+    def get_ego_state(self, tick_context=None):
+        context = tick_context
+        if context is None:
+            context = self._last_tick_context
+        if context is not None:
+            if not isinstance(context, CARLATickContext):
+                raise TypeError("tick_context must be a CARLATickContext")
+            return self._state_from_transform(
+                context.ego_transform,
+                context.ego_velocity,
+                frame_id=context.frame_id,
+                simulation_time_s=context.simulation_time_s,
+            )
+
+        return self._state_from_transform(
+            self.ego_vehicle.get_transform(),
+            self.ego_vehicle.get_velocity(),
+        )
 
     def update_history(self, state):
-        self.history_buffer.append(state)
+        normalized = dict(state)
+        frame_id = normalized.get("frame_id")
+        if frame_id is not None and self.history_buffer:
+            previous_frame_id = self.history_buffer[-1].get("frame_id")
+            if previous_frame_id is not None:
+                if int(frame_id) < int(previous_frame_id):
+                    raise ValueError("ego history frame IDs must be monotonic")
+                if int(frame_id) == int(previous_frame_id):
+                    self.history_buffer[-1] = normalized
+                    return
+                previous_time = self.history_buffer[-1].get("simulation_time_s")
+                simulation_time = normalized.get("simulation_time_s")
+                frame_gap = int(frame_id) != int(previous_frame_id) + 1
+                time_gap = (
+                    previous_time is not None
+                    and simulation_time is not None
+                    and not math.isclose(
+                        float(simulation_time) - float(previous_time),
+                        float(cfg.CONTROL_DT),
+                        rel_tol=0.0,
+                        abs_tol=1e-4,
+                    )
+                )
+                if frame_gap or time_gap:
+                    # Alpamayo expects history on a contiguous 10 Hz grid. A
+                    # missing bundle starts a new sequence that will be padded
+                    # from its first complete observation.
+                    self.history_buffer.clear()
+                    self._history_sequence_resets += 1
+        self.history_buffer.append(normalized)
         if len(self.history_buffer) > cfg.NUM_HISTORY:
             self.history_buffer.pop(0)
 
+    def _padded_history_states(self):
+        states = list(self.history_buffer[-cfg.NUM_HISTORY :])
+        if not states:
+            states = [self.get_ego_state()]
+        return [states[0]] * (cfg.NUM_HISTORY - len(states)) + states
+
     def get_history_in_local_frame(self):
-        if len(self.history_buffer) < cfg.NUM_HISTORY:
-            while len(self.history_buffer) < cfg.NUM_HISTORY:
-                self.history_buffer.insert(0, self.history_buffer[0] if self.history_buffer else self.get_ego_state())
+        states = self._padded_history_states()
+        poses = [pose_matrix_from_state(state) for state in states]
+        current_pose = poses[-1]
+        positions_world = np.stack([pose[:3, 3] for pose in poses], axis=0)
+        history_xyz = world_points_to_model_ego(current_pose, positions_world)
 
-        current = self.history_buffer[-1]
-        current_pos = np.array([current["x"], current["y"], current["z"]])
-        yaw_rad = math.radians(-current["yaw"])
-        cos_yaw, sin_yaw = math.cos(yaw_rad), math.sin(yaw_rad)
-        rot_matrix = np.array([[cos_yaw, -sin_yaw, 0], [sin_yaw, cos_yaw, 0], [0, 0, 1]])
+        current_rotation_inv = current_pose[:3, :3].T
+        history_rot = np.stack(
+            [
+                carla_relative_rotation_to_model(
+                    current_rotation_inv @ pose[:3, :3]
+                )
+                for pose in poses
+            ],
+            axis=0,
+        )
+        return history_xyz.astype(np.float32), history_rot.astype(np.float32)
 
-        history_xyz = np.zeros((cfg.NUM_HISTORY, 3), dtype=np.float32)
-        history_rot = np.zeros((cfg.NUM_HISTORY, 3, 3), dtype=np.float32)
+    def _camera_calibration(self, packets, ego_pose_world):
+        intrinsics = []
+        extrinsics = []
+        world_to_ego = np.linalg.inv(ego_pose_world)
+        for spec in self.camera_specs:
+            packet = packets[spec["name"]]
+            width = int(getattr(packet, "width", cfg.IMG_WIDTH))
+            height = int(getattr(packet, "height", cfg.IMG_HEIGHT))
+            intrinsics.append(camera_intrinsic_matrix(width, height, spec["fov"]))
 
-        for i, st in enumerate(self.history_buffer):
-            pos = np.array([st["x"], st["y"], st["z"]])
-            history_xyz[i] = rot_matrix @ (pos - current_pos)
-            state_yaw = math.radians(-st["yaw"])
-            rel_yaw = state_yaw - yaw_rad
-            history_rot[i] = np.array(
-                [[math.cos(rel_yaw), -math.sin(rel_yaw), 0], [math.sin(rel_yaw), math.cos(rel_yaw), 0], [0, 0, 1]]
-            )
+            capture_transform = getattr(packet, "transform", None)
+            if capture_transform is not None:
+                sensor_to_ego = world_to_ego @ pose_matrix_from_transform(capture_transform)
+            else:
+                sensor_to_ego = pose_matrix_from_components(
+                    spec["x"],
+                    spec["y"],
+                    spec["z"],
+                    spec.get("roll", 0.0),
+                    spec.get("pitch", 0.0),
+                    spec.get("yaw", 0.0),
+                )
+            extrinsics.append(sensor_to_ego)
+        return np.stack(intrinsics, axis=0), np.stack(extrinsics, axis=0)
 
-        return history_xyz, history_rot
+    def get_synchronized_observation(
+        self,
+        tick_context=None,
+        timeout=1.0,
+        *,
+        update_history=True,
+    ):
+        """Build one complete, exact-frame observation from a tick snapshot."""
+
+        context = tick_context if tick_context is not None else self._last_tick_context
+        if not isinstance(context, CARLATickContext):
+            raise RuntimeError("tick() must succeed before collecting an observation")
+
+        packets = self._collect_camera_packets(context.frame_id, timeout)
+        for name, packet in packets.items():
+            packet_timestamp = getattr(packet, "timestamp", None)
+            if packet_timestamp is not None and not math.isclose(
+                float(packet_timestamp),
+                context.simulation_time_s,
+                rel_tol=0.0,
+                abs_tol=1e-4,
+            ):
+                self._camera_timestamp_mismatches += 1
+                raise RuntimeError(
+                    f"Camera {name} timestamp {float(packet_timestamp):.6f}s does not "
+                    f"match snapshot {context.simulation_time_s:.6f}s"
+                )
+        images = np.stack(
+            [self._decode_camera_image(packets[name]) for name in self.camera_order],
+            axis=0,
+        )
+        state = self.get_ego_state(context)
+        if update_history:
+            self.update_history(state)
+
+        ego_pose_world = state["pose_world"].copy()
+        intrinsics, extrinsics = self._camera_calibration(packets, ego_pose_world)
+        identified_history = [
+            history_state
+            for history_state in self.history_buffer
+            if "frame_id" in history_state and "simulation_time_s" in history_state
+        ]
+        if not identified_history:
+            identified_history = [state]
+        history_poses = np.stack(
+            [pose_matrix_from_state(history_state) for history_state in identified_history],
+            axis=0,
+        )
+
+        return SynchronizedObservation(
+            frame_id=context.frame_id,
+            simulation_time_s=context.simulation_time_s,
+            ego_pose_world=ego_pose_world,
+            ego_velocity_world=state["velocity_world"].copy(),
+            camera_images=images,
+            camera_ids=self.camera_ids,
+            camera_intrinsics=intrinsics,
+            camera_extrinsics=extrinsics,
+            ego_history=history_poses,
+            ego_history_frame_ids=tuple(
+                int(history_state["frame_id"])
+                for history_state in identified_history
+            ),
+            ego_history_simulation_times_s=tuple(
+                float(history_state["simulation_time_s"])
+                for history_state in identified_history
+            ),
+        )
+
+    def get_camera_sync_stats(self):
+        """Return exact-frame bundle and packet health counters."""
+
+        return {
+            "accepted_bundles": int(self._accepted_camera_bundles),
+            "missing_bundles": int(self._missing_camera_bundles),
+            "frame_mismatches": int(self._camera_frame_mismatches),
+            "timestamp_mismatches": int(self._camera_timestamp_mismatches),
+            "history_sequence_resets": int(self._history_sequence_resets),
+            **self.camera_collector.stats(),
+        }
 
     def apply_control(self, steering, throttle, brake):
         control = carla.VehicleControl()
@@ -363,7 +676,33 @@ class CARLAInterface:
         self.ego_vehicle.apply_control(control)
 
     def tick(self):
-        self.world.tick()
+        tick_frame = self.world.tick()
+        snapshot = self.world.get_snapshot()
+        snapshot_frame = int(snapshot.frame)
+        frame_id = snapshot_frame if tick_frame is None else int(tick_frame)
+        if snapshot_frame != frame_id:
+            raise RuntimeError(
+                f"CARLA tick returned frame {frame_id}, but world snapshot is "
+                f"frame {snapshot_frame}"
+            )
+
+        actor_snapshot = snapshot.find(self.ego_vehicle.id)
+        if actor_snapshot is None:
+            raise RuntimeError(
+                f"Ego vehicle {self.ego_vehicle.id} is missing from CARLA frame {frame_id}"
+            )
+        timestamp = snapshot.timestamp
+        context = CARLATickContext(
+            frame_id=frame_id,
+            simulation_time_s=float(timestamp.elapsed_seconds),
+            delta_seconds=float(getattr(timestamp, "delta_seconds", cfg.CONTROL_DT)),
+            snapshot=snapshot,
+            actor_snapshot=actor_snapshot,
+            ego_transform=actor_snapshot.get_transform(),
+            ego_velocity=actor_snapshot.get_velocity(),
+        )
+        self._last_tick_context = context
+        return context
 
     def cleanup(self):
         print("\nCleaning up...")

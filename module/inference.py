@@ -130,13 +130,84 @@ def _prime_oom_pipeline(model):
         pipeline.start_iteration()
 
 
-def prepare_model_input(images_array, history_xyz, history_rot):
-    """Convert CARLA data to model input format."""
+def _configured_camera_ids():
+    camera_ids = tuple(int(spec["alpamayo_id"]) for spec in cfg.CAMERA_SPECS)
+    camera_names = tuple(str(spec["name"]) for spec in cfg.CAMERA_SPECS)
+    expected_names = (
+        "cam_front_left",
+        "cam_front_wide",
+        "cam_front_right",
+        "cam_front_tele",
+    )
+    if camera_ids != (0, 1, 2, 6):
+        raise ValueError(
+            "CAMERA_SPECS must be ordered as Alpamayo cameras [0, 1, 2, 6]"
+        )
+    if camera_names != expected_names:
+        raise ValueError(
+            "CAMERA_SPECS must be ordered as front-left, front-wide, "
+            "front-right, front-tele"
+        )
+    return camera_ids
+
+
+def prepare_model_input(
+    images_array,
+    history_xyz,
+    history_rot,
+    *,
+    camera_indices=None,
+):
+    """Validate and convert synchronized CARLA data to Alpamayo tensors."""
+
+    images_array = np.asarray(images_array)
+    history_xyz = np.asarray(history_xyz)
+    history_rot = np.asarray(history_rot)
+    configured_camera_ids = _configured_camera_ids()
+    if camera_indices is None:
+        camera_ids = configured_camera_ids
+    else:
+        if isinstance(camera_indices, torch.Tensor):
+            camera_indices = camera_indices.detach().cpu().tolist()
+        camera_ids = tuple(int(camera_id) for camera_id in camera_indices)
+        if camera_ids != configured_camera_ids:
+            raise ValueError(
+                "camera_indices must match configured Alpamayo order "
+                f"{list(configured_camera_ids)}; got {list(camera_ids)}"
+            )
+
+    if images_array.ndim != 5 or images_array.shape[:2] != (
+        len(camera_ids),
+        cfg.NUM_FRAMES,
+    ):
+        raise ValueError(
+            "images_array must have shape "
+            f"({len(camera_ids)}, {cfg.NUM_FRAMES}, H, W, C); got {images_array.shape}"
+        )
+    if images_array.shape[-1] != cfg.IMG_CHANNELS:
+        raise ValueError(
+            f"images_array must have {cfg.IMG_CHANNELS} channels; got {images_array.shape[-1]}"
+        )
+    if images_array.dtype != np.uint8:
+        raise TypeError(f"images_array must use uint8 pixels; got {images_array.dtype}")
+    if history_xyz.shape != (cfg.NUM_HISTORY, 3):
+        raise ValueError(
+            f"history_xyz must have shape ({cfg.NUM_HISTORY}, 3); got {history_xyz.shape}"
+        )
+    if history_rot.shape != (cfg.NUM_HISTORY, 3, 3):
+        raise ValueError(
+            "history_rot must have shape "
+            f"({cfg.NUM_HISTORY}, 3, 3); got {history_rot.shape}"
+        )
+    if not np.isfinite(history_xyz).all() or not np.isfinite(history_rot).all():
+        raise ValueError("ego history must contain only finite values")
+
     images = torch.from_numpy(images_array).permute(0, 1, 4, 2, 3).contiguous()
     hist_xyz = torch.from_numpy(history_xyz).float().unsqueeze(0).unsqueeze(0)
     hist_rot = torch.from_numpy(history_rot).float().unsqueeze(0).unsqueeze(0)
     return {
         "image_frames": images,
+        "camera_indices": torch.tensor(camera_ids, dtype=torch.long),
         "ego_history_xyz": hist_xyz,
         "ego_history_rot": hist_rot,
     }
@@ -165,6 +236,7 @@ def run_inference(
     messages = helper.create_message(
         data["image_frames"].flatten(0, 1),
         camera_indices=data.get("camera_indices"),
+        num_frames_per_camera=int(data["image_frames"].shape[1]),
         nav_text=nav_text or None,
     )
 
@@ -367,6 +439,7 @@ def run_vqa(
         data["image_frames"].flatten(0, 1),
         question=question,
         camera_indices=data.get("camera_indices"),
+        num_frames_per_camera=int(data["image_frames"].shape[1]),
     )
     inputs = processor.apply_chat_template(
         messages,

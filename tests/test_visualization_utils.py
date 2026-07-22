@@ -9,6 +9,8 @@ from module.visualization import (
     create_open_loop_visualization_frame,
     create_visualization_frame,
     project_trajectory_to_image,
+    project_world_points_to_camera,
+    project_world_trajectory_to_image,
     save_open_loop_video,
 )
 
@@ -40,6 +42,41 @@ def test_project_trajectory_to_image_rejects_invalid_rank():
 
     with pytest.raises(ValueError, match=r"Expected trajectory with ndim 2 or 3"):
         project_trajectory_to_image(image, trajectory)
+
+
+def test_exact_world_projection_uses_carla_camera_axes():
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [
+            [10.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0],
+            [10.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    pixels, valid = project_world_points_to_camera(points, np.eye(4), intrinsic)
+
+    np.testing.assert_allclose(pixels[:3], [[80.0, 60.0], [90.0, 60.0], [80.0, 50.0]])
+    assert valid.tolist() == [True, True, True, False]
+
+
+def test_calibrated_world_trajectory_draws_on_the_current_image():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array([[2.0, 0.0, 0.0], [5.0, 0.2, 0.0], [8.0, 0.4, 0.0]])
+
+    rendered = project_world_trajectory_to_image(image, points, np.eye(4), intrinsic)
+
+    assert rendered.shape == image.shape
+    assert rendered[..., 1].max() == 255
 
 
 def test_create_visualization_frame_preserves_rgb_shape_and_adds_overlay():

@@ -2,81 +2,126 @@
 
 ## Status
 
-CarlaMayo is currently a proof of integration:
+CarlaMayo now has an implemented safe closed-loop baseline on the prototype
+branch:
 
-- CARLA provides multi-camera observations and ego history.
-- Alpamayo 1.5 produces Chain-of-Causation reasoning and future trajectories.
-- A CARLA PID controller converts a selected trajectory into vehicle controls.
-- Navigation text, VQA, asynchronous inference, collision respawn, visualization,
-  quantization, and OOM-free execution paths exist.
+- Exact-frame CARLA observations bind the ego state and canonical left, wide,
+  right, and tele cameras to one simulation snapshot.
+- Alpamayo receives camera IDs `[0, 1, 2, 6]` and produces auditable
+  Chain-of-Causation reasoning plus a 64-point trajectory.
+- A validated proposal is anchored once at its capture pose, timestamped in
+  simulation time, and followed as an immutable world path by a stopping-capable
+  CARLA PID controller.
+- A privileged CARLA-ground-truth, stop-only safety shield can replace nominal
+  control with a latched emergency brake. Unsafe and unknown assessments both
+  fail closed.
+- Structured telemetry distinguishes the Alpamayo proposal, controller request,
+  post-processed nominal control, final applied control, fallback, and safety
+  override. Proposal events retain the complete, untruncated CoC text and an
+  integrity hash.
+- Synchronous inference is the default. Normal and navigation submissions use a
+  one-second CARLA simulation-time cadence after observation warm-up; `--async`
+  remains an explicit opt-in mode.
 
-The next milestone is not a complete autonomous-driving stack. It is:
+This is more than proof of integration, but it has not passed the deterministic
+CARLA release gate below. The next milestone is:
 
-> Geometrically and temporally correct basic lane following and stopping on a
-> deterministic CARLA route, with safe behavior when inference is invalid or late.
+> Validate geometrically and temporally correct lane following and stopping on a
+> deterministic CARLA route, then use the evidence to tune the baseline without
+> weakening its fail-closed behavior.
 
-This plan intentionally defers traffic-heavy scenarios, multi-trajectory safety
-ranking, fine-tuning, V2X, and world-model integration until the basic-driving
-gate passes.
+Destination-aware routing, traffic-rule policy, multi-trajectory selection, the
+complete four-panel UI, fine-tuning, V2X, and world-model integration remain
+deferred until the basic-driving gate passes.
 
 ### Implementation progress
 
-- PR 1 runtime contracts and baseline telemetry are implemented on the prototype
-  branch: frozen runtime records, append-only JSONL events, bounded percentile
-  aggregation, request/control provenance, persistent episode collision counts,
-  and an optional simulation-tick duration limit.
-- Exact camera source frames, CARLA timestamps, and exact plan-age percentiles
-  remain intentionally unavailable in PR 1. Loop-tick estimates are labelled as
-  proxies until PR 2 supplies synchronized sensor identities.
-- PR 2 synchronized and correctly labelled observations is the next implementation
-  slice.
+- PR 1, runtime contracts and baseline telemetry: implemented.
+- PR 2, synchronized and correctly labelled observations: implemented.
+- PR 3, coordinate-system and camera-calibration correctness: implemented for the
+  canonical CARLA rig and current calibrated front-wide projection. Exact
+  reproduction of Alpamayo's undisclosed training-rig extrinsics is not claimed.
+- PR 4, timestamped fixed-world trajectory lifecycle: implemented.
+- PR 5, fixed-world, stopping-capable controller: implemented.
+- Safe-baseline hardening, including the CARLA-ground-truth adapter, fail-closed
+  stop-only shield, and full CoC proposal audit: implemented.
+- PR 6, traceable four-panel UI: partially implemented. The current view exposes
+  persistent proposal/controller/override labels and requested versus applied
+  control, but the four thumbnails, dedicated CoC panel, BEV, and full telemetry
+  panel remain pending.
+- PR 7, deterministic CARLA validation harness and the release-gate runs: pending.
+
+Simulator-free tests cover the implemented contracts. No release claim should be
+made until the fixed-route CARLA criteria below have also passed.
+
+### Current runtime defaults and artifacts
+
+- Closed-loop execution defaults to synchronous inference. After the initial
+  four-frame observation warm-up, normal/navigation inference is submitted no
+  more often than once per 1.0 second of CARLA simulation time. `--async` is
+  optional and uses the same minimum simulation-time submission interval.
+- The default recorded view is
+  `./carla_alpamayo_closed_loop_result.mp4`; the live preview is
+  `./carla_alpamayo_closed_loop_latest.jpg`.
+- `--pygame-ui` additionally records
+  `./carla_alpamayo_closed_loop_result_pygame_ui.mp4`.
+- Runtime JSONL is opt-in at the exact path supplied to `--telemetry-jsonl`. It is
+  also the complete CoC audit artifact; proposal text is stored in
+  `alpamayo_proposal.coc_text_full` with SHA-256 and length metadata.
+- `CARLAMAYO_OUTPUT_VIDEO` and `CARLAMAYO_LIVE_PREVIEW_IMAGE` override the two
+  default media paths. The supplied Slurm runner places its video, preview, and
+  `runtime.jsonl` in `/home/aqiu/carlamayo-runs/<SLURM_JOB_ID>/` and writes the
+  CARLA server log to `./carla-server-<SLURM_JOB_ID>.log`.
 
 ## Review of the Proposed Roadmap
 
-The original roadmap is directionally correct. Its main diagnosis—proof of
-integration rather than a reliable autonomous-driving agent—is supported by the
-current implementation. The following refinements are required before using it
-as an execution plan.
+The original roadmap is directionally correct. Its diagnosis—proof of integration
+rather than a reliable autonomous-driving agent—described the original prototype.
+The current baseline addresses the defects below, but still requires the planned
+simulator evaluation before it can be treated as a reliable agent.
 
-### Confirmed critical defects
+### Critical defects addressed in the baseline
 
-1. `module/inference.py:prepare_model_input()` omits Alpamayo camera indices,
-   although the official input order is `[0, 1, 2, 6]`.
-2. `module/carla_interface.py:get_camera_images()` dequeues one image from each
-   camera without checking `carla.Image.frame`.
-3. The selected ego-frame trajectory is transformed with the vehicle's current
-   pose on every control tick instead of being anchored once at observation time.
-4. Target speed is based on total trajectory extent and has a 10 km/h minimum,
-   so the controller cannot reliably execute a predicted stop.
-5. The current displayed trajectory age starts at result completion and therefore
-   excludes the inference delay.
-6. The front-wide camera is configured at 95 degrees while the nominal Alpamayo
-   front-wide input is 120 degrees. The visualization also uses an approximate
-   projection rather than the actual camera calibration.
-7. Inference errors are logged, but a previous trajectory can remain active
-   without a validity deadline or explicit fail-safe state transition.
+1. Model input now includes the canonical Alpamayo camera indices `[0, 1, 2, 6]`
+   in left/wide/right/tele order.
+2. The exact-frame collector accepts a camera bundle only when all four images
+   match the requested CARLA frame; snapshot and sensor timestamps are checked,
+   while missing, old, duplicate, and future packets are handled explicitly.
+3. A selected ego-frame trajectory is transformed at observation capture once and
+   remains fixed in CARLA world coordinates throughout its lifetime.
+4. Target speed is derived from waypoint distance over waypoint time. The legacy
+   10 km/h floor is not used by the fixed-world controller, and geometric terminal
+   stop tails produce deceleration and full braking.
+5. Plan source age starts at the exact source observation's CARLA simulation time
+   and therefore includes all simulation-time delay.
+6. The canonical front-wide FOV is 120 degrees and the current path overlay uses
+   the captured camera pose and intrinsic matrix.
+7. Plans have explicit source-age, remaining-horizon, prompt/respawn revision, and
+   tracking-alignment validity. An invalid proposal is never activated; an older
+   plan may continue only while independently valid, otherwise control brakes.
 
 ### Corrections to the proposed timing policy
 
-- Plan validity must use CARLA simulation time, not `time.time()`.
-- The current one-second inference interval is only a minimum submission interval.
-  A single pending request makes effective frequency inference-limited.
-- The completed prototype run had approximately 2.39 seconds median inference
-  latency and 3.73 seconds p95 latency. A fixed two-second source-age limit would
-  reject most current results.
+- Plan validity now uses CARLA simulation time, not `time.time()`.
+- The one-second inference interval is a minimum submission interval measured in
+  CARLA simulation time. Synchronous mode blocks world ticks while inference runs;
+  asynchronous mode permits ticking but still allows only one pending request, so
+  its effective frequency can be inference-limited.
+- The recorded asynchronous prototype run (`22843540`) had approximately 6.62
+  seconds median inference latency and 10.19 seconds p95 latency. A fixed
+  two-second source-age limit would reject most current results.
 - Alpamayo waypoints represent future times `[0.1, 0.2, ..., 6.4]` seconds.
-  Expired points must be selected through these explicit timestamps to avoid an
+  Expired points are selected through these explicit timestamps to avoid an
   off-by-one error.
-- Initially require a minimum remaining horizon, then derive a maximum acceptable
-  source age from measured latency and drift. For a 6.4-second prediction and a
-  two-second minimum remaining horizon, the absolute upper bound is 4.4 seconds.
+- The initial policy requires a two-second minimum remaining horizon and caps
+  source age at 4.4 seconds. These limits must be recalibrated from measured
+  latency and drift rather than treated as universal constants.
 
 ### Sequencing correction
 
-Evaluation cannot be postponed until the final gate. Runtime telemetry and a
-deterministic baseline must be introduced first. Full simulator evaluation is
-completed after geometry, timing, and control are corrected, but every preceding
-change must already produce comparable metrics.
+Evaluation cannot be postponed until the final gate. Runtime telemetry is now in
+place and every implemented slice produces comparable metrics. Full simulator
+evaluation follows the completed geometry, timing, control, and shield work.
 
 ## Target Runtime Architecture
 
@@ -93,7 +138,7 @@ source observation + ego history + camera IDs + prompt/respawn revisions
       |
       v
 Alpamayo 1.5
-CoC + K ego-frame trajectory proposals
+CoC + ego-frame trajectory proposal (current K=1; multi-candidate K>1 deferred)
       |
       v
 TrajectoryPlan
@@ -205,7 +250,7 @@ global state or block the simulation/control loop.
 
 ## Implementation Sequence
 
-### PR 1: Runtime contracts and baseline telemetry
+### PR 1: Runtime contracts and baseline telemetry — implemented
 
 #### Files
 
@@ -232,7 +277,7 @@ global state or block the simulation/control loop.
 - p50, p95, and p99 latency and plan-age metrics are reported.
 - No PID or inference behavior changes in this PR.
 
-### PR 2: Synchronized and correctly labelled observations
+### PR 2: Synchronized and correctly labelled observations — implemented
 
 #### Files
 
@@ -274,7 +319,7 @@ global state or block the simulation/control loop.
 - Generated Alpamayo messages contain the four correct camera names and frame
   numbers.
 
-### PR 3: Coordinate-system and camera-calibration correctness
+### PR 3: Coordinate-system and camera-calibration correctness — implemented
 
 #### Files
 
@@ -312,7 +357,7 @@ global state or block the simulation/control loop.
 - Known camera-axis points project within two pixels of expected locations.
 - Visualization and control consume the same world trajectory.
 
-### PR 4: Timestamped, fixed-world trajectory lifecycle
+### PR 4: Timestamped, fixed-world trajectory lifecycle — implemented
 
 #### Files
 
@@ -356,9 +401,10 @@ global state or block the simulation/control loop.
 - No expired, prompt-stale, or respawn-stale plan is applied.
 - A plan's world coordinates do not change between control ticks.
 - Invalid output enters fallback within one 0.1-second control tick.
-- Source age, result age, execution age, and wall latency are logged separately.
+- Source/arrival identities, source age, remaining horizon, and wall latency are
+  logged separately.
 
-### PR 5: World-trajectory and stopping-capable controller
+### PR 5: World-trajectory and stopping-capable controller — implemented
 
 #### Files
 
@@ -399,11 +445,62 @@ global state or block the simulation/control loop.
 - Moving the ego transform does not move the planned world trajectory.
 - Missing or expired plans command braking and never throttle.
 
-### PR 6: Traceable four-panel visualization UI
+### Safe-baseline hardening: Fail-closed ground-truth shield — implemented
 
-This PR can be developed in parallel with the validation harness after PR 5.
-Semantic traceability is required; decorative polish is not a prerequisite for
-the basic-driving release gate.
+This slice is an integration guard around the nominal controller. It is not a
+claim that Alpamayo perceives or resolves these hazards itself, and it is not a
+substitute for an onboard perception stack.
+
+#### Files
+
+- Add `module/safety_shield.py`.
+- Add `module/carla_safety_adapter.py`.
+- Add `module/proposal_audit.py`.
+- Update `carlamayo_closed_loop.py`, `module/config.py`, and
+  `module/visualization.py`.
+- Add simulator-free tests for the shield, CARLA adapter, proposal audit, and
+  closed-loop arbitration.
+
+#### Implemented behavior
+
+1. Evaluate the selected fixed-world path at no more than 0.5-metre spacing,
+   including the ego footprint center and corners, against CARLA driving-lane
+   queries. Junction transitions remain valid only while the footprint is on a
+   drivable lane.
+2. Read vehicle and pedestrian poses, velocities, and bounding boxes from the
+   same exact CARLA snapshot as the control tick.
+3. Evaluate oriented-box overlap, predicted path conflict, stopping distance,
+   hard-gap, and time-to-collision conditions with auditable reason codes.
+4. Treat every unsafe or unknown road/obstacle assessment, missing controller
+   request, invalid nominal control, or adapter exception as an emergency-brake
+   trigger.
+5. Latch emergency braking for a minimum hold interval and require consecutive
+   clear ticks before releasing it.
+6. Keep controller-requested, nominal post-processed, and final applied controls
+   separate. Record `CONTROLLER_EXECUTION` or `SAFETY_OVERRIDE` as the applied
+   control source.
+7. Emit one `alpamayo_proposal` event per extracted proposal with full
+   `coc_text_full`, `coc_sha256`, length metadata, source identity, candidate
+   geometry, and a stable proposal ID. Link separate validation and control-tick
+   events to that ID; UI truncation never truncates the audit log.
+
+#### Acceptance status
+
+- Simulator-free road-containment, obstacle, hysteresis, adapter, arbitration,
+  and proposal-audit tests pass.
+- Unknown safety state demonstrably produces full braking rather than allowing
+  nominal throttle.
+- CARLA fixed-route hazard trials remain part of PR 7 and have not yet passed a
+  release gate.
+
+### PR 6: Traceable four-panel visualization UI — partially implemented
+
+The current calibrated primary view already shows persistent `ALPAMAYO PROPOSAL`,
+`CONTROLLER EXECUTION`, and `SAFETY OVERRIDE` layers, including source age,
+requested control, applied control, and override reason. The composed four-panel
+dashboard described below is still pending and can be developed in parallel with
+the validation harness. Semantic traceability is required; decorative polish is
+not a prerequisite for the basic-driving release gate.
 
 #### Files
 
@@ -509,8 +606,9 @@ Telemetry panel:
 3. The MP4 recorder consumes the same composed frame shown by Pygame.
 4. Headless operation and `--no-ui` must preserve identical control behavior and
    telemetry.
-5. Safety overlays may be empty before the safety module exists, but the
-   `SAFETY OVERRIDE: INACTIVE` state must still be explicit.
+5. Safety geometry may be sparse until the full dashboard is implemented, but
+   `SAFETY OVERRIDE: INACTIVE` or `SAFETY OVERRIDE: ACTIVE` must always be
+   explicit.
 
 #### Acceptance
 
@@ -524,7 +622,7 @@ Telemetry panel:
   in a replay test.
 - Dashboard composition and video recording pass headless simulator-free tests.
 
-### PR 7: Deterministic CARLA validation harness
+### PR 7: Deterministic CARLA validation harness — pending
 
 #### Files
 
@@ -623,8 +721,8 @@ The following begins only after the basic-driving release gate passes.
 - route-progress to Alpamayo navigation-text generation;
 - traffic-light and stop-sign state handling;
 - pedestrians, lane changes, cut-ins, and obstacle preview;
-- explicit separation of Alpamayo proposals, controller execution, safety
-  overrides, and fallback decisions.
+- preserve the existing separation of Alpamayo proposals, controller execution,
+  safety overrides, and fallback decisions as route/rule policy is added.
 
 ### Multi-trajectory selection
 
@@ -672,5 +770,5 @@ Stopping-capable world-trajectory controller
         +------> Deterministic CARLA evaluation
                          |
                          v
-Route, traffic, safety ranking, and research extensions
+Route, traffic, multi-candidate safety ranking, and research extensions
 ```

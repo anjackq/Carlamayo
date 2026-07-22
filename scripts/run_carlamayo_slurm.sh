@@ -77,6 +77,15 @@ from module.inference import require_cuda_runtime
 print(f"Alpamayo CUDA device: {require_cuda_runtime()}")
 PY
 
-echo "Starting CarlaMayo closed-loop async run."
+CARLAMAYO_RUN_ROOT="/home/aqiu/carlamayo-runs/${SLURM_JOB_ID}"
+mkdir -p "$CARLAMAYO_RUN_ROOT"
+export CARLAMAYO_OUTPUT_VIDEO="$CARLAMAYO_RUN_ROOT/carla_alpamayo_closed_loop_result.mp4"
+export CARLAMAYO_LIVE_PREVIEW_IMAGE="$CARLAMAYO_RUN_ROOT/carla_alpamayo_closed_loop_latest.jpg"
+
+echo "Starting CarlaMayo closed-loop synchronized safety run."
+echo "Artifacts: ${CARLAMAYO_RUN_ROOT}"
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$CARLAMAYO_MODEL_GPU" \
-    "$CARLAMAYO_VENV/bin/python" carlamayo_closed_loop.py --async
+    "$CARLAMAYO_VENV/bin/python" carlamayo_closed_loop.py \
+    --telemetry-jsonl "$CARLAMAYO_RUN_ROOT/runtime.jsonl" \
+    --max-episode-seconds "${CARLAMAYO_EPISODE_SECONDS:-60}" \
+    "$@"

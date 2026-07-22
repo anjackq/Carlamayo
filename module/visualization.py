@@ -10,6 +10,90 @@ import numpy as np
 import torch
 
 
+def project_world_points_to_camera(
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+    *,
+    minimum_depth_m=0.5,
+):
+    """Project CARLA world points using an exact sensor pose and calibration.
+
+    CARLA camera coordinates are ``x`` forward, ``y`` right, ``z`` up.  The
+    returned boolean mask identifies finite points in front of the camera.
+    """
+
+    points = np.asarray(world_points, dtype=np.float64)
+    camera_pose = np.asarray(camera_pose_world, dtype=np.float64)
+    intrinsic = np.asarray(camera_intrinsic, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"world_points must have shape (N, >=3), got {points.shape}")
+    if camera_pose.shape != (4, 4) or intrinsic.shape != (3, 3):
+        raise ValueError("camera pose and intrinsic matrices must be 4x4 and 3x3")
+    if not (
+        np.isfinite(points[:, :3]).all()
+        and np.isfinite(camera_pose).all()
+        and np.isfinite(intrinsic).all()
+    ):
+        raise ValueError("projection inputs must be finite")
+
+    homogeneous = np.column_stack([points[:, :3], np.ones(len(points))])
+    camera_points = (np.linalg.inv(camera_pose) @ homogeneous.T).T[:, :3]
+    depth = camera_points[:, 0]
+    valid = depth > float(minimum_depth_m)
+    pixels = np.full((len(points), 2), np.nan, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pixels[valid, 0] = (
+            intrinsic[0, 0] * camera_points[valid, 1] / depth[valid]
+            + intrinsic[0, 2]
+        )
+        pixels[valid, 1] = (
+            intrinsic[1, 2]
+            - intrinsic[1, 1] * camera_points[valid, 2] / depth[valid]
+        )
+    valid &= np.isfinite(pixels).all(axis=1)
+    return pixels, valid
+
+
+def project_world_trajectory_to_image(
+    cam_img,
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+):
+    """Draw the fixed-world controller path on its current calibrated image."""
+
+    result = np.asarray(cam_img).copy()
+    pixels, valid = project_world_points_to_camera(
+        world_points,
+        camera_pose_world,
+        camera_intrinsic,
+    )
+    height, width = result.shape[:2]
+    inside = (
+        valid
+        & (pixels[:, 0] >= 0.0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0.0)
+        & (pixels[:, 1] < height)
+    )
+    for index in range(len(pixels) - 1):
+        if inside[index] and inside[index + 1]:
+            start = tuple(np.rint(pixels[index]).astype(np.int32))
+            end = tuple(np.rint(pixels[index + 1]).astype(np.int32))
+            cv2.line(result, start, end, (0, 255, 80), 8, cv2.LINE_AA)
+    for pixel in pixels[inside]:
+        cv2.circle(
+            result,
+            tuple(np.rint(pixel).astype(np.int32)),
+            5,
+            (80, 255, 120),
+            -1,
+            cv2.LINE_AA,
+        )
+    return result
+
+
 def _project_one_trajectory(
     result,
     points_3d,
@@ -112,9 +196,32 @@ def create_visualization_frame(
     navigation_text="",
     navigation_weight=1.0,
     paused=False,
+    world_trajectory=None,
+    camera_pose_world=None,
+    camera_intrinsic=None,
+    source_frame_id=None,
+    source_age_s=None,
+    controller_state="WAITING",
+    requested_control=None,
+    applied_control=None,
+    applied_control_source="FALLBACK",
+    safety_override_applied=False,
+    safety_override_reason=None,
 ):
     """Create a single visualization frame with all overlays."""
-    vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
+    if (
+        world_trajectory is not None
+        and camera_pose_world is not None
+        and camera_intrinsic is not None
+    ):
+        vis_img = project_world_trajectory_to_image(
+            cam_img,
+            world_trajectory,
+            camera_pose_world,
+            camera_intrinsic,
+        )
+    else:
+        vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
     vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
     h, w = vis_img.shape[:2]
 
@@ -149,6 +256,49 @@ def create_visualization_frame(
         thickness,
         cv2.LINE_AA,
     )
+
+    source_text = "unknown" if source_frame_id is None else str(source_frame_id)
+    age_text = "unknown" if source_age_s is None else f"{source_age_s:.2f}s"
+    requested = requested_control or {}
+    applied = applied_control or {}
+    layer_lines = (
+        (
+            f"ALPAMAYO PROPOSAL | source frame {source_text} | age {age_text}",
+            (255, 255, 0),
+        ),
+        (
+            "CONTROLLER EXECUTION | "
+            f"{controller_state} | request "
+            f"S/T/B={requested.get('steering', 0.0):.2f}/"
+            f"{requested.get('throttle', 0.0):.2f}/"
+            f"{requested.get('brake', 0.0):.2f}",
+            (80, 255, 120),
+        ),
+        (
+            "SAFETY OVERRIDE | "
+            f"{'ACTIVE' if safety_override_applied else 'INACTIVE'} | "
+            f"source={applied_control_source} | "
+            f"applied S/T/B={applied.get('steering', 0.0):.2f}/"
+            f"{applied.get('throttle', 0.0):.2f}/"
+            f"{applied.get('brake', 0.0):.2f} | "
+            f"reason={safety_override_reason or 'none'}",
+            (0, 80, 255) if safety_override_applied else (180, 180, 180),
+        ),
+    )
+    overlay = vis_img.copy()
+    cv2.rectangle(overlay, (10, 72), (w - 10, 182), (0, 0, 0), -1)
+    vis_img = cv2.addWeighted(overlay, 0.65, vis_img, 0.35, 0)
+    for line_index, (line, color) in enumerate(layer_lines):
+        cv2.putText(
+            vis_img,
+            line,
+            (20, 100 + line_index * 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
     status = "PAUSED" if paused else "RUNNING"
     nav_display = navigation_text or "(no navigation text)"

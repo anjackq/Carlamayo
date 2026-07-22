@@ -28,9 +28,74 @@ def test_prepare_model_input_builds_expected_tensor_shapes_and_types():
 
     assert model_input["image_frames"].shape == (4, 4, 3, 8, 12)
     assert model_input["image_frames"].dtype == torch.uint8
+    assert model_input["camera_indices"].dtype == torch.int64
+    assert model_input["camera_indices"].device.type == "cpu"
+    assert model_input["camera_indices"].tolist() == [0, 1, 2, 6]
     assert model_input["ego_history_xyz"].shape == (1, 1, 16, 3)
     assert model_input["ego_history_xyz"].dtype == torch.float32
     assert model_input["ego_history_rot"].shape == (1, 1, 16, 3, 3)
+
+    messages = inference.helper.create_message(
+        model_input["image_frames"].flatten(0, 1),
+        camera_indices=model_input["camera_indices"],
+        num_frames_per_camera=4,
+    )
+    labels = [
+        item["text"]
+        for item in messages[1]["content"]
+        if item["type"] == "text"
+    ]
+    assert "Front left camera: " in labels
+    assert "Front camera: " in labels
+    assert "Front right camera: " in labels
+    assert "Front telephoto camera: " in labels
+    assert labels.count("frame 0 ") == 4
+    assert labels.count("frame 3 ") == 4
+
+
+@pytest.mark.parametrize(
+    ("images_shape", "history_shape", "rotation_shape", "message"),
+    [
+        ((3, 4, 8, 12, 3), (16, 3), (16, 3, 3), "images_array"),
+        ((4, 3, 8, 12, 3), (16, 3), (16, 3, 3), "images_array"),
+        ((4, 4, 8, 12, 3), (15, 3), (16, 3, 3), "history_xyz"),
+        ((4, 4, 8, 12, 3), (16, 3), (15, 3, 3), "history_rot"),
+    ],
+)
+def test_prepare_model_input_rejects_wrong_synchronized_shapes(
+    images_shape,
+    history_shape,
+    rotation_shape,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        inference.prepare_model_input(
+            np.zeros(images_shape, dtype=np.uint8),
+            np.zeros(history_shape, dtype=np.float32),
+            np.zeros(rotation_shape, dtype=np.float32),
+        )
+
+
+def test_prepare_model_input_validates_explicit_camera_identity_order():
+    images = np.zeros((4, 4, 8, 12, 3), dtype=np.uint8)
+    history_xyz = np.zeros((16, 3), dtype=np.float32)
+    history_rot = np.repeat(np.eye(3, dtype=np.float32)[None, :, :], 16, axis=0)
+
+    model_input = inference.prepare_model_input(
+        images,
+        history_xyz,
+        history_rot,
+        camera_indices=(0, 1, 2, 6),
+    )
+    assert model_input["camera_indices"].tolist() == [0, 1, 2, 6]
+
+    with pytest.raises(ValueError, match="camera_indices"):
+        inference.prepare_model_input(
+            images,
+            history_xyz,
+            history_rot,
+            camera_indices=(1, 0, 2, 6),
+        )
 
 
 @pytest.mark.parametrize(
