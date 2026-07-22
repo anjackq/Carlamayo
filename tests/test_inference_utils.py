@@ -9,6 +9,16 @@ def test_model_name_uses_alpamayo_15_weights():
     assert inference.ALPAMAYO_MODEL_NAME == "nvidia/Alpamayo-1.5-10B"
 
 
+def test_require_cuda_runtime_fails_before_model_loading_without_cuda(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(inference.torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="Exclusive_Process") as exc_info:
+        inference.require_cuda_runtime()
+
+    assert "CUDA_VISIBLE_DEVICES=0" in str(exc_info.value)
+
+
 def test_prepare_model_input_builds_expected_tensor_shapes_and_types():
     images = np.zeros((4, 4, 8, 12, 3), dtype=np.uint8)
     history_xyz = np.zeros((16, 3), dtype=np.float32)

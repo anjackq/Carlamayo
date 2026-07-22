@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 import re
 
 import torch
@@ -34,6 +35,32 @@ VQA_ANSWER_TERMINATORS = (
 )
 
 
+def require_cuda_runtime():
+    """Fail before model loading when PyTorch cannot use an NVIDIA GPU."""
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable to PyTorch, and Alpamayo cannot run on CPU. "
+            "Verify that this process is inside a GPU allocation, that `nvidia-smi` "
+            "can access the assigned GPU, and that another process (such as CARLA) "
+            "does not already own an Exclusive_Process GPU. "
+            f"CUDA_VISIBLE_DEVICES={visible_devices}."
+        )
+
+    try:
+        probe = torch.empty(1, device="cuda")
+        del probe
+    except Exception as exc:
+        raise RuntimeError(
+            "PyTorch detected CUDA but could not create a CUDA tensor. Check the "
+            "NVIDIA driver and whether another process owns an Exclusive_Process GPU. "
+            f"CUDA_VISIBLE_DEVICES={visible_devices}."
+        ) from exc
+
+    return torch.cuda.get_device_name(0)
+
+
 def configure_cuda_linalg_library(library: str | None):
     """Set PyTorch's preferred CUDA linalg backend when supported."""
 
@@ -59,6 +86,7 @@ def configure_cuda_linalg_library(library: str | None):
 
 def load_model(use_quantization: bool, device_map="auto"):
     """Load Alpamayo model and processor."""
+    require_cuda_runtime()
     if use_quantization:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,

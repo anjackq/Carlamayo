@@ -91,6 +91,23 @@ def test_video_recorder_no_frames_does_not_create_output(tmp_path):
     assert not output_path.exists()
 
 
+def test_video_recorder_streams_frames_and_publishes_preview(tmp_path):
+    output_path = tmp_path / "streamed.mp4"
+    preview_path = tmp_path / "latest.jpg"
+    recorder = VideoRecorder(output_path, fps=5, preview_path=preview_path)
+
+    recorder.add_frame(np.zeros((80, 120, 3), dtype=np.uint8))
+
+    assert recorder.frame_count == 1
+    assert preview_path.exists()
+    assert preview_path.stat().st_size > 0
+
+    recorder.save()
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+
 def test_save_open_loop_video_writes_nonempty_video(tmp_path):
     output_path = tmp_path / "open_loop.mp4"
     predictions = [np.array([[[2.0, 0.0, 0.0], [5.0, 0.2, 0.0], [8.0, 0.4, 0.0]]])]

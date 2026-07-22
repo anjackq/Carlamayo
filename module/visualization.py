@@ -309,15 +309,42 @@ def transcode_video_for_browser_compat(source_path, output_path):
 
 
 class VideoRecorder:
-    """Records frames and saves to video file."""
+    """Stream RGB frames to disk and optionally publish a live JPEG preview."""
 
-    def __init__(self, output_path, fps=10):
-        self.output_path = output_path
+    def __init__(self, output_path, fps=10, preview_path=None, preview_interval_frames=1):
+        self.output_path = os.fspath(output_path)
         self.fps = fps
-        self.frames = []
+        self.preview_path = os.fspath(preview_path) if preview_path is not None else None
+        self.preview_interval_frames = max(1, int(preview_interval_frames))
+        self.frame_count = 0
+        self.width = None
+        self.height = None
+        self._writer = None
+        self._selected_codec = None
+        self._temp_path = None
 
     def add_frame(self, frame):
-        self.frames.append(frame)
+        frame = np.asarray(frame)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected RGB frame with shape HxWx3, got {frame.shape}")
+
+        height, width = frame.shape[:2]
+        if self._writer is None:
+            self._initialize_writer(width, height)
+        elif (width, height) != (self.width, self.height):
+            raise ValueError(
+                f"Video frame size changed from {self.width}x{self.height} "
+                f"to {width}x{height}"
+            )
+
+        self._writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.frame_count += 1
+
+        if (
+            self.preview_path is not None
+            and (self.frame_count - 1) % self.preview_interval_frames == 0
+        ):
+            self._publish_preview(frame)
 
     def _create_writer(self, width, height, output_path):
         for codec in ("mp4v", "avc1", "H264"):
@@ -328,44 +355,58 @@ class VideoRecorder:
             writer.release()
         return None, None
 
-    def save(self):
-        if not self.frames:
-            print("No frames to save.")
-            return
-
-        print(f"\nSaving video with {len(self.frames)} frames...")
-        h, w = self.frames[0].shape[:2]
+    def _initialize_writer(self, width, height):
         output_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
         os.makedirs(output_dir, exist_ok=True)
-        temp_path = os.path.join(
+        self._temp_path = os.path.join(
             output_dir,
             f".{os.path.basename(self.output_path)}.opencv-tmp.mp4",
         )
-
-        writer, selected_codec = self._create_writer(w, h, temp_path)
+        writer, selected_codec = self._create_writer(width, height, self._temp_path)
         if writer is None:
-            print("Failed to initialize video writer.")
-            return
+            raise RuntimeError("Failed to initialize video writer.")
         if hasattr(cv2, "VIDEOWRITER_PROP_QUALITY"):
             writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)
 
-        for frame in self.frames:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.width = width
+        self.height = height
+        self._writer = writer
+        self._selected_codec = selected_codec
 
-        writer.release()
+    def _publish_preview(self, frame):
+        preview_dir = os.path.dirname(os.path.abspath(self.preview_path)) or "."
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_name = os.path.basename(self.preview_path)
+        preview_temp = os.path.join(preview_dir, f".{preview_name}.tmp.jpg")
+        if not cv2.imwrite(preview_temp, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)):
+            raise RuntimeError(f"Failed to write live preview image: {self.preview_path}")
+        os.replace(preview_temp, self.preview_path)
 
-        transcoded, transcode_msg = transcode_video_for_browser_compat(temp_path, self.output_path)
+    def save(self):
+        if self.frame_count == 0:
+            print("No frames to save.")
+            return
+
+        print(f"\nFinalizing video with {self.frame_count} frames...")
+        self._writer.release()
+        self._writer = None
+
+        transcoded, transcode_msg = transcode_video_for_browser_compat(
+            self._temp_path,
+            self.output_path,
+        )
         if not transcoded:
-            shutil.move(temp_path, self.output_path)
+            shutil.move(self._temp_path, self.output_path)
             print(
                 f"Warning: H.264 transcode skipped ({transcode_msg}); "
-                f"saved OpenCV {selected_codec} output."
+                f"saved OpenCV {self._selected_codec} output."
             )
         else:
-            os.remove(temp_path)
+            os.remove(self._temp_path)
 
         print(f"Video saved: {self.output_path}")
         print(
-            f"  Codec: {transcode_msg if transcoded else selected_codec}, "
-            f"Resolution: {w}x{h}, FPS: {self.fps}, Frames: {len(self.frames)}"
+            f"  Codec: {transcode_msg if transcoded else self._selected_codec}, "
+            f"Resolution: {self.width}x{self.height}, FPS: {self.fps}, "
+            f"Frames: {self.frame_count}"
         )

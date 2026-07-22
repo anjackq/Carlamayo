@@ -234,7 +234,16 @@ def main():
         print("OOM-free mode: Alpamayo loads after CARLA is fully spawned.")
 
     carla_if = CARLAInterface()
-    video_recorder = VideoRecorder(cfg.OUTPUT_VIDEO, fps=cfg.VIDEO_FPS) if cfg.SAVE_VIDEO else None
+    video_recorder = (
+        VideoRecorder(
+            cfg.OUTPUT_VIDEO,
+            fps=cfg.VIDEO_FPS,
+            preview_path=cfg.LIVE_PREVIEW_IMAGE,
+            preview_interval_frames=max(1, cfg.VIDEO_FPS // 2),
+        )
+        if cfg.SAVE_VIDEO
+        else None
+    )
     pygame_ui = None
     pygame_ui_recorder = None
     latest_ui_frame = None

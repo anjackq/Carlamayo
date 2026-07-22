@@ -20,6 +20,7 @@ NUM_TRAJ_SAMPLES = 1
 # Video Configuration
 SAVE_VIDEO = True
 OUTPUT_VIDEO = "carla_alpamayo_closed_loop_result.mp4"
+LIVE_PREVIEW_IMAGE = "carla_alpamayo_closed_loop_latest.jpg"
 VIDEO_FPS = 10
 PYGAME_WINDOW_WIDTH = 1280
 PYGAME_WINDOW_HEIGHT = 900
