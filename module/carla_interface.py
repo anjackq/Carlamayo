@@ -34,6 +34,11 @@ class CARLAInterface:
         self.sensors = {}
         self.sensor_queues = {}
         self.collision_events = []
+        self.spawn_collision_count = 0
+        # The spawn-local counter drives RespawnMonitor, the detail list is a
+        # bounded diagnostic ring, and the episode total deliberately survives
+        # ego respawns for run-level telemetry.
+        self.episode_collision_count = 0
         self.history_buffer = []
         self.npc_vehicle_ids = []
         self.npc_walker_ids = []
@@ -254,6 +259,8 @@ class CARLAInterface:
             "other_actor_id": int(getattr(other_actor, "id", 0)),
         }
         self.collision_events.append(collision_event)
+        self.spawn_collision_count += 1
+        self.episode_collision_count += 1
         if len(self.collision_events) > 20:
             self.collision_events = self.collision_events[-20:]
         print(
@@ -263,13 +270,19 @@ class CARLAInterface:
         )
 
     def get_collision_count(self):
-        return len(self.collision_events)
+        return self.spawn_collision_count
+
+    def get_episode_collision_count(self):
+        """Return the collision count for the complete interface lifetime."""
+
+        return self.episode_collision_count
 
     def get_last_collision_event(self):
         return self.collision_events[-1] if self.collision_events else None
 
     def reset_collision_history(self):
         self.collision_events.clear()
+        self.spawn_collision_count = 0
 
     def flush_camera_queues(self):
         for sensor_queue in self.sensor_queues.values():

@@ -124,6 +124,26 @@ Optional async inference mode:
 python carlamayo_closed_loop.py --async
 ```
 
+Optional runtime telemetry and a bounded simulation episode:
+
+```bash
+python carlamayo_closed_loop.py --async \
+  --telemetry-jsonl carlamayo_runtime.jsonl \
+  --max-episode-seconds 120
+```
+
+The JSONL stream contains schema-versioned inference, control-tick, respawn,
+and final-summary events. It distinguishes raw controller requests from the
+post-processed control sent to CARLA and preserves an episode-wide collision
+total across ego respawns. The duration limit counts successful CARLA ticks,
+so it pauses with the Pygame UI and does not interrupt model loading or a
+blocking inference call.
+
+Until synchronized sensor frame identities are added, source/arrival CARLA
+frame IDs and exact simulation-time plan age are recorded as `null`. The
+current loop-tick estimates are explicitly labelled as proxies and are not
+included in the exact plan-age percentiles.
+
 Output:
 
 - `carla_alpamayo_closed_loop_result.mp4`

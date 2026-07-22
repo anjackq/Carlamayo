@@ -1,6 +1,7 @@
 """Modular entrypoint for CARLA closed-loop control with Alpamayo."""
 
 import argparse
+import math
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ from module import config as cfg
 from module.navigation_control import NavigationControlState
 from module.pid_controller import OfficialPIDFollower
 from module.respawn_control import RespawnMonitor
+from module.runtime_metrics import JsonlWriter, RuntimeMetrics
 from module.vlm_generate_optimization import VlmGenerateTiming
 from module.visualization import VideoRecorder, create_visualization_frame
 from module.carla_interface import CARLAInterface
@@ -50,6 +52,7 @@ def format_vqa_answer_preview(answer, limit=160):
 def capture_initial_ui_frame(carla_if, frame_count):
     """Tick once so paused pygame starts with a real camera frame."""
 
+    carla_if.apply_control(0.0, 0.0, 1.0)
     carla_if.tick()
     frame_count += 1
     state = carla_if.get_ego_state()
@@ -70,7 +73,7 @@ def capture_initial_ui_frame(carla_if, frame_count):
     return frame_count, ui_frame, telemetry
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run CARLA closed-loop control with Alpamayo (modular)."
     )
@@ -176,9 +179,31 @@ def parse_args():
         action="store_true",
         help="Print async inference worker tracebacks when worker requests fail.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--telemetry-jsonl",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Append schema-versioned tick, inference, respawn, and summary events "
+            "to this JSONL file. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--max-episode-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Stop after this many seconds of successful simulation ticks. "
+            "Disabled by default."
+        ),
+    )
+    args = parser.parse_args(argv)
     if args.oom_free and args.quantization:
         parser.error("--oom-free and --quantization are mutually exclusive.")
+    if args.max_episode_seconds is not None and (
+        not math.isfinite(args.max_episode_seconds) or args.max_episode_seconds <= 0.0
+    ):
+        parser.error("--max-episode-seconds must be finite and greater than zero.")
     args.start_paused = bool(args.pygame_ui)
     args.pygame_ui_video = (
         derive_pygame_ui_video_path(cfg.OUTPUT_VIDEO) if args.pygame_ui else None
@@ -204,6 +229,9 @@ def main():
     print(f"Device map: {args.device_map}")
     print(f"CUDA linalg library: {args.cuda_linalg_library}")
     print("Auto respawn: ON after collisions")
+    print(f"Runtime telemetry: {args.telemetry_jsonl or 'OFF'}")
+    if args.max_episode_seconds is not None:
+        print(f"Episode limit: {args.max_episode_seconds:.1f}s of simulation ticks")
 
     nav_state = NavigationControlState(
         args.navigation_text,
@@ -248,6 +276,49 @@ def main():
     pygame_ui_recorder = None
     latest_ui_frame = None
     latest_telemetry = {}
+    run_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}"
+    run_started_monotonic_s = None
+    runtime_metrics = None
+    telemetry_writer = JsonlWriter(args.telemetry_jsonl) if args.telemetry_jsonl else None
+    telemetry_write_failed = False
+    frame_count = 0
+    respawn_count = 0
+    request_sequence = 0
+    simulation_tick_seconds = float(cfg.CONTROL_DT)
+    stop_reason = "unknown"
+    run_error = None
+    pending_inference = False
+    inference_request_q = None
+    inference_result_q = None
+    inference_stop = None
+    worker_thread = None
+
+    def emit_runtime_event(event_type, **fields):
+        """Aggregate an event and append it to JSONL when telemetry is enabled."""
+
+        nonlocal telemetry_write_failed, run_started_monotonic_s, runtime_metrics
+        if run_started_monotonic_s is None:
+            run_started_monotonic_s = time.monotonic()
+        if runtime_metrics is None:
+            runtime_metrics = RuntimeMetrics()
+        event = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "wall_time_unix_s": time.time(),
+            "wall_elapsed_s": max(0.0, time.monotonic() - run_started_monotonic_s),
+            **fields,
+        }
+        payload = runtime_metrics.record_event(
+            event_type,
+            event,
+        )
+        if telemetry_writer is not None and not telemetry_write_failed:
+            try:
+                telemetry_writer.append(payload)
+            except Exception as exc:
+                telemetry_write_failed = True
+                print(f"Warning: runtime telemetry disabled after write failure: {exc}")
+        return payload
 
     if args.pygame_ui:
         from module.pygame_ui import ClosedLoopPygameUI
@@ -271,6 +342,9 @@ def main():
         carla_if.load_map(cfg.CARLA_MAP)
         carla_if.spawn_ego_vehicle()
         carla_if.enable_synchronous_mode()
+        fixed_delta_seconds = carla_if.world.get_settings().fixed_delta_seconds
+        if fixed_delta_seconds is not None and float(fixed_delta_seconds) > 0.0:
+            simulation_tick_seconds = float(fixed_delta_seconds)
         carla_if.spawn_npcs(num_vehicles=cfg.NPC_VEHICLE_COUNT, num_walkers=cfg.NPC_WALKER_COUNT)
         carla_if.setup_cameras()
         carla_if.setup_collision_sensor()
@@ -305,9 +379,14 @@ def main():
         )
         frame_buffer = []
         current_trajectory_ts = None
+        current_plan_id = None
+        current_plan_source_loop_tick_id = None
+        current_plan_source_elapsed_proxy_s = None
         prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 0.0}
 
         pending_inference = False
+        pending_request_id = None
+        outstanding_async_requests = {}
         last_inference_submit_ts = 0.0
         respawn_revision = 0
         inference_request_q = None
@@ -315,24 +394,199 @@ def main():
         inference_stop = None
         worker_thread = None
 
-        def _clear_async_queues():
-            for maybe_queue in (inference_request_q, inference_result_q):
-                if maybe_queue is None:
-                    continue
+        def _emit_async_terminal(request_id, status, rejection_reason, result=None):
+            if request_id is None:
+                return False
+            request = outstanding_async_requests.pop(int(request_id), None)
+            if request is None:
+                return False
+            has_result = result is not None
+            result = result or {}
+            source_loop_tick_id = request["source_loop_tick_id"]
+            source_age_proxy_s = max(
+                0.0,
+                float(frame_count - source_loop_tick_id) * simulation_tick_seconds,
+            )
+            request_lifetime_s = max(
+                0.0,
+                time.monotonic() - request["submission_monotonic_s"],
+            )
+            emit_runtime_event(
+                "inference_result",
+                request_id=int(request_id),
+                mode=result.get("mode", request["mode"]),
+                status=status,
+                rejected=rejection_reason is not None,
+                rejection_reason=rejection_reason,
+                source_loop_tick_id=source_loop_tick_id,
+                source_elapsed_proxy_s=request["source_elapsed_proxy_s"],
+                source_carla_frame_id=None,
+                source_simulation_time_s=None,
+                arrival_loop_tick_id=int(frame_count),
+                arrival_carla_frame_id=None,
+                arrival_simulation_time_s=None,
+                frame_id_quality="loop_counter_proxy",
+                source_age_s=None,
+                source_age_proxy_s=source_age_proxy_s,
+                inference_wall_latency_s=request_lifetime_s if has_result else None,
+                request_lifetime_s=request_lifetime_s,
+                model_inference_latency_s=result.get("model_inference_time"),
+                worker_compute_latency_s=result.get("inference_time"),
+                prompt_revision=request["prompt_revision"],
+                respawn_revision=request["respawn_revision"],
+                source_plan_id=current_plan_id if status == "accepted_plan" else None,
+            )
+            return True
+
+        def _emit_sync_terminal(
+            *,
+            request_id,
+            mode,
+            status,
+            rejection_reason,
+            submission_monotonic_s,
+            model_inference_latency_s=None,
+            source_plan_id=None,
+        ):
+            request_lifetime_s = max(0.0, time.monotonic() - submission_monotonic_s)
+            emit_runtime_event(
+                "inference_result",
+                request_id=request_id,
+                mode=mode,
+                status=status,
+                rejected=rejection_reason is not None,
+                rejection_reason=rejection_reason,
+                source_loop_tick_id=int(frame_count),
+                source_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
+                source_carla_frame_id=None,
+                source_simulation_time_s=None,
+                arrival_loop_tick_id=int(frame_count),
+                arrival_carla_frame_id=None,
+                arrival_simulation_time_s=None,
+                frame_id_quality="loop_counter_proxy",
+                source_age_s=None,
+                source_age_proxy_s=0.0,
+                inference_wall_latency_s=request_lifetime_s,
+                request_lifetime_s=request_lifetime_s,
+                model_inference_latency_s=model_inference_latency_s,
+                prompt_revision=nav_state.revision,
+                respawn_revision=respawn_revision,
+                source_plan_id=source_plan_id,
+            )
+
+        def _clear_async_queues(reason):
+            if inference_request_q is not None:
                 while True:
                     try:
-                        maybe_queue.get_nowait()
+                        request = inference_request_q.get_nowait()
                     except queue.Empty:
                         break
+                    if request is not None:
+                        _emit_async_terminal(
+                            request.get("request_id"),
+                            "cancelled",
+                            f"request_queue_cleared:{reason}",
+                        )
+            if inference_result_q is not None:
+                while True:
+                    try:
+                        result = inference_result_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    for request_id in result.get("superseded_request_ids", ()):
+                        _emit_async_terminal(
+                            request_id,
+                            "discarded",
+                            "result_queue_superseded",
+                        )
+                    _emit_async_terminal(
+                        result.get("request_id"),
+                        "discarded",
+                        f"result_queue_cleared:{reason}",
+                        result=result,
+                    )
+
+        def _simulation_elapsed_proxy_s():
+            return float(frame_count) * simulation_tick_seconds
+
+        def _current_plan_timing_proxies():
+            if current_plan_source_loop_tick_id is None:
+                return None, None
+            age_s = max(
+                0.0,
+                float(frame_count - current_plan_source_loop_tick_id) * simulation_tick_seconds,
+            )
+            horizon_s = None
+            if current_trajectory is not None:
+                horizon_s = max(
+                    0.0,
+                    float(len(current_trajectory)) * simulation_tick_seconds - age_s,
+                )
+            return age_s, horizon_s
+
+        def _emit_control_tick(
+            *,
+            state,
+            controller_state,
+            requested_control,
+            applied_control,
+            fallback_state="NONE",
+            fallback_reason=None,
+            rejection_reason=None,
+            control_origin="nominal_controller",
+            postprocessing=(),
+            event_type="tick",
+        ):
+            plan_age_proxy_s, remaining_horizon_proxy_s = _current_plan_timing_proxies()
+            return emit_runtime_event(
+                event_type,
+                loop_tick_id=int(frame_count),
+                carla_frame_id=None,
+                simulation_time_s=None,
+                simulation_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
+                frame_id_quality="loop_counter_proxy",
+                source_carla_frame_id=None,
+                source_simulation_time_s=None,
+                source_loop_tick_id=current_plan_source_loop_tick_id,
+                source_elapsed_proxy_s=current_plan_source_elapsed_proxy_s,
+                source_age_s=None,
+                plan_source_age_proxy_s=plan_age_proxy_s,
+                remaining_horizon_s=None,
+                remaining_horizon_proxy_s=remaining_horizon_proxy_s,
+                speed_mps=float(state["speed"]),
+                controller_state=controller_state,
+                control_timing="command_applied_after_observation",
+                control_origin=control_origin,
+                requested_control=requested_control,
+                applied_control=applied_control,
+                postprocessing=list(postprocessing),
+                fallback_state=fallback_state,
+                fallback_reason=fallback_reason,
+                safety_override_applied=False,
+                safety_override_type=None,
+                safety_override_reason=None,
+                rejection_reason=rejection_reason,
+                source_plan_id=current_plan_id,
+                source_plan_frame_id=None,
+                source_plan_loop_tick_id=current_plan_source_loop_tick_id,
+                prompt_revision=nav_state.revision,
+                respawn_revision=respawn_revision,
+                inference_pending=bool(pending_inference),
+                collision_count=carla_if.get_episode_collision_count(),
+            )
 
         def _auto_respawn(reason):
             nonlocal current_trajectory, current_pred_xyz, prev_selected_trajectory
             nonlocal current_selected_traj_idx, current_cot, current_inference_time
             nonlocal current_trajectory_ts, prev_control, pending_inference, pid_follower
+            nonlocal pending_request_id
             nonlocal respawn_revision, last_vqa_submitted_revision, last_vqa_completed_revision
+            nonlocal current_plan_id, current_plan_source_loop_tick_id
+            nonlocal current_plan_source_elapsed_proxy_s, respawn_count
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
             carla_if.respawn_ego_vehicle()
+            respawn_count += 1
             pid_follower = OfficialPIDFollower(carla_if.world, carla_if.ego_vehicle)
             current_trajectory = None
             current_pred_xyz = None
@@ -341,8 +595,12 @@ def main():
             current_cot = ""
             current_inference_time = 0.0
             current_trajectory_ts = None
+            current_plan_id = None
+            current_plan_source_loop_tick_id = None
+            current_plan_source_elapsed_proxy_s = None
             prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
             pending_inference = False
+            pending_request_id = None
             respawn_revision += 1
             last_vqa_submitted_revision = None
             last_vqa_completed_revision = None
@@ -351,7 +609,16 @@ def main():
                 collision_count=carla_if.get_collision_count(),
             )
             frame_buffer.clear()
-            _clear_async_queues()
+            _clear_async_queues("respawn")
+            emit_runtime_event(
+                "respawn",
+                loop_tick_id=int(frame_count),
+                simulation_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
+                reason=reason,
+                respawn_count=respawn_count,
+                respawn_revision=respawn_revision,
+                collision_count=carla_if.get_episode_collision_count(),
+            )
 
         def _run_inference_with_nav_fallback(model_data, navigation_text, navigation_weight):
             def _run_once(weight):
@@ -412,6 +679,7 @@ def main():
             inference_stop = threading.Event()
 
             def _build_inference_request():
+                nonlocal request_sequence
                 images_array = np.zeros(
                     (
                         cfg.NUM_CAMERAS,
@@ -426,7 +694,9 @@ def main():
                     for c in range(cfg.NUM_CAMERAS):
                         images_array[c, t] = frame_images[c]
                 history_xyz, history_rot = carla_if.get_history_in_local_frame()
+                request_sequence += 1
                 return {
+                    "request_id": request_sequence,
                     "mode": args.mode,
                     "images_array": images_array,
                     "history_xyz": history_xyz,
@@ -436,6 +706,12 @@ def main():
                     "vqa_question": nav_state.vqa_question,
                     "prompt_revision": nav_state.revision,
                     "respawn_revision": respawn_revision,
+                    "source_loop_tick_id": int(frame_count),
+                    "source_elapsed_proxy_s": _simulation_elapsed_proxy_s(),
+                    "source_carla_frame_id": None,
+                    "source_simulation_time_s": None,
+                    "submission_wall_time_s": time.time(),
+                    "submission_monotonic_s": time.monotonic(),
                 }
 
             def _inference_worker():
@@ -447,28 +723,39 @@ def main():
                     if req is None:
                         break
                     req_frame = int(req["frame"])
+                    model_t0 = None
                     try:
-                        t0 = time.time()
+                        t0 = time.monotonic()
                         model_data = prepare_model_input(
                             req["images_array"],
                             req["history_xyz"],
                             req["history_rot"],
                         )
+                        model_t0 = time.monotonic()
                         if req["mode"] == "vqa":
                             extra = _run_vqa_with_linalg_fallback(
                                 model_data,
                                 question=req["vqa_question"],
                             )
+                            completed_monotonic_s = time.monotonic()
                             result = {
                                 "mode": "vqa",
                                 "frame_submitted": req_frame,
                                 "extra": extra,
                                 "answer": extract_answer_text(extra),
-                                "inference_time": time.time() - t0,
-                                "result_ts": time.time(),
+                                "inference_time": completed_monotonic_s - t0,
+                                "model_inference_time": completed_monotonic_s - model_t0,
+                                "result_ts": time.monotonic(),
                                 "vqa_question": req["vqa_question"],
                                 "prompt_revision": req["prompt_revision"],
                                 "respawn_revision": req["respawn_revision"],
+                                "request_id": req["request_id"],
+                                "source_loop_tick_id": req["source_loop_tick_id"],
+                                "source_elapsed_proxy_s": req["source_elapsed_proxy_s"],
+                                "source_carla_frame_id": req["source_carla_frame_id"],
+                                "source_simulation_time_s": req["source_simulation_time_s"],
+                                "submission_wall_time_s": req["submission_wall_time_s"],
+                                "submission_monotonic_s": req["submission_monotonic_s"],
                             }
                         else:
                             navigation_text = (
@@ -482,32 +769,61 @@ def main():
                                 navigation_text=navigation_text,
                                 navigation_weight=navigation_weight,
                             )
+                            completed_monotonic_s = time.monotonic()
                             result = {
                                 "mode": req["mode"],
                                 "frame_submitted": req_frame,
                                 "pred_xyz": pred_xyz,
                                 "extra": extra,
-                                "inference_time": time.time() - t0,
-                                "result_ts": time.time(),
+                                "inference_time": completed_monotonic_s - t0,
+                                "model_inference_time": completed_monotonic_s - model_t0,
+                                "result_ts": time.monotonic(),
                                 "navigation_text": navigation_text,
                                 "navigation_weight": navigation_weight,
                                 "prompt_revision": req["prompt_revision"],
                                 "respawn_revision": req["respawn_revision"],
+                                "request_id": req["request_id"],
+                                "source_loop_tick_id": req["source_loop_tick_id"],
+                                "source_elapsed_proxy_s": req["source_elapsed_proxy_s"],
+                                "source_carla_frame_id": req["source_carla_frame_id"],
+                                "source_simulation_time_s": req["source_simulation_time_s"],
+                                "submission_wall_time_s": req["submission_wall_time_s"],
+                                "submission_monotonic_s": req["submission_monotonic_s"],
                             }
                     except Exception as e:
                         result = {
                             "frame_submitted": req_frame,
                             "error": str(e),
                             "traceback": traceback.format_exc(),
-                            "result_ts": time.time(),
+                            "inference_time": time.monotonic() - t0,
+                            "model_inference_time": (
+                                time.monotonic() - model_t0 if model_t0 is not None else None
+                            ),
+                            "result_ts": time.monotonic(),
+                            "request_id": req.get("request_id"),
+                            "source_loop_tick_id": req.get("source_loop_tick_id"),
+                            "source_elapsed_proxy_s": req.get("source_elapsed_proxy_s"),
+                            "source_carla_frame_id": req.get("source_carla_frame_id"),
+                            "source_simulation_time_s": req.get("source_simulation_time_s"),
+                            "submission_wall_time_s": req.get("submission_wall_time_s"),
+                            "submission_monotonic_s": req.get("submission_monotonic_s"),
+                            "prompt_revision": req.get("prompt_revision"),
                             "respawn_revision": req.get("respawn_revision"),
                         }
 
+                    superseded_request_ids = []
                     while True:
                         try:
-                            inference_result_q.get_nowait()
+                            superseded = inference_result_q.get_nowait()
                         except queue.Empty:
                             break
+                        superseded_request_ids.extend(
+                            superseded.get("superseded_request_ids", ())
+                        )
+                        if superseded.get("request_id") is not None:
+                            superseded_request_ids.append(superseded["request_id"])
+                    if superseded_request_ids:
+                        result["superseded_request_ids"] = superseded_request_ids
                     inference_result_q.put_nowait(result)
 
             worker_thread = threading.Thread(
@@ -524,21 +840,53 @@ def main():
             print(f"Recording Pygame UI to: {args.pygame_ui_video}")
         print("-" * 60)
 
-        frame_count = 0
         last_seen_nav_revision = nav_state.revision
         last_vqa_submitted_revision = None
         last_vqa_completed_revision = None
+        pause_brake_active = False
         if pygame_ui is not None and nav_state.paused:
             frame_count, latest_ui_frame, latest_telemetry = capture_initial_ui_frame(
                 carla_if,
                 frame_count,
             )
+        emit_runtime_event(
+            "episode_start",
+            mode=args.mode,
+            execution="async" if args.async_mode else "sync",
+            frame_id_quality="loop_counter_proxy",
+            exact_sensor_frame_ids_available=False,
+            simulation_tick_seconds=simulation_tick_seconds,
+            initial_loop_tick_id=int(frame_count),
+            max_episode_seconds=args.max_episode_seconds,
+        )
+        if pygame_ui is not None and nav_state.paused:
+            _emit_control_tick(
+                state=carla_if.get_ego_state(),
+                controller_state="PAUSED",
+                requested_control=None,
+                applied_control={"steering": 0.0, "throttle": 0.0, "brake": 1.0},
+                fallback_state="PAUSED_BRAKE",
+                fallback_reason="pygame_started_paused",
+                control_origin="paused_ui",
+            )
+            pause_brake_active = True
             draw_pygame_ui(latest_ui_frame, latest_telemetry)
 
         while True:
+            if (
+                args.max_episode_seconds is not None
+                and _simulation_elapsed_proxy_s() >= args.max_episode_seconds
+            ):
+                stop_reason = "max_episode_seconds"
+                print(
+                    "\nEpisode duration limit reached: "
+                    f"{_simulation_elapsed_proxy_s():.1f}s of simulation ticks."
+                )
+                break
             if pygame_ui is not None:
                 if not pygame_ui.process_events(nav_state):
                     print("\nPygame UI requested shutdown.")
+                    stop_reason = "pygame_shutdown"
                     break
                 if nav_state.revision != last_seen_nav_revision:
                     if args.mode == "navigation":
@@ -552,10 +900,36 @@ def main():
                     current_trajectory = None
                     current_pred_xyz = None
                     current_trajectory_ts = None
+                    current_plan_id = None
+                    current_plan_source_loop_tick_id = None
+                    current_plan_source_elapsed_proxy_s = None
                     pending_inference = False
+                    pending_request_id = None
+                    emit_runtime_event(
+                        "prompt_revision_changed",
+                        loop_tick_id=int(frame_count),
+                        prompt_revision=nav_state.revision,
+                        mode=args.mode,
+                    )
                     last_seen_nav_revision = nav_state.revision
                 if nav_state.paused:
-                    carla_if._control(0.0, 0.0, 1.0)
+                    if not pause_brake_active:
+                        carla_if.apply_control(0.0, 0.0, 1.0)
+                        _emit_control_tick(
+                            state=carla_if.get_ego_state(),
+                            controller_state="PAUSED",
+                            requested_control=None,
+                            applied_control={
+                                "steering": 0.0,
+                                "throttle": 0.0,
+                                "brake": 1.0,
+                            },
+                            fallback_state="PAUSED_BRAKE",
+                            fallback_reason="pygame_paused",
+                            control_origin="paused_ui",
+                            event_type="control_command",
+                        )
+                        pause_brake_active = True
                     latest_telemetry = {
                         **latest_telemetry,
                         "frame": frame_count,
@@ -563,6 +937,7 @@ def main():
                     }
                     draw_pygame_ui(latest_ui_frame, latest_telemetry)
                     continue
+                pause_brake_active = False
 
             carla_if.tick()
             frame_count += 1
@@ -577,6 +952,15 @@ def main():
             )
             if collision_decision.should_respawn:
                 _auto_respawn(collision_decision.reason)
+                _emit_control_tick(
+                    state=state,
+                    controller_state="RESPAWNING",
+                    requested_control=None,
+                    applied_control={"steering": 0.0, "throttle": 0.0, "brake": 1.0},
+                    fallback_state="RESPAWN_BRAKE",
+                    fallback_reason=collision_decision.reason,
+                    control_origin="respawn_reset",
+                )
                 continue
 
             try:
@@ -585,6 +969,15 @@ def main():
                 print(f"[Frame {frame_count}] Warning: {exc}; braking and skipping this tick.")
                 carla_if.apply_control(0.0, 0.0, 1.0)
                 prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
+                _emit_control_tick(
+                    state=state,
+                    controller_state="CAMERA_TIMEOUT",
+                    requested_control=None,
+                    applied_control={"steering": 0.0, "throttle": 0.0, "brake": 1.0},
+                    fallback_state="CAMERA_TIMEOUT_BRAKE",
+                    fallback_reason=str(exc),
+                    control_origin="fallback_missing_camera",
+                )
                 latest_telemetry = {
                     "frame": frame_count,
                     "speed_kmh": state["speed"] * 3.6,
@@ -607,7 +1000,7 @@ def main():
                 frame_buffer.pop(0)
 
             if args.async_mode:
-                now_ts = time.time()
+                now_ts = time.monotonic()
                 if args.mode == "vqa":
                     should_submit_inference = (
                         len(frame_buffer) >= cfg.NUM_FRAMES
@@ -627,12 +1020,42 @@ def main():
                     req["frame"] = int(frame_count)
                     while True:
                         try:
-                            inference_request_q.get_nowait()
+                            superseded_request = inference_request_q.get_nowait()
                         except queue.Empty:
                             break
+                        if superseded_request is not None:
+                            _emit_async_terminal(
+                                superseded_request.get("request_id"),
+                                "cancelled",
+                                "request_queue_superseded",
+                            )
                     inference_request_q.put_nowait(req)
                     pending_inference = True
+                    pending_request_id = req["request_id"]
+                    outstanding_async_requests[req["request_id"]] = {
+                        key: req[key]
+                        for key in (
+                            "mode",
+                            "source_loop_tick_id",
+                            "source_elapsed_proxy_s",
+                            "submission_monotonic_s",
+                            "prompt_revision",
+                            "respawn_revision",
+                        )
+                    }
                     last_inference_submit_ts = now_ts
+                    emit_runtime_event(
+                        "inference_submitted",
+                        request_id=req["request_id"],
+                        mode=req["mode"],
+                        source_loop_tick_id=req["source_loop_tick_id"],
+                        source_elapsed_proxy_s=req["source_elapsed_proxy_s"],
+                        source_carla_frame_id=None,
+                        source_simulation_time_s=None,
+                        frame_id_quality="loop_counter_proxy",
+                        prompt_revision=req["prompt_revision"],
+                        respawn_revision=req["respawn_revision"],
+                    )
                     if args.mode == "vqa":
                         last_vqa_submitted_revision = nav_state.revision
 
@@ -643,71 +1066,124 @@ def main():
                     except queue.Empty:
                         break
                 if latest_result is not None:
-                    pending_inference = False
-                    if (
-                        latest_result.get("prompt_revision", nav_state.revision)
-                        != nav_state.revision
+                    for superseded_request_id in latest_result.get(
+                        "superseded_request_ids", ()
                     ):
-                        print(
-                            f"[Frame {frame_count}] Discarded stale inference result for "
-                            f"prompt revision {latest_result.get('prompt_revision')}"
+                        _emit_async_terminal(
+                            superseded_request_id,
+                            "discarded",
+                            "result_queue_superseded",
                         )
-                    elif (
-                        latest_result.get("respawn_revision", respawn_revision)
-                        != respawn_revision
-                    ):
-                        print(
-                            f"[Frame {frame_count}] Discarded stale inference result from "
-                            f"respawn revision {latest_result.get('respawn_revision')}"
-                        )
-                    elif "error" not in latest_result and latest_result.get("mode") == "vqa":
-                        answer = latest_result.get("answer") or extract_answer_text(
-                            latest_result.get("extra")
-                        )
-                        nav_state.set_vqa_answer(answer)
-                        current_inference_time = float(latest_result["inference_time"])
-                        last_vqa_completed_revision = latest_result.get("prompt_revision")
-                        print(
-                            f"[Frame {frame_count}] VQA done: {current_inference_time:.2f}s "
-                            f"(submitted at frame {latest_result['frame_submitted']})"
-                        )
-                        print(f"    Q: {latest_result.get('vqa_question') or '(none)'}")
-                        print(f"    A: {format_vqa_answer_preview(answer)}")
-                    elif "error" not in latest_result:
-                        pred_xyz = latest_result["pred_xyz"]
-                        extra = latest_result["extra"]
-                        inference_time = float(latest_result["inference_time"])
-                        traj_samples = extract_trajectory_samples(pred_xyz)
-                        selected_idx, _similarity_scores = select_trajectory_by_prev_similarity(
-                            traj_samples,
-                            prev_selected_trajectory,
-                        )
-                        current_selected_traj_idx = selected_idx
-                        current_trajectory = traj_samples[selected_idx]
-                        prev_selected_trajectory = current_trajectory.copy()
-                        current_pred_xyz = traj_samples
-                        current_cot = extract_cot_text(extra)
-                        current_inference_time = inference_time
-                        current_trajectory_ts = float(latest_result["result_ts"])
+                    if latest_result.get("request_id") == pending_request_id:
+                        pending_inference = False
+                        pending_request_id = None
+                    result_status = "completed"
+                    result_rejection_reason = None
+                    try:
+                        if (
+                            latest_result.get("prompt_revision", nav_state.revision)
+                            != nav_state.revision
+                        ):
+                            print(
+                                f"[Frame {frame_count}] Discarded stale inference result for "
+                                f"prompt revision {latest_result.get('prompt_revision')}"
+                            )
+                            result_status = "discarded"
+                            result_rejection_reason = "stale_prompt_revision"
+                        elif (
+                            latest_result.get("respawn_revision", respawn_revision)
+                            != respawn_revision
+                        ):
+                            print(
+                                f"[Frame {frame_count}] Discarded stale inference result from "
+                                f"respawn revision {latest_result.get('respawn_revision')}"
+                            )
+                            result_status = "discarded"
+                            result_rejection_reason = "stale_respawn_revision"
+                        elif (
+                            "error" not in latest_result
+                            and latest_result.get("mode") == "vqa"
+                        ):
+                            answer = latest_result.get("answer") or extract_answer_text(
+                                latest_result.get("extra")
+                            )
+                            nav_state.set_vqa_answer(answer)
+                            current_inference_time = float(latest_result["inference_time"])
+                            last_vqa_completed_revision = latest_result.get("prompt_revision")
+                            print(
+                                f"[Frame {frame_count}] VQA done: "
+                                f"{current_inference_time:.2f}s "
+                                f"(submitted at frame {latest_result['frame_submitted']})"
+                            )
+                            print(f"    Q: {latest_result.get('vqa_question') or '(none)'}")
+                            print(f"    A: {format_vqa_answer_preview(answer)}")
+                            result_status = "completed_vqa"
+                        elif "error" not in latest_result:
+                            pred_xyz = latest_result["pred_xyz"]
+                            extra = latest_result["extra"]
+                            inference_time = float(latest_result["inference_time"])
+                            traj_samples = extract_trajectory_samples(pred_xyz)
+                            selected_idx, _similarity_scores = (
+                                select_trajectory_by_prev_similarity(
+                                    traj_samples,
+                                    prev_selected_trajectory,
+                                )
+                            )
+                            current_selected_traj_idx = selected_idx
+                            current_trajectory = traj_samples[selected_idx]
+                            prev_selected_trajectory = current_trajectory.copy()
+                            current_pred_xyz = traj_samples
+                            current_cot = extract_cot_text(extra)
+                            current_inference_time = inference_time
+                            current_trajectory_ts = float(latest_result["result_ts"])
+                            current_plan_id = f"{run_id}:{latest_result['request_id']}"
+                            current_plan_source_loop_tick_id = int(
+                                latest_result["source_loop_tick_id"]
+                            )
+                            current_plan_source_elapsed_proxy_s = float(
+                                latest_result["source_elapsed_proxy_s"]
+                            )
+                            result_status = "accepted_plan"
 
-                        print(
-                            f"[Frame {frame_count}] Inference done: {inference_time:.2f}s "
-                            f"(submitted at frame {latest_result['frame_submitted']})"
+                            print(
+                                f"[Frame {frame_count}] Inference done: "
+                                f"{inference_time:.2f}s "
+                                f"(submitted at frame {latest_result['frame_submitted']})"
+                            )
+                            print(f"    CoT: {current_cot[:60]}...")
+                            print(
+                                f"    Nav: {latest_result.get('navigation_text') or '(none)'} "
+                                f"(weight={latest_result.get('navigation_weight', 1.0):.2f})"
+                            )
+                            print(
+                                f"    Selected traj sample: {current_selected_traj_idx}/"
+                                f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                            )
+                            print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
+                        else:
+                            print(
+                                f"[Frame {frame_count}] Inference error: "
+                                f"{latest_result['error']}"
+                            )
+                            result_status = "error"
+                            result_rejection_reason = str(latest_result["error"])
+                            if args.debug_worker_traceback and latest_result.get("traceback"):
+                                print(latest_result["traceback"].rstrip())
+                    except Exception as exc:
+                        _emit_async_terminal(
+                            latest_result.get("request_id"),
+                            "error",
+                            f"result_processing_error:{exc}",
+                            result=latest_result,
                         )
-                        print(f"    CoT: {current_cot[:60]}...")
-                        print(
-                            f"    Nav: {latest_result.get('navigation_text') or '(none)'} "
-                            f"(weight={latest_result.get('navigation_weight', 1.0):.2f})"
-                        )
-                        print(
-                            f"    Selected traj sample: {current_selected_traj_idx}/"
-                            f"{cfg.NUM_TRAJ_SAMPLES - 1}"
-                        )
-                        print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
+                        raise
                     else:
-                        print(f"[Frame {frame_count}] Inference error: {latest_result['error']}")
-                        if args.debug_worker_traceback and latest_result.get("traceback"):
-                            print(latest_result["traceback"].rstrip())
+                        _emit_async_terminal(
+                            latest_result.get("request_id"),
+                            result_status,
+                            result_rejection_reason,
+                            result=latest_result,
+                        )
             else:
                 if len(frame_buffer) >= cfg.NUM_FRAMES:
                     images_array = np.zeros(
@@ -733,19 +1209,62 @@ def main():
                             and nav_state.revision != last_vqa_completed_revision
                         )
                         if should_run_vqa:
-                            model_start_time = time.time()
-                            extra = _run_vqa_with_linalg_fallback(
-                                model_data,
-                                question=nav_state.vqa_question,
+                            request_sequence += 1
+                            request_id = request_sequence
+                            submission_monotonic_s = time.monotonic()
+                            emit_runtime_event(
+                                "inference_submitted",
+                                request_id=request_id,
+                                mode="vqa",
+                                source_loop_tick_id=int(frame_count),
+                                source_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
+                                source_carla_frame_id=None,
+                                source_simulation_time_s=None,
+                                frame_id_quality="loop_counter_proxy",
+                                prompt_revision=nav_state.revision,
+                                respawn_revision=respawn_revision,
                             )
-                            model_inference_time = time.time() - model_start_time
-                            answer = extract_answer_text(extra)
-                            nav_state.set_vqa_answer(answer)
-                            current_inference_time = model_inference_time
-                            last_vqa_completed_revision = nav_state.revision
-                            print(f"[Frame {frame_count}] VQA: {model_inference_time:.2f}s")
-                            print(f"    Q: {nav_state.vqa_question}")
-                            print(f"    A: {format_vqa_answer_preview(answer)}")
+                            model_start_time = time.monotonic()
+                            stage = "model_inference"
+                            try:
+                                extra = _run_vqa_with_linalg_fallback(
+                                    model_data,
+                                    question=nav_state.vqa_question,
+                                )
+                                model_inference_time = time.monotonic() - model_start_time
+                                stage = "result_processing"
+                                answer = extract_answer_text(extra)
+                                nav_state.set_vqa_answer(answer)
+                                current_inference_time = model_inference_time
+                                last_vqa_completed_revision = nav_state.revision
+                                print(
+                                    f"[Frame {frame_count}] VQA: "
+                                    f"{model_inference_time:.2f}s"
+                                )
+                                print(f"    Q: {nav_state.vqa_question}")
+                                print(f"    A: {format_vqa_answer_preview(answer)}")
+                            except Exception as exc:
+                                _emit_sync_terminal(
+                                    request_id=request_id,
+                                    mode="vqa",
+                                    status="error",
+                                    rejection_reason=f"{stage}_error:{exc}",
+                                    submission_monotonic_s=submission_monotonic_s,
+                                    model_inference_latency_s=(
+                                        model_inference_time
+                                        if stage == "result_processing"
+                                        else time.monotonic() - model_start_time
+                                    ),
+                                )
+                                raise
+                            _emit_sync_terminal(
+                                request_id=request_id,
+                                mode="vqa",
+                                status="completed_vqa",
+                                rejection_reason=None,
+                                submission_monotonic_s=submission_monotonic_s,
+                                model_inference_latency_s=model_inference_time,
+                            )
                     else:
                         navigation_text = (
                             nav_state.navigation_text if args.mode == "navigation" else ""
@@ -753,39 +1272,90 @@ def main():
                         navigation_weight = (
                             nav_state.navigation_weight if args.mode == "navigation" else 1.0
                         )
-                        model_start_time = time.time()
-                        pred_xyz, extra = _run_inference_with_nav_fallback(
-                            model_data,
-                            navigation_text=navigation_text,
-                            navigation_weight=navigation_weight,
+                        request_sequence += 1
+                        request_id = request_sequence
+                        submission_monotonic_s = time.monotonic()
+                        emit_runtime_event(
+                            "inference_submitted",
+                            request_id=request_id,
+                            mode=args.mode,
+                            source_loop_tick_id=int(frame_count),
+                            source_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
+                            source_carla_frame_id=None,
+                            source_simulation_time_s=None,
+                            frame_id_quality="loop_counter_proxy",
+                            prompt_revision=nav_state.revision,
+                            respawn_revision=respawn_revision,
                         )
-                        model_inference_time = time.time() - model_start_time
-
-                        traj_samples = extract_trajectory_samples(pred_xyz)
-                        selected_idx, _similarity_scores = select_trajectory_by_prev_similarity(
-                            traj_samples,
-                            prev_selected_trajectory,
-                        )
-                        current_selected_traj_idx = selected_idx
-                        current_trajectory = traj_samples[selected_idx]
-                        prev_selected_trajectory = current_trajectory.copy()
-                        current_pred_xyz = traj_samples
-                        current_cot = extract_cot_text(extra)
-                        current_inference_time = model_inference_time
-                        current_trajectory_ts = time.time()
-
-                        print(f"[Frame {frame_count}] Inference: {model_inference_time:.2f}s")
-                        print(f"    CoT: {current_cot[:60]}...")
-                        if args.mode == "navigation":
-                            print(
-                                f"    Nav: {nav_state.navigation_text or '(none)'} "
-                                f"(weight={nav_state.navigation_weight:.2f})"
+                        model_start_time = time.monotonic()
+                        stage = "model_inference"
+                        try:
+                            pred_xyz, extra = _run_inference_with_nav_fallback(
+                                model_data,
+                                navigation_text=navigation_text,
+                                navigation_weight=navigation_weight,
                             )
-                        print(
-                            f"    Selected traj sample: {current_selected_traj_idx}/"
-                            f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                            model_inference_time = time.monotonic() - model_start_time
+                            stage = "result_processing"
+
+                            traj_samples = extract_trajectory_samples(pred_xyz)
+                            selected_idx, _similarity_scores = (
+                                select_trajectory_by_prev_similarity(
+                                    traj_samples,
+                                    prev_selected_trajectory,
+                                )
+                            )
+                            current_selected_traj_idx = selected_idx
+                            current_trajectory = traj_samples[selected_idx]
+                            prev_selected_trajectory = current_trajectory.copy()
+                            current_pred_xyz = traj_samples
+                            current_cot = extract_cot_text(extra)
+                            current_inference_time = model_inference_time
+                            current_trajectory_ts = time.monotonic()
+                            current_plan_id = f"{run_id}:{request_id}"
+                            current_plan_source_loop_tick_id = int(frame_count)
+                            current_plan_source_elapsed_proxy_s = (
+                                _simulation_elapsed_proxy_s()
+                            )
+
+                            print(
+                                f"[Frame {frame_count}] Inference: "
+                                f"{model_inference_time:.2f}s"
+                            )
+                            print(f"    CoT: {current_cot[:60]}...")
+                            if args.mode == "navigation":
+                                print(
+                                    f"    Nav: {nav_state.navigation_text or '(none)'} "
+                                    f"(weight={nav_state.navigation_weight:.2f})"
+                                )
+                            print(
+                                f"    Selected traj sample: {current_selected_traj_idx}/"
+                                f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                            )
+                            print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
+                        except Exception as exc:
+                            _emit_sync_terminal(
+                                request_id=request_id,
+                                mode=args.mode,
+                                status="error",
+                                rejection_reason=f"{stage}_error:{exc}",
+                                submission_monotonic_s=submission_monotonic_s,
+                                model_inference_latency_s=(
+                                    model_inference_time
+                                    if stage == "result_processing"
+                                    else time.monotonic() - model_start_time
+                                ),
+                            )
+                            raise
+                        _emit_sync_terminal(
+                            request_id=request_id,
+                            mode=args.mode,
+                            status="accepted_plan",
+                            rejection_reason=None,
+                            submission_monotonic_s=submission_monotonic_s,
+                            model_inference_latency_s=model_inference_time,
+                            source_plan_id=current_plan_id,
                         )
-                        print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
 
             if current_trajectory is not None:
                 vehicle_tf = carla_if.ego_vehicle.get_transform()
@@ -807,6 +1377,21 @@ def main():
 
                 prev_control = {"steer": steering, "throttle": throttle, "brake": brake}
                 carla_if.apply_control(steering, throttle, brake)
+                _emit_control_tick(
+                    state=state,
+                    controller_state="TRACKING",
+                    requested_control={
+                        "steering": float(steering_raw),
+                        "throttle": float(throttle_raw),
+                        "brake": float(brake_raw),
+                    },
+                    applied_control={
+                        "steering": float(steering),
+                        "throttle": float(throttle),
+                        "brake": float(brake),
+                    },
+                    postprocessing=("ema_smoothing", "throttle_brake_arbitration"),
+                )
 
                 if current_pred_xyz is not None:
                     cam_img = images[1]
@@ -841,12 +1426,26 @@ def main():
                     f"Steer: {steering:.4f}, Throttle: {throttle:.3f}, Brake: {brake:.3f}"
                 )
                 if current_trajectory_ts is not None and args.async_mode:
-                    print(f"    Trajectory age: {time.time() - current_trajectory_ts:.2f}s")
+                    print(
+                        "    Trajectory result age (wall-clock, excludes inference): "
+                        f"{time.monotonic() - current_trajectory_ts:.2f}s"
+                    )
             else:
-                if args.mode == "vqa":
-                    carla_if.apply_control(0.0, 0.0, 1.0)
-                else:
-                    carla_if.apply_control(0.0, 0.0, 1.0)
+                waiting_reason = (
+                    "vqa_mode_has_no_trajectory_control"
+                    if args.mode == "vqa"
+                    else "waiting_for_first_plan"
+                )
+                carla_if.apply_control(0.0, 0.0, 1.0)
+                _emit_control_tick(
+                    state=state,
+                    controller_state="WAITING_FOR_PLAN",
+                    requested_control=None,
+                    applied_control={"steering": 0.0, "throttle": 0.0, "brake": 1.0},
+                    fallback_state="WAITING_FOR_PLAN",
+                    fallback_reason=waiting_reason,
+                    control_origin="waiting_for_plan",
+                )
                 latest_telemetry = {
                     "frame": frame_count,
                     "speed_kmh": state["speed"] * 3.6,
@@ -857,8 +1456,13 @@ def main():
                     draw_pygame_ui(latest_ui_frame, latest_telemetry)
 
     except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
+        emit_runtime_event("episode_stop_requested", status=stop_reason)
         print("\n\nInterrupted by user.")
     except Exception as e:
+        stop_reason = "error"
+        run_error = str(e)
+        emit_runtime_event("runtime_error", status="error", error=run_error)
         print(f"\nError: {e}")
         traceback.print_exc()
     finally:
@@ -870,13 +1474,84 @@ def main():
                 pass
             if worker_thread is not None:
                 worker_thread.join(timeout=2.0)
-        if cfg.SAVE_VIDEO and video_recorder:
-            video_recorder.save()
-        if pygame_ui_recorder is not None:
-            pygame_ui_recorder.save()
-        if pygame_ui is not None:
-            pygame_ui.close()
-        carla_if.cleanup()
+            _clear_async_queues("episode_end")
+            for outstanding_request_id in list(outstanding_async_requests):
+                _emit_async_terminal(
+                    outstanding_request_id,
+                    "cancelled",
+                    "episode_ended_before_result_consumption",
+                )
+        if runtime_metrics is None:
+            runtime_metrics = RuntimeMetrics()
+        runtime_metrics.record_collision_count(carla_if.get_episode_collision_count())
+        summary = runtime_metrics.final_summary(
+            run_id=run_id,
+            stop_reason=stop_reason,
+            error=run_error,
+            mode=args.mode,
+            execution="async" if args.async_mode else "sync",
+            loop_tick_count=int(frame_count),
+            simulation_duration_proxy_s=float(frame_count) * simulation_tick_seconds,
+            simulation_tick_seconds=simulation_tick_seconds,
+            simulation_duration_quality="successful_tick_count_times_world_fixed_delta",
+            exact_source_frame_ids_available=False,
+            exact_plan_age_available=False,
+            respawn_count=int(respawn_count),
+            episode_collision_count=carla_if.get_episode_collision_count(),
+            telemetry_path=args.telemetry_jsonl,
+            telemetry_write_failed=telemetry_write_failed,
+        )
+        if telemetry_writer is not None and not telemetry_write_failed:
+            try:
+                telemetry_writer.append(summary)
+            except Exception as exc:
+                telemetry_write_failed = True
+                print(f"Warning: failed to write final runtime summary: {exc}")
+        if telemetry_writer is not None:
+            try:
+                telemetry_writer.close()
+            except Exception as exc:
+                print(f"Warning: failed to close runtime telemetry: {exc}")
+
+        latency_summary = summary["inference_latency_s"]
+        source_age_proxy_summary = summary["source_age_proxy_s"]
+        print("\nRuntime summary:")
+        print(
+            f"  stop={stop_reason}, ticks={frame_count}, respawns={respawn_count}, "
+            f"collisions={carla_if.get_episode_collision_count()}"
+        )
+        print(
+            "  inference latency p50/p95/p99: "
+            f"{latency_summary['p50']!r} / {latency_summary['p95']!r} / "
+            f"{latency_summary['p99']!r} s"
+        )
+        print("  exact source-frame and plan-age metrics: unavailable until PR2")
+        print(
+            "  source-age proxy p50/p95/p99: "
+            f"{source_age_proxy_summary['p50']!r} / "
+            f"{source_age_proxy_summary['p95']!r} / "
+            f"{source_age_proxy_summary['p99']!r} s"
+        )
+        if args.telemetry_jsonl:
+            print(f"  telemetry: {args.telemetry_jsonl}")
+        try:
+            if cfg.SAVE_VIDEO and video_recorder:
+                try:
+                    video_recorder.save()
+                except Exception as exc:
+                    print(f"Warning: failed to save closed-loop video: {exc}")
+            if pygame_ui_recorder is not None:
+                try:
+                    pygame_ui_recorder.save()
+                except Exception as exc:
+                    print(f"Warning: failed to save Pygame UI video: {exc}")
+            if pygame_ui is not None:
+                try:
+                    pygame_ui.close()
+                except Exception as exc:
+                    print(f"Warning: failed to close Pygame UI: {exc}")
+        finally:
+            carla_if.cleanup()
 
     print("\nStopped.")
 

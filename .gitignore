@@ -166,6 +166,7 @@ carla_data*/
 carla_alpamayo_*.mp4
 .carla_alpamayo_*.opencv-tmp.mp4
 carla_alpamayo_*_latest.jpg
+carlamayo_runtime*.jsonl
 *.avi
 *.mov
 *.mkv

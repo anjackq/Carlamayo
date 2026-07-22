@@ -30,6 +30,39 @@ def test_get_camera_images_raises_when_camera_frame_missing():
         carla_if.get_camera_images()
 
 
+def test_episode_collision_count_survives_spawn_history_reset():
+    carla_if = CARLAInterface()
+    event = types.SimpleNamespace(
+        frame=42,
+        normal_impulse=types.SimpleNamespace(x=3.0, y=4.0, z=0.0),
+        other_actor=types.SimpleNamespace(type_id="vehicle.test", id=7),
+    )
+
+    carla_if._collision_callback(event)
+    assert carla_if.get_collision_count() == 1
+    assert carla_if.get_episode_collision_count() == 1
+
+    carla_if.reset_collision_history()
+    assert carla_if.get_collision_count() == 0
+    assert carla_if.get_episode_collision_count() == 1
+
+
+def test_episode_collision_count_is_not_capped_by_detail_history():
+    carla_if = CARLAInterface()
+    for frame in range(25):
+        carla_if._collision_callback(
+            types.SimpleNamespace(
+                frame=frame,
+                normal_impulse=types.SimpleNamespace(x=1.0, y=0.0, z=0.0),
+                other_actor=types.SimpleNamespace(type_id="vehicle.test", id=frame),
+            )
+        )
+
+    assert len(carla_if.collision_events) == 20
+    assert carla_if.get_collision_count() == 25
+    assert carla_if.get_episode_collision_count() == 25
+
+
 def test_cleanup_reports_recoverable_teardown_failures(capsys):
     class FailingTrafficManager:
         def set_synchronous_mode(self, _enabled):

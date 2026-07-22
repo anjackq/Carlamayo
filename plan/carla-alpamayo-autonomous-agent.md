@@ -19,6 +19,18 @@ This plan intentionally defers traffic-heavy scenarios, multi-trajectory safety
 ranking, fine-tuning, V2X, and world-model integration until the basic-driving
 gate passes.
 
+### Implementation progress
+
+- PR 1 runtime contracts and baseline telemetry are implemented on the prototype
+  branch: frozen runtime records, append-only JSONL events, bounded percentile
+  aggregation, request/control provenance, persistent episode collision counts,
+  and an optional simulation-tick duration limit.
+- Exact camera source frames, CARLA timestamps, and exact plan-age percentiles
+  remain intentionally unavailable in PR 1. Loop-tick estimates are labelled as
+  proxies until PR 2 supplies synchronized sensor identities.
+- PR 2 synchronized and correctly labelled observations is the next implementation
+  slice.
+
 ## Review of the Proposed Roadmap
 
 The original roadmap is directionally correct. Its main diagnosis—proof of
