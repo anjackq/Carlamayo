@@ -121,6 +121,40 @@ simulator evaluation before it can be treated as a reliable agent.
   source age at 4.4 seconds. These limits must be recalibrated from measured
   latency and drift rather than treated as universal constants.
 
+### Simulator evidence from the synchronized safety baseline
+
+Two 20-second synchronized, full-precision OOM-free trials were recorded on
+2026-07-22. They demonstrate fail-closed integration, not autonomous-driving
+completion:
+
+- Run `22844690` completed 200 exact sensor/control ticks with zero collisions
+  and zero respawns. It accepted 15 of 20 proposals, but five rejections were
+  traced to a numerical defect: micrometre-scale reverse jitter at the start of
+  otherwise forward trajectories was interpreted as a 180-degree path heading.
+  The vehicle remained effectively stationary and safety overrode 129 ticks.
+- Commit `aa6d513` changed controller-alignment and road-path headings to use a
+  meaningful 0.5 m spatial baseline with a 0.05 m minimum displacement. Offline
+  replay reduced all 20 recorded heading errors below 0.28 degrees while the
+  existing true 90-degree-divergence test continued to reject.
+- Fixed rerun `22844855` accepted all 20 proposals, produced no heading-only road
+  failures, retained perfect synchronization across 200 camera bundles, and
+  again had zero collisions or respawns. Exact plan-age statistics now contain
+  only the 197 plan-bearing control ticks (p50 0.4 s, p95/max 0.9 s), and proposal
+  rejection totals are no longer double-counted.
+- The fixed rerun still made no useful progress. Safety overrode 191 of 200 ticks
+  (`actor_overlap`: 166, `road_containment_failed`: 22,
+  `predicted_actor_conflict`: 3), and no throttle command reached CARLA. Some
+  early actor-overlap decisions occurred while the front-wide view looked clear;
+  actors behind or beside the ego cannot be audited from that view alone.
+
+The two synchronized trials used different random spawn points and NPC layouts,
+so their override counts are not a controlled A/B comparison. The next release
+work must start with a deterministic empty-road route and a BEV/four-camera actor
+audit. That gate should distinguish valid adjacent/rear/crossing hazards from
+shield geometry errors before any safety threshold is relaxed. Only after that
+gate should inference cadence, controller handoff, and traffic-heavy scenarios
+be tuned for route progress.
+
 ### Sequencing correction
 
 Evaluation cannot be postponed until the final gate. Runtime telemetry is now in
