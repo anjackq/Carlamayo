@@ -151,6 +151,37 @@ def test_runtime_metrics_aggregates_percentiles_and_event_outcomes():
     assert summary["fallbacks"] == {"total": 1, "reasons": {"no_valid_plan": 1}}
 
 
+def test_runtime_metrics_can_exclude_intermediate_age_and_rejection_events():
+    metrics = RuntimeMetrics()
+    validation = metrics.record_event(
+        "plan_validation",
+        valid=False,
+        rejection_reason="expired",
+        source_age_s=0.0,
+        source_age_proxy_s=0.0,
+        aggregate_age=False,
+        aggregate_rejection=False,
+    )
+    metrics.record_event(
+        "inference_result",
+        status="rejected_plan",
+        rejected=True,
+        rejection_reason="expired",
+        source_age_s=0.0,
+        aggregate_age=False,
+    )
+    metrics.record_event("tick", source_age_s=1.25)
+
+    summary = metrics.final_summary()
+
+    assert validation["valid"] is False
+    assert validation["rejection_reason"] == "expired"
+    assert summary["source_age_s"]["count"] == 1
+    assert summary["source_age_s"]["p50"] == pytest.approx(1.25)
+    assert summary["source_age_proxy_s"]["count"] == 0
+    assert summary["rejections"] == {"total": 1, "reasons": {"expired": 1}}
+
+
 def test_collision_total_survives_per_ego_counter_reset():
     metrics = RuntimeMetrics()
 

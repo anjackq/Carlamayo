@@ -117,6 +117,11 @@ TRAJECTORY_MAX_SPEED_MPS = 35.0 / 3.6
 TRAJECTORY_TIME_EPSILON_S = 1e-6
 TRAJECTORY_MAX_TRACKING_ERROR_M = 2.5
 TRAJECTORY_MAX_HEADING_ERROR_DEG = 45.0
+# Estimate path heading over a meaningful spatial baseline.  Alpamayo can emit
+# micrometre-scale reversals while starting or stopping; those numerical
+# oscillations must not be interpreted as a 180-degree driving direction.
+TRAJECTORY_HEADING_LOOKAHEAD_M = 0.5
+TRAJECTORY_HEADING_MIN_DISPLACEMENT_M = 0.05
 # A stop is represented geometrically: at least this many terminal samples stay
 # inside a small cluster and have near-zero spacing.  This catches a moving path
 # followed by repeated endpoint samples as well as an all-stationary proposal.

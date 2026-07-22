@@ -14,6 +14,8 @@ from typing import Any
 import carla
 import numpy as np
 
+from . import config as cfg
+from .geometry import meaningful_path_tangent_xy
 from .safety_shield import (
     ActorObstacle,
     AssessmentStatus,
@@ -71,16 +73,15 @@ def _footprint_points(
 
 
 def _path_yaw(points: np.ndarray, index: int, fallback_yaw_rad: float) -> float:
-    for offset in range(1, len(points)):
-        for other_index in (index + offset, index - offset):
-            if not 0 <= other_index < len(points) or other_index == index:
-                continue
-            delta = points[other_index, :2] - points[index, :2]
-            if other_index < index:
-                delta *= -1.0
-            if float(np.linalg.norm(delta)) > 1e-6:
-                return math.atan2(float(delta[1]), float(delta[0]))
-    return fallback_yaw_rad
+    tangent = meaningful_path_tangent_xy(
+        points,
+        index,
+        lookahead_m=float(cfg.TRAJECTORY_HEADING_LOOKAHEAD_M),
+        minimum_displacement_m=float(cfg.TRAJECTORY_HEADING_MIN_DISPLACEMENT_M),
+    )
+    if tangent is None:
+        return fallback_yaw_rad
+    return math.atan2(float(tangent[1]), float(tangent[0]))
 
 
 def _wrapped_angle_degrees(angle_deg: float) -> float:

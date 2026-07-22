@@ -378,6 +378,8 @@ class RuntimeMetrics:
         fallback_reason: Any | None = None,
         collision_count: int | None = None,
         collision_delta: int | None = None,
+        aggregate_age: bool = True,
+        aggregate_rejection: bool = True,
         **fields: Any,
     ) -> dict[str, Any]:
         """Aggregate one event and return its normalized JSON-safe payload.
@@ -387,6 +389,11 @@ class RuntimeMetrics:
         that reset sample (or use explicit ``collision_delta`` values) so no
         collisions are ambiguous. A single event must not provide both forms.
         """
+
+        if not isinstance(aggregate_age, bool):
+            raise TypeError("aggregate_age must be a bool")
+        if not isinstance(aggregate_rejection, bool):
+            raise TypeError("aggregate_rejection must be a bool")
 
         payload = self._event_payload(event_type, event, fields)
         explicit_fields = {
@@ -425,8 +432,13 @@ class RuntimeMetrics:
             self._latency.add(
                 latency_s if latency_s is not None else _first_present(payload, self._LATENCY_KEYS)
             )
-            self._age.add(age_s if age_s is not None else _first_present(payload, self._AGE_KEYS))
-            self._age_proxy.add(_first_present(payload, self._AGE_PROXY_KEYS))
+            if aggregate_age:
+                self._age.add(
+                    age_s
+                    if age_s is not None
+                    else _first_present(payload, self._AGE_KEYS)
+                )
+                self._age_proxy.add(_first_present(payload, self._AGE_PROXY_KEYS))
             self._record_simulation_time(_first_present(payload, self._SIMULATION_TIME_KEYS))
 
             rejection_reason = _coalesce(rejection_reason, payload.get("rejection_reason"))
@@ -436,7 +448,7 @@ class RuntimeMetrics:
                     rejected = True
                 if rejected is None and rejection_reason not in (None, ""):
                     rejected = True
-            if rejected:
+            if rejected and aggregate_rejection:
                 self._rejection_count += 1
                 self._rejection_reasons.add(rejection_reason)
 

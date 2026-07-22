@@ -377,7 +377,13 @@ def main():
 
         carla_if.apply_control(*command.as_tuple())
 
-    def emit_runtime_event(event_type, **fields):
+    def emit_runtime_event(
+        event_type,
+        *,
+        aggregate_age=True,
+        aggregate_rejection=True,
+        **fields,
+    ):
         """Aggregate an event and append it to JSONL when telemetry is enabled."""
 
         nonlocal telemetry_write_failed, run_started_monotonic_s, runtime_metrics
@@ -395,6 +401,8 @@ def main():
         payload = runtime_metrics.record_event(
             event_type,
             event,
+            aggregate_age=aggregate_age,
+            aggregate_rejection=aggregate_rejection,
         )
         if telemetry_writer is not None and not telemetry_write_failed:
             try:
@@ -563,6 +571,7 @@ def main():
                 )
             emit_runtime_event(
                 "inference_result",
+                aggregate_age=False,
                 request_id=int(request_id),
                 mode=result.get("mode", request["mode"]),
                 status=status,
@@ -628,6 +637,7 @@ def main():
                 )
             payload = emit_runtime_event(
                 "inference_result",
+                aggregate_age=False,
                 request_id=request_id,
                 mode=mode,
                 status=status,
@@ -833,6 +843,8 @@ def main():
             )
             emit_runtime_event(
                 "plan_validation",
+                aggregate_age=False,
+                aggregate_rejection=False,
                 layer="ALPAMAYO_PROPOSAL",
                 proposal_id=plan.plan_id,
                 source_carla_frame_id=plan.source_frame_id,

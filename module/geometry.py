@@ -139,6 +139,65 @@ def world_points_to_model_ego(capture_pose_world: Any, points: Any) -> np.ndarra
     return carla_ego_points_to_model(carla_local)
 
 
+def meaningful_path_tangent_xy(
+    points: Any,
+    index: int,
+    *,
+    lookahead_m: float,
+    minimum_displacement_m: float,
+) -> np.ndarray | None:
+    """Return a robust forward XY tangent around one path point.
+
+    The tangent uses a spatial baseline instead of the immediately adjacent
+    segment.  This prevents sub-centimetre start/stop jitter from looking like
+    a genuine reverse path.  Future points are preferred; near the end of a
+    path, earlier points are used with their direction reversed.
+    """
+
+    path = _finite_array(points, name="points")
+    if path.ndim != 2 or path.shape[1] < 2 or len(path) == 0:
+        raise ValueError(f"points must have shape (N, >=2), got {path.shape}")
+    point_index = int(index)
+    if point_index < 0 or point_index >= len(path):
+        raise IndexError("path index is out of range")
+
+    lookahead = float(lookahead_m)
+    minimum = float(minimum_displacement_m)
+    if not math.isfinite(lookahead) or lookahead <= 0.0:
+        raise ValueError("lookahead_m must be a positive finite value")
+    if not math.isfinite(minimum) or minimum <= 0.0 or minimum > lookahead:
+        raise ValueError(
+            "minimum_displacement_m must be positive and no greater than lookahead_m"
+        )
+
+    anchor = path[point_index, :2]
+
+    def search(indices: range, *, reverse: bool) -> np.ndarray | None:
+        travelled = 0.0
+        previous = anchor
+        fallback_delta = None
+        fallback_norm = 0.0
+        for other_index in indices:
+            point = path[other_index, :2]
+            travelled += float(np.linalg.norm(point - previous))
+            previous = point
+            delta = anchor - point if reverse else point - anchor
+            norm = float(np.linalg.norm(delta))
+            if norm > fallback_norm:
+                fallback_delta = delta
+                fallback_norm = norm
+            if travelled >= lookahead and norm >= minimum:
+                return delta / norm
+        if fallback_delta is not None and fallback_norm >= minimum:
+            return fallback_delta / fallback_norm
+        return None
+
+    future = search(range(point_index + 1, len(path)), reverse=False)
+    if future is not None:
+        return future
+    return search(range(point_index - 1, -1, -1), reverse=True)
+
+
 def carla_relative_rotation_to_model(rotation: Any) -> np.ndarray:
     """Change basis for a relative rotation from CARLA ego to model ego."""
 

@@ -15,7 +15,7 @@ from typing import Any, Callable
 import numpy as np
 
 from . import config as cfg
-from .geometry import model_ego_points_to_world
+from .geometry import meaningful_path_tangent_xy, model_ego_points_to_world
 from .safety_shield import densify_path
 
 
@@ -482,7 +482,23 @@ def validate_plan_alignment(
         errors = np.linalg.norm(projections - ego_xy, axis=1)
         closest = int(np.argmin(errors))
         tracking_error = float(errors[closest])
-        tangent = deltas[closest] / math.sqrt(float(lengths_sq[closest]))
+        segment_indices = np.flatnonzero(moving_segments)
+        closest_segment_index = int(segment_indices[closest])
+        closest_projection = projections[closest]
+        heading_path = np.insert(
+            path_xy,
+            closest_segment_index + 1,
+            closest_projection,
+            axis=0,
+        )
+        tangent = meaningful_path_tangent_xy(
+            heading_path,
+            closest_segment_index + 1,
+            lookahead_m=float(cfg.TRAJECTORY_HEADING_LOOKAHEAD_M),
+            minimum_displacement_m=float(
+                cfg.TRAJECTORY_HEADING_MIN_DISPLACEMENT_M
+            ),
+        )
     else:
         # A geometrically stationary stop has no meaningful path heading.
         tracking_error = float(np.linalg.norm(ego_xy - path_xy[0]))

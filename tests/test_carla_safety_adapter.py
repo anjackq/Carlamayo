@@ -275,6 +275,26 @@ def test_path_is_densified_to_half_metre_and_catches_off_road_gap(driving_lane_t
     ) <= 0.5
 
 
+def test_path_heading_ignores_submillimetre_reverse_start_jitter(
+    driving_lane_type,
+):
+    adapter, _, _ = _adapter(RecordingMap())
+    road = adapter._assess_path_road(
+        [
+            (0.0, 0.0, 0.0),
+            (-0.00003, 0.0, 0.0),
+            (-0.00010, 0.0, 0.0),
+            (0.0001, 0.0, 0.0),
+            (0.5, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+        ],
+        _ego_kinematics(half_length=0.05, half_width=0.05),
+    )
+
+    assert road.status is AssessmentStatus.SAFE
+    assert "path_heading_opposes_lane" not in road.reason_codes
+
+
 def test_junction_transition_accepts_any_exact_driving_lane(driving_lane_type):
     def resolve(location):
         if location.x > 0.0:

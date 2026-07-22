@@ -215,6 +215,26 @@ def test_plan_alignment_rejects_heading_divergence_but_allows_stationary_stop():
     assert stopped.valid is True
 
 
+def test_plan_alignment_ignores_submillimetre_reverse_start_jitter():
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = np.concatenate(
+        [
+            np.array([-0.00003, -0.00010, -0.00016, -0.00019, -0.00014]),
+            np.linspace(0.0001, 20.0, 59),
+        ]
+    )
+    plan = _build_plan(source_time=10.0, points=points)
+
+    aligned = validate_plan_alignment(
+        plan,
+        10.0,
+        pose_matrix_from_components(0.0, 0.0, 0.0),
+    )
+
+    assert aligned.valid is True
+    assert aligned.heading_error_deg == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize(
     ("plan", "current_time", "reason"),
     [
