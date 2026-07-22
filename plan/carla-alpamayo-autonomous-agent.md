@@ -66,12 +66,16 @@ made until the fixed-route CARLA criteria below have also passed.
 - `--pygame-ui` additionally records
   `./carla_alpamayo_closed_loop_result_pygame_ui.mp4`.
 - Runtime JSONL is opt-in at the exact path supplied to `--telemetry-jsonl`. It is
-  also the complete CoC audit artifact; proposal text is stored in
+  the complete CoC audit artifact for proposals consumed by the control loop;
+  proposal text is stored in
   `alpamayo_proposal.coc_text_full` with SHA-256 and length metadata.
 - `CARLAMAYO_OUTPUT_VIDEO` and `CARLAMAYO_LIVE_PREVIEW_IMAGE` override the two
   default media paths. The supplied Slurm runner places its video, preview, and
   `runtime.jsonl` in `/home/aqiu/carlamayo-runs/<SLURM_JOB_ID>/` and writes the
   CARLA server log to `./carla-server-<SLURM_JOB_ID>.log`.
+- Async mode remains experimental. A generated result abandoned during shutdown
+  or superseded inside the size-one result queue may not reach the control loop,
+  so its proposal/CoT cannot be present in the JSONL audit.
 
 ## Review of the Proposed Roadmap
 

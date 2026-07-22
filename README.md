@@ -64,17 +64,22 @@ The current prototype implements a conservative, auditable closed-loop baseline:
   the exact CARLA snapshot. An unsafe result, unknown input, or adapter failure
   applies a latched emergency brake and is recorded separately from the
   controller request.
-- With `--telemetry-jsonl PATH`, every proposal is auditable through an
-  `alpamayo_proposal` event containing the full, untruncated CoC text, its SHA-256
-  digest, source identity, and candidate trajectory. The same JSONL stream links
-  that proposal ID to validation events and to tick events containing the
-  controller request, final applied control, and safety-override reasons.
+- With `--telemetry-jsonl PATH`, every proposal consumed by the control loop is
+  auditable through an `alpamayo_proposal` event containing the full,
+  untruncated CoC text, its SHA-256 digest, source identity, and candidate
+  trajectory. The same JSONL stream links that proposal ID to validation events
+  and to tick events containing the controller request, final applied control,
+  and safety-override reasons.
 
 The runner defaults to synchronous inference; `--async` is opt-in. In normal and
 navigation modes, inference is scheduled no more often than once per 1.0 second
 of CARLA simulation time after the initial four-frame warm-up. Synchronous model
 inference blocks the next world tick, so wall-clock time may be much longer while
 simulation-time source age remains stable.
+
+Async mode remains experimental: an in-flight result abandoned at shutdown, or
+an older generated result superseded inside its size-one result queue, may never
+reach the control loop and therefore may not have a proposal/CoT audit event.
 
 A bounded, telemetry-enabled baseline run is:
 

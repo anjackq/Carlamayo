@@ -8,8 +8,10 @@ import hashlib
 def coc_audit_fields(coc_text: str | None) -> dict[str, object]:
     """Return the full CoC and stable integrity metadata for JSONL telemetry.
 
-    Display code may shorten the text, but the proposal event must retain the
-    extracted model output byte-for-byte so rejected plans remain inspectable.
+    Display code may shorten the text, but the proposal event retains the
+    complete extracted CoT field byte-for-byte so rejected plans remain
+    inspectable. The upstream Alpamayo decoder may already normalize token
+    boundaries before exposing that field.
     """
 
     text = "" if coc_text is None else str(coc_text)

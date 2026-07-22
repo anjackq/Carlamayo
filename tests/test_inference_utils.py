@@ -101,7 +101,7 @@ def test_prepare_model_input_validates_explicit_camera_identity_order():
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        ({"cot": [[[["  reason about lanes  "]]]]}, "reason about lanes"),
+        ({"cot": [[[["  reason about lanes  "]]]]}, "  reason about lanes  "),
         ({"cot": np.array(["stop for light"], dtype=object)}, "stop for light"),
         ({"cot": torch.tensor([7])}, "7"),
         ({}, ""),
@@ -109,6 +109,12 @@ def test_prepare_model_input_validates_explicit_camera_identity_order():
 )
 def test_extract_cot_text_handles_nested_common_return_shapes(extra, expected):
     assert inference.extract_cot_text(extra) == expected
+
+
+def test_extract_cot_text_selects_matching_candidate_without_normalizing_text():
+    extra = {"cot": np.array([[" first ", " second\n"]], dtype=object)}
+
+    assert inference.extract_cot_text(extra, candidate_index=1) == " second\n"
 
 
 def test_extract_answer_text_removes_special_tokens_and_terminators():

@@ -362,6 +362,272 @@ def test_runtime_error_is_recorded_before_the_final_summary(monkeypatch, tmp_pat
     _assert_stream_summary_invariants(records)
 
 
+def test_runtime_error_after_nominal_throttle_applies_final_brake_and_returns_one(
+    monkeypatch,
+    tmp_path,
+):
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.6, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 5.0,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _SafeAdapter:
+        def __init__(self, *_args):
+            pass
+
+        def assess(self, **_kwargs):
+            return types.SimpleNamespace(
+                road=RoadContainmentAssessment.safe(sample_count=5),
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "post-throttle-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.3",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1, fail_on_tick=2)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(
+        closed_loop,
+        "OfficialPIDFollower",
+        lambda *_args: _TrackingFollower(),
+    )
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _SafeAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    assert len(carla_if.applied_controls) == 2
+    assert carla_if.applied_controls[0][1] > 0.0
+    assert carla_if.applied_controls[0][2] == 0.0
+    assert carla_if.applied_controls[-1] == (0.0, 0.0, 1.0)
+
+    records = _read_jsonl(telemetry_path)
+    runtime_error = next(
+        record for record in records if record["event_type"] == "runtime_error"
+    )
+    assert runtime_error["error"] == "synthetic tick failure 2"
+    assert runtime_error["fail_closed_brake_applied"] is True
+    assert records[-1]["stop_reason"] == "error"
+    assert records[-1]["error"] == "synthetic tick failure 2"
+    _assert_stream_summary_invariants(records)
+
+
+def test_sync_keyboard_interrupt_terminalizes_request_and_returns_130(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "sync-keyboard-interrupt.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    def interrupt_inference(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(closed_loop, "run_inference", interrupt_inference)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 130
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)]
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["request_id"] == submitted[0]["request_id"]
+    assert terminal[0]["status"] == "interrupted"
+    assert terminal[0]["rejected"] is True
+    assert (
+        terminal[0]["rejection_reason"]
+        == "keyboard_interrupt_during_sync_inference"
+    )
+    stop_event = next(
+        record
+        for record in records
+        if record["event_type"] == "episode_stop_requested"
+    )
+    assert stop_event["emergency_brake_applied"] is True
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "keyboard_interrupt"
+    _assert_stream_summary_invariants(records)
+
+
+def test_sync_vqa_failure_is_not_retried_on_each_tick(monkeypatch, tmp_path):
+    telemetry_path = tmp_path / "sync-vqa-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--mode",
+            "vqa",
+            "--vqa-question",
+            "What is ahead?",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.5",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    vqa_calls = 0
+
+    def fail_vqa(*_args, **_kwargs):
+        nonlocal vqa_calls
+        vqa_calls += 1
+        raise RuntimeError("synthetic VQA failure")
+
+    monkeypatch.setattr(closed_loop, "run_vqa", fail_vqa)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 0
+    assert vqa_calls == 1
+    assert carla_if.tick_count == 5
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)] * 5
+
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["request_id"] == submitted[0]["request_id"]
+    assert terminal[0]["status"] == "error"
+    assert terminal[0]["rejection_reason"].startswith("model_inference_error:")
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "max_episode_seconds"
+    _assert_stream_summary_invariants(records)
+
+
+def test_startup_model_load_error_emits_runtime_error_and_summary(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "startup-model-load-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.ego_vehicle = None
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    def fail_model_load(*_args, **_kwargs):
+        raise RuntimeError("synthetic model load failure")
+
+    monkeypatch.setattr(closed_loop, "load_model", fail_model_load)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    assert carla_if.tick_count == 0
+    assert carla_if.cleanup_count == 1
+    assert carla_if.applied_controls == []
+    records = _read_jsonl(telemetry_path)
+    assert [record["event_type"] for record in records] == [
+        "runtime_error",
+        "episode_summary",
+    ]
+    runtime_error, summary = records
+    assert runtime_error["error"] == "synthetic model load failure"
+    assert runtime_error["emergency_brake_attempted"] is False
+    assert runtime_error["fail_closed_brake_applied"] is False
+    assert summary["stop_reason"] == "error"
+    assert summary["error"] == "synthetic model load failure"
+    assert summary["loop_tick_count"] == 0
+    _assert_stream_summary_invariants(records)
+
+
+def test_summary_exact_timing_flags_are_false_without_exact_observations(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "zero-exact-observations.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1, fail_on_tick=1)
+
+    def unexpected_synchronized_observation(*_args, **_kwargs):
+        raise AssertionError("tick failure should prevent observation capture")
+
+    carla_if.get_synchronized_observation = unexpected_synchronized_observation
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    records = _read_jsonl(telemetry_path)
+    episode_start = next(
+        record for record in records if record["event_type"] == "episode_start"
+    )
+    summary = records[-1]
+    assert episode_start["exact_sensor_frame_ids_available"] is True
+    assert summary["loop_tick_count"] == 0
+    assert summary["exact_source_frame_ids_available"] is False
+    assert summary["exact_plan_age_available"] is False
+    assert summary["source_age_s"]["count"] == 0
+    _assert_stream_summary_invariants(records)
+
+
 def test_sync_normal_inference_failure_keeps_episode_running_and_brakes(
     monkeypatch,
     tmp_path,

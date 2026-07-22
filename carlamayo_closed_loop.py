@@ -345,30 +345,10 @@ def main():
     if args.mode == "vqa" and nav_state.vqa_question:
         print(f"Initial VQA question: {nav_state.vqa_question}")
 
-    print("\nLoading model...")
-    configure_cuda_linalg_library(args.cuda_linalg_library)
     model = None
     processor = None
-    if not args.oom_free:
-        model, processor = load_model(args.quantization, device_map=args.device_map)
-        print("Model loaded!")
-        print(f"VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f} GB allocated")
-    else:
-        # Defer loading until CARLA has spawned its cameras/NPCs so the OOM-free
-        # residency plan is computed against the VRAM CARLA actually leaves free.
-        print("OOM-free mode: Alpamayo loads after CARLA is fully spawned.")
-
     carla_if = CARLAInterface()
-    video_recorder = (
-        VideoRecorder(
-            cfg.OUTPUT_VIDEO,
-            fps=cfg.VIDEO_FPS,
-            preview_path=cfg.LIVE_PREVIEW_IMAGE,
-            preview_interval_frames=max(1, cfg.VIDEO_FPS // 2),
-        )
-        if cfg.SAVE_VIDEO
-        else None
-    )
+    video_recorder = None
     pygame_ui = None
     pygame_ui_recorder = None
     latest_ui_frame = None
@@ -376,7 +356,7 @@ def main():
     run_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}"
     run_started_monotonic_s = None
     runtime_metrics = None
-    telemetry_writer = JsonlWriter(args.telemetry_jsonl) if args.telemetry_jsonl else None
+    telemetry_writer = None
     telemetry_write_failed = False
     frame_count = 0
     respawn_count = 0
@@ -389,15 +369,13 @@ def main():
     inference_result_q = None
     inference_stop = None
     worker_thread = None
-    tick_requires_control = False
-    control_applied_for_tick = False
+    exact_observation_count = 0
+    active_sync_request = None
 
     def apply_vehicle_control(command):
         """The single low-level gateway for all loop-owned vehicle commands."""
 
-        nonlocal control_applied_for_tick
         carla_if.apply_control(*command.as_tuple())
-        control_applied_for_tick = True
 
     def emit_runtime_event(event_type, **fields):
         """Aggregate an event and append it to JSONL when telemetry is enabled."""
@@ -426,16 +404,6 @@ def main():
                 print(f"Warning: runtime telemetry disabled after write failure: {exc}")
         return payload
 
-    if args.pygame_ui:
-        from module.pygame_ui import ClosedLoopPygameUI
-
-        pygame_ui = ClosedLoopPygameUI(
-            width=cfg.PYGAME_WINDOW_WIDTH,
-            height=cfg.PYGAME_WINDOW_HEIGHT,
-            mode=args.mode,
-        )
-        pygame_ui_recorder = VideoRecorder(args.pygame_ui_video, fps=cfg.VIDEO_FPS)
-
     def draw_pygame_ui(frame_rgb, telemetry):
         if pygame_ui is None:
             return
@@ -444,6 +412,42 @@ def main():
             pygame_ui_recorder.add_frame(pygame_ui.capture_frame())
 
     try:
+        if args.telemetry_jsonl:
+            telemetry_writer = JsonlWriter(args.telemetry_jsonl)
+        if cfg.SAVE_VIDEO:
+            video_recorder = VideoRecorder(
+                cfg.OUTPUT_VIDEO,
+                fps=cfg.VIDEO_FPS,
+                preview_path=cfg.LIVE_PREVIEW_IMAGE,
+                preview_interval_frames=max(1, cfg.VIDEO_FPS // 2),
+            )
+        if args.pygame_ui:
+            from module.pygame_ui import ClosedLoopPygameUI
+
+            pygame_ui = ClosedLoopPygameUI(
+                width=cfg.PYGAME_WINDOW_WIDTH,
+                height=cfg.PYGAME_WINDOW_HEIGHT,
+                mode=args.mode,
+            )
+            pygame_ui_recorder = VideoRecorder(
+                args.pygame_ui_video,
+                fps=cfg.VIDEO_FPS,
+            )
+
+        print("\nLoading model...")
+        configure_cuda_linalg_library(args.cuda_linalg_library)
+        if not args.oom_free:
+            model, processor = load_model(
+                args.quantization,
+                device_map=args.device_map,
+            )
+            print("Model loaded!")
+            print(f"VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f} GB allocated")
+        else:
+            # Defer loading until CARLA has spawned its cameras/NPCs so the
+            # OOM-free plan reflects the VRAM CARLA actually leaves free.
+            print("OOM-free mode: Alpamayo loads after CARLA is fully spawned.")
+
         carla_if.connect()
         carla_if.load_map(cfg.CARLA_MAP)
         carla_if.spawn_ego_vehicle()
@@ -600,6 +604,8 @@ def main():
             frame_id_quality=None,
             coc_sha256=None,
         ):
+            nonlocal active_sync_request
+
             request_lifetime_s = max(0.0, time.monotonic() - submission_monotonic_s)
             if current_observation_entry is not None:
                 if source_carla_frame_id is None:
@@ -620,7 +626,7 @@ def main():
                     0.0,
                     float(current_simulation_time_s) - float(source_simulation_time_s),
                 )
-            emit_runtime_event(
+            payload = emit_runtime_event(
                 "inference_result",
                 request_id=request_id,
                 mode=mode,
@@ -648,6 +654,12 @@ def main():
                 source_plan_id=source_plan_id,
                 coc_sha256=coc_sha256,
             )
+            if (
+                active_sync_request is not None
+                and int(active_sync_request["request_id"]) == int(request_id)
+            ):
+                active_sync_request = None
+            return payload
 
         def _clear_async_queues(reason):
             if inference_request_q is not None:
@@ -687,10 +699,7 @@ def main():
         def _extract_and_audit_proposal(result, *, model_inference_latency_s):
             """Extract one generated proposal and log its complete reasoning once."""
 
-            cot_text = extract_cot_text(result.get("extra"))
-            audit = coc_audit_fields(cot_text)
             proposal_id = f"{run_id}:{int(result['request_id'])}"
-            result["coc_sha256"] = audit["coc_sha256"]
             try:
                 traj_samples = extract_trajectory_samples(result["pred_xyz"])
                 selected_idx, similarity_scores = select_trajectory_by_prev_similarity(
@@ -698,6 +707,9 @@ def main():
                     prev_selected_trajectory,
                 )
             except Exception as exc:
+                cot_text = extract_cot_text(result.get("extra"))
+                audit = coc_audit_fields(cot_text)
+                result["coc_sha256"] = audit["coc_sha256"]
                 emit_runtime_event(
                     "alpamayo_proposal",
                     layer="ALPAMAYO_PROPOSAL",
@@ -722,6 +734,12 @@ def main():
                     **audit,
                 )
                 raise TrajectoryValidationError(f"trajectory_extraction_error:{exc}") from exc
+            cot_text = extract_cot_text(
+                result.get("extra"),
+                candidate_index=int(selected_idx),
+            )
+            audit = coc_audit_fields(cot_text)
+            result["coc_sha256"] = audit["coc_sha256"]
             emit_runtime_event(
                 "alpamayo_proposal",
                 layer="ALPAMAYO_PROPOSAL",
@@ -753,6 +771,42 @@ def main():
                 "coc_text": cot_text,
                 "coc_sha256": audit["coc_sha256"],
             }
+
+        def _audit_discarded_generated_result(result, discard_reason):
+            """Preserve generated reasoning even when revisions make a result stale."""
+
+            if "error" in result or result.get("mode") == "vqa":
+                return
+            cot_text = extract_cot_text(result.get("extra"))
+            audit = coc_audit_fields(cot_text)
+            proposal_id = f"{run_id}:{int(result['request_id'])}"
+            result["coc_sha256"] = audit["coc_sha256"]
+            emit_runtime_event(
+                "alpamayo_proposal",
+                layer="ALPAMAYO_PROPOSAL",
+                proposal_id=proposal_id,
+                proposal_status="discarded_before_trajectory_validation",
+                discard_reason=discard_reason,
+                request_id=int(result["request_id"]),
+                mode=result.get("mode", args.mode),
+                source_loop_tick_id=int(result["source_loop_tick_id"]),
+                source_carla_frame_id=int(result["source_carla_frame_id"]),
+                source_simulation_time_s=float(result["source_simulation_time_s"]),
+                frame_id_quality=result.get("frame_id_quality", "loop_counter_proxy"),
+                camera_ids=list(result.get("camera_ids", tuple())),
+                prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
+                respawn_revision=int(result.get("respawn_revision", respawn_revision)),
+                selected_candidate_index=None,
+                candidate_count=None,
+                candidate_similarity_scores=None,
+                candidate_trajectories_model=None,
+                model_inference_latency_s=float(
+                    result.get("model_inference_time")
+                    or result.get("inference_time")
+                    or 0.0
+                ),
+                **audit,
+            )
 
         def _build_and_validate_fixed_plan(result, proposal):
             plan = build_fixed_world_trajectory(
@@ -1528,11 +1582,8 @@ def main():
                     continue
                 pause_brake_active = False
 
-            tick_requires_control = False
             tick_context = carla_if.tick()
             frame_count += 1
-            tick_requires_control = True
-            control_applied_for_tick = False
             (
                 current_carla_frame_id,
                 current_simulation_time_s,
@@ -1606,6 +1657,8 @@ def main():
             current_carla_frame_id = observation_entry["frame_id"]
             current_simulation_time_s = observation_entry["simulation_time_s"]
             current_frame_id_quality = observation_entry["frame_id_quality"]
+            if current_frame_id_quality == "exact_carla_snapshot":
+                exact_observation_count += 1
             if len(images) > 1:
                 latest_ui_frame = images[1]
             latest_telemetry = {
@@ -1728,6 +1781,10 @@ def main():
                             latest_result.get("prompt_revision", nav_state.revision)
                             != nav_state.revision
                         ):
+                            _audit_discarded_generated_result(
+                                latest_result,
+                                "stale_prompt_revision",
+                            )
                             print(
                                 f"[Frame {frame_count}] Discarded stale inference result for "
                                 f"prompt revision {latest_result.get('prompt_revision')}"
@@ -1738,6 +1795,10 @@ def main():
                             latest_result.get("respawn_revision", respawn_revision)
                             != respawn_revision
                         ):
+                            _audit_discarded_generated_result(
+                                latest_result,
+                                "stale_respawn_revision",
+                            )
                             print(
                                 f"[Frame {frame_count}] Discarded stale inference result from "
                                 f"respawn revision {latest_result.get('respawn_revision')}"
@@ -1850,6 +1911,7 @@ def main():
                 if args.mode == "vqa":
                     should_prepare_sync_input = (
                         bool(nav_state.vqa_question)
+                        and nav_state.revision != last_vqa_submitted_revision
                         and nav_state.revision != last_vqa_completed_revision
                     )
                 else:
@@ -1873,12 +1935,25 @@ def main():
                     if args.mode == "vqa":
                         should_run_vqa = (
                             bool(nav_state.vqa_question)
+                            and nav_state.revision != last_vqa_submitted_revision
                             and nav_state.revision != last_vqa_completed_revision
                         )
                         if should_run_vqa:
                             request_sequence += 1
                             request_id = request_sequence
                             submission_monotonic_s = time.monotonic()
+                            last_vqa_submitted_revision = nav_state.revision
+                            active_sync_request = {
+                                "request_id": request_id,
+                                "mode": "vqa",
+                                "submission_monotonic_s": submission_monotonic_s,
+                                "source_loop_tick_id": int(frame_count),
+                                "source_carla_frame_id": int(source_entry["frame_id"]),
+                                "source_simulation_time_s": float(
+                                    source_entry["simulation_time_s"]
+                                ),
+                                "frame_id_quality": source_entry["frame_id_quality"],
+                            }
                             emit_runtime_event(
                                 "inference_submitted",
                                 request_id=request_id,
@@ -1959,6 +2034,17 @@ def main():
                             current_simulation_time_s
                         )
                         submission_monotonic_s = time.monotonic()
+                        active_sync_request = {
+                            "request_id": request_id,
+                            "mode": args.mode,
+                            "submission_monotonic_s": submission_monotonic_s,
+                            "source_loop_tick_id": int(frame_count),
+                            "source_carla_frame_id": int(source_entry["frame_id"]),
+                            "source_simulation_time_s": float(
+                                source_entry["simulation_time_s"]
+                            ),
+                            "frame_id_quality": source_entry["frame_id_quality"],
+                        }
                         emit_runtime_event(
                             "inference_submitted",
                             request_id=request_id,
@@ -2337,50 +2423,125 @@ def main():
 
     except KeyboardInterrupt:
         stop_reason = "keyboard_interrupt"
-        emit_runtime_event("episode_stop_requested", status=stop_reason)
+        emergency_brake_attempted = carla_if.ego_vehicle is not None
+        emergency_brake_applied = False
+        emergency_brake_error = None
+        if emergency_brake_attempted:
+            try:
+                apply_vehicle_control(ControlCommand.full_brake())
+                emergency_brake_applied = True
+            except Exception as exc:
+                emergency_brake_error = f"{type(exc).__name__}:{exc}"
+        sync_terminal_error = None
+        if active_sync_request is not None:
+            request = dict(active_sync_request)
+            try:
+                _emit_sync_terminal(
+                    request_id=request["request_id"],
+                    mode=request["mode"],
+                    status="interrupted",
+                    rejection_reason="keyboard_interrupt_during_sync_inference",
+                    submission_monotonic_s=request["submission_monotonic_s"],
+                    source_loop_tick_id=request["source_loop_tick_id"],
+                    source_carla_frame_id=request["source_carla_frame_id"],
+                    source_simulation_time_s=request["source_simulation_time_s"],
+                    frame_id_quality=request["frame_id_quality"],
+                )
+            except Exception as exc:
+                sync_terminal_error = f"{type(exc).__name__}:{exc}"
+        emit_runtime_event(
+            "episode_stop_requested",
+            status=stop_reason,
+            emergency_brake_attempted=emergency_brake_attempted,
+            emergency_brake_applied=emergency_brake_applied,
+            emergency_brake_error=emergency_brake_error,
+            sync_terminal_error=sync_terminal_error,
+        )
         print("\n\nInterrupted by user.")
     except Exception as e:
         stop_reason = "error"
         run_error = str(e)
+        emergency_brake_attempted = carla_if.ego_vehicle is not None
+        emergency_brake_applied = False
         fail_closed_apply_error = None
-        if tick_requires_control and not control_applied_for_tick:
+        if emergency_brake_attempted:
             try:
                 apply_vehicle_control(ControlCommand.full_brake())
+                emergency_brake_applied = True
             except Exception as apply_exc:
                 fail_closed_apply_error = f"{type(apply_exc).__name__}:{apply_exc}"
+        sync_terminal_error = None
+        if active_sync_request is not None:
+            request = dict(active_sync_request)
+            try:
+                _emit_sync_terminal(
+                    request_id=request["request_id"],
+                    mode=request["mode"],
+                    status="error",
+                    rejection_reason=f"runtime_error:{type(e).__name__}:{e}",
+                    submission_monotonic_s=request["submission_monotonic_s"],
+                    source_loop_tick_id=request["source_loop_tick_id"],
+                    source_carla_frame_id=request["source_carla_frame_id"],
+                    source_simulation_time_s=request["source_simulation_time_s"],
+                    frame_id_quality=request["frame_id_quality"],
+                )
+            except Exception as terminal_exc:
+                sync_terminal_error = (
+                    f"{type(terminal_exc).__name__}:{terminal_exc}"
+                )
         emit_runtime_event(
             "runtime_error",
             status="error",
             error=run_error,
-            fail_closed_brake_applied=bool(
-                tick_requires_control and control_applied_for_tick
-            ),
+            emergency_brake_attempted=emergency_brake_attempted,
+            fail_closed_brake_applied=emergency_brake_applied,
             fail_closed_apply_error=fail_closed_apply_error,
+            sync_terminal_error=sync_terminal_error,
         )
         print(f"\nError: {e}")
         traceback.print_exc()
     finally:
-        if args.async_mode and inference_stop is not None:
-            inference_stop.set()
-            try:
-                inference_request_q.put_nowait(None)
-            except Exception:
-                pass
-            if worker_thread is not None:
-                worker_thread.join(timeout=2.0)
-            _clear_async_queues("episode_end")
-            for outstanding_request_id in list(outstanding_async_requests):
-                _emit_async_terminal(
-                    outstanding_request_id,
-                    "cancelled",
-                    "episode_ended_before_result_consumption",
+        async_shutdown_error = None
+        try:
+            if args.async_mode and inference_stop is not None:
+                inference_stop.set()
+                try:
+                    inference_request_q.put_nowait(None)
+                except Exception:
+                    pass
+                if worker_thread is not None:
+                    worker_thread.join(timeout=2.0)
+                worker_is_alive = bool(
+                    worker_thread is not None
+                    and callable(getattr(worker_thread, "is_alive", None))
+                    and worker_thread.is_alive()
                 )
+                _clear_async_queues("episode_end")
+                for outstanding_request_id in list(outstanding_async_requests):
+                    _emit_async_terminal(
+                        outstanding_request_id,
+                        "abandoned" if worker_is_alive else "cancelled",
+                        (
+                            "worker_still_running_at_episode_end"
+                            if worker_is_alive
+                            else "episode_ended_before_result_consumption"
+                        ),
+                    )
+        except Exception as exc:
+            async_shutdown_error = f"{type(exc).__name__}:{exc}"
+            print(f"Warning: async shutdown telemetry failed: {exc}")
+
+        cleanup_error = None
+        try:
+            carla_if.cleanup()
+        except Exception as exc:
+            cleanup_error = f"{type(exc).__name__}:{exc}"
+            print(f"Warning: CARLA cleanup failed: {exc}")
+
         if runtime_metrics is None:
             runtime_metrics = RuntimeMetrics()
         runtime_metrics.record_collision_count(carla_if.get_episode_collision_count())
-        exact_timing_available = callable(
-            getattr(carla_if, "get_synchronized_observation", None)
-        )
+        exact_timing_available = exact_observation_count > 0
         get_camera_sync_stats = getattr(carla_if, "get_camera_sync_stats", None)
         camera_sync_stats = (
             get_camera_sync_stats() if callable(get_camera_sync_stats) else None
@@ -2396,12 +2557,17 @@ def main():
             simulation_tick_seconds=simulation_tick_seconds,
             simulation_duration_quality="successful_tick_count_times_world_fixed_delta",
             exact_source_frame_ids_available=exact_timing_available,
-            exact_plan_age_available=exact_timing_available,
+            exact_plan_age_available=False,
             camera_sync_stats=camera_sync_stats,
             respawn_count=int(respawn_count),
             episode_collision_count=carla_if.get_episode_collision_count(),
             telemetry_path=args.telemetry_jsonl,
             telemetry_write_failed=telemetry_write_failed,
+            async_shutdown_error=async_shutdown_error,
+            cleanup_error=cleanup_error,
+        )
+        summary["exact_plan_age_available"] = bool(
+            summary["source_age_s"]["count"] > 0
         )
         if telemetry_writer is not None and not telemetry_write_failed:
             try:
@@ -2445,27 +2611,27 @@ def main():
         )
         if args.telemetry_jsonl:
             print(f"  telemetry: {args.telemetry_jsonl}")
-        try:
-            if cfg.SAVE_VIDEO and video_recorder:
-                try:
-                    video_recorder.save()
-                except Exception as exc:
-                    print(f"Warning: failed to save closed-loop video: {exc}")
-            if pygame_ui_recorder is not None:
-                try:
-                    pygame_ui_recorder.save()
-                except Exception as exc:
-                    print(f"Warning: failed to save Pygame UI video: {exc}")
-            if pygame_ui is not None:
-                try:
-                    pygame_ui.close()
-                except Exception as exc:
-                    print(f"Warning: failed to close Pygame UI: {exc}")
-        finally:
-            carla_if.cleanup()
+        if cfg.SAVE_VIDEO and video_recorder:
+            try:
+                video_recorder.save()
+            except Exception as exc:
+                print(f"Warning: failed to save closed-loop video: {exc}")
+        if pygame_ui_recorder is not None:
+            try:
+                pygame_ui_recorder.save()
+            except Exception as exc:
+                print(f"Warning: failed to save Pygame UI video: {exc}")
+        if pygame_ui is not None:
+            try:
+                pygame_ui.close()
+            except Exception as exc:
+                print(f"Warning: failed to close Pygame UI: {exc}")
 
     print("\nStopped.")
+    if stop_reason == "keyboard_interrupt":
+        return 130
+    return 1 if stop_reason == "error" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

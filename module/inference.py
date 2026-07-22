@@ -300,7 +300,13 @@ def run_inference(
     return pred_xyz, extra
 
 
-def _extract_text_field(extra, key):
+def _extract_text_field(
+    extra,
+    key,
+    *,
+    candidate_index=0,
+    preserve_whitespace=False,
+):
     if not isinstance(extra, dict):
         return ""
     if key not in extra:
@@ -310,25 +316,45 @@ def _extract_text_field(extra, key):
     if value is None:
         return ""
 
+    selected_candidate = False
     while True:
         if isinstance(value, str):
-            return str(value).strip()
+            text = str(value)
+            return text if preserve_whitespace else text.strip()
         if isinstance(value, (list, tuple)):
             if len(value) == 0:
                 return ""
-            value = value[0]
+            if len(value) == 1:
+                value = value[0]
+            else:
+                selection = int(candidate_index) if not selected_candidate else 0
+                value = value[min(max(0, selection), len(value) - 1)]
+                selected_candidate = True
             continue
         if isinstance(value, np.ndarray):
             if value.size == 0:
                 return ""
-            value = value.flat[0]
+            while (
+                isinstance(value, np.ndarray)
+                and value.ndim > 0
+                and value.shape[0] == 1
+            ):
+                value = value[0]
+            if isinstance(value, np.ndarray):
+                selection = int(candidate_index) if not selected_candidate else 0
+                value = value.flat[min(max(0, selection), value.size - 1)]
+                selected_candidate = True
             continue
         if hasattr(value, "numel") and hasattr(value, "reshape"):
             if int(value.numel()) == 0:
                 return ""
-            value = value.reshape(-1)[0].item()
+            flat = value.reshape(-1)
+            selection = int(candidate_index) if not selected_candidate else 0
+            value = flat[min(max(0, selection), int(value.numel()) - 1)].item()
+            selected_candidate = True
             continue
-        return str(value).strip()
+        text = str(value)
+        return text if preserve_whitespace else text.strip()
 
 
 def _clean_generated_answer_text(text):
@@ -406,8 +432,15 @@ def _generate_vqa_text_with_partial_answer_fallback(
     }
 
 
-def extract_cot_text(extra):
-    return _extract_text_field(extra, "cot")
+def extract_cot_text(extra, candidate_index=0):
+    """Return the complete extracted CoT field for one trajectory candidate."""
+
+    return _extract_text_field(
+        extra,
+        "cot",
+        candidate_index=candidate_index,
+        preserve_whitespace=True,
+    )
 
 
 def extract_answer_text(extra):
