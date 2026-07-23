@@ -85,6 +85,12 @@ PYGAME_WINDOW_HEIGHT = 900
 CARLA_MAP = "Town03"  # Urban-style map
 NPC_VEHICLE_COUNT = 50
 NPC_WALKER_COUNT = 50
+# Diagnostic scenario defaults.  Empty-road runs force a fresh map, spawn no
+# traffic participants, and place the ego at a stable CARLA map spawn point so
+# safety/controller changes can be compared against the same initial scene.
+EMPTY_ROAD_EGO_SPAWN_INDEX = 0
+EMPTY_ROAD_SCENARIO_SEED = 0
+MAX_SCENARIO_SEED = 2**32 - 1
 NPC_EXCLUDED_VEHICLE_KEYWORDS = (
     "ambulance",
     "carlacola",

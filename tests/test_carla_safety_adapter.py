@@ -253,6 +253,73 @@ def test_center_valid_but_corner_off_lane_is_rejected(driving_lane_type):
     assert "footprint_corner_off_driving_lane" in road.reason_codes
 
 
+def test_spawn_preflight_uses_actual_ego_bbox_and_exact_lane_queries(
+    driving_lane_type,
+):
+    carla_map = RecordingMap()
+    adapter, _, _ = _adapter(
+        carla_map,
+        ego_bounding_box=FakeBoundingBox(
+            half_length=1.2,
+            half_width=0.8,
+            offset_x=0.2,
+            offset_y=0.1,
+            yaw=3.0,
+        ),
+    )
+
+    road = adapter.assess_ego_transform(FakeTransform(x=4.0, y=0.0, yaw=7.0))
+
+    assert road.status is AssessmentStatus.SAFE
+    assert road.quality == "carla_ground_truth_spawn_preflight"
+    assert road.sample_count == 5
+    assert len(carla_map.calls) == 5
+    assert all(call["project_to_road"] is False for call in carla_map.calls)
+    assert all(call["lane_type"] is driving_lane_type for call in carla_map.calls)
+    queried_center = carla_map.calls[0]["location"]
+    expected_x = 4.0 + 0.2 * math.cos(math.radians(7.0)) - 0.1 * math.sin(
+        math.radians(7.0)
+    )
+    expected_y = 0.2 * math.sin(math.radians(7.0)) + 0.1 * math.cos(
+        math.radians(7.0)
+    )
+    assert queried_center.x == pytest.approx(expected_x)
+    assert queried_center.y == pytest.approx(expected_y)
+
+
+def test_spawn_preflight_rejects_footprint_that_crosses_driving_lane_edge(
+    driving_lane_type,
+):
+    def resolve(location):
+        if abs(location.y) >= 0.5:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, _ = _adapter(
+        RecordingMap(resolve),
+        ego_bounding_box=FakeBoundingBox(half_length=0.4, half_width=0.6),
+    )
+
+    road = adapter.assess_ego_transform(FakeTransform())
+
+    assert road.status is AssessmentStatus.UNSAFE
+    assert road.quality == "carla_ground_truth_spawn_preflight"
+    assert "footprint_corner_off_driving_lane" in road.reason_codes
+
+
+def test_spawn_preflight_map_error_fails_closed_to_unknown(driving_lane_type):
+    def fail(_location):
+        raise RuntimeError("map unavailable")
+
+    adapter, _, _ = _adapter(RecordingMap(fail))
+
+    road = adapter.assess_ego_transform(FakeTransform())
+
+    assert road.status is AssessmentStatus.UNKNOWN
+    assert road.quality == "carla_ground_truth_spawn_preflight"
+    assert "carla_map_query_error:RuntimeError" in road.reason_codes
+
+
 def test_path_is_densified_to_half_metre_and_catches_off_road_gap(driving_lane_type):
     def resolve(location):
         if 0.9 <= location.x <= 1.1:

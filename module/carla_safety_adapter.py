@@ -37,6 +37,8 @@ class CarlaSafetyAssessment:
     road: RoadContainmentAssessment
     obstacles: ObstacleAssessment
     safety_source: str = "carla_ground_truth"
+    current_ego_road: RoadContainmentAssessment | None = None
+    proposed_path_road: RoadContainmentAssessment | None = None
 
 
 def _yaw_rad(transform: Any, bounding_box: Any | None = None) -> float:
@@ -290,6 +292,28 @@ class CarlaGroundTruthSafetyAdapter:
             quality = "carla_ground_truth_drivable_only_at_junction"
         return assess_road_containment(samples, quality=quality)
 
+    def assess_ego_transform(self, transform: Any) -> RoadContainmentAssessment:
+        """Assess the ego footprint at one candidate transform."""
+
+        bounding_box = self.ego_vehicle.bounding_box
+        center_xy = _bbox_center_xy(transform, bounding_box)
+        return assess_road_containment(
+            self._query_footprint(
+                center_xyz=np.array(
+                    [
+                        *center_xy,
+                        float(transform.location.z),
+                    ],
+                    dtype=np.float64,
+                ),
+                yaw_rad=_yaw_rad(transform, bounding_box),
+                half_length_m=float(bounding_box.extent.x),
+                half_width_m=float(bounding_box.extent.y),
+                sample_index_start=0,
+            ),
+            quality="carla_ground_truth_spawn_preflight",
+        )
+
     @staticmethod
     def _combine_road(
         plan_road: RoadContainmentAssessment,
@@ -427,7 +451,12 @@ class CarlaGroundTruthSafetyAdapter:
                 actors=self._actors_from_context(tick_context),
                 policy=self.policy,
             )
-        return CarlaSafetyAssessment(road=road, obstacles=obstacles)
+        return CarlaSafetyAssessment(
+            road=road,
+            obstacles=obstacles,
+            current_ego_road=current_road,
+            proposed_path_road=self._cached_plan_road,
+        )
 
 
 __all__ = ["CarlaGroundTruthSafetyAdapter", "CarlaSafetyAssessment"]

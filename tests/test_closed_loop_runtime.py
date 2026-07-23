@@ -30,36 +30,70 @@ class _FakeWorld:
         return self._settings
 
 
+class _FakeEgoVehicle:
+    def __init__(self):
+        self.transform = object()
+
+    def get_transform(self):
+        return self.transform
+
+
 class _FakeCarlaInterface:
     def __init__(self, *, fixed_delta_seconds=0.1, on_tick=None, fail_on_tick=None):
         self.world = _FakeWorld(fixed_delta_seconds)
-        self.ego_vehicle = object()
+        self.ego_vehicle = _FakeEgoVehicle()
         self.tick_count = 0
         self.cleanup_count = 0
         self.applied_controls = []
+        self.loaded_maps = []
+        self.scenario_seeds = []
+        self.ego_spawn_requests = []
+        self.npc_spawn_requests = []
+        self.setup_cameras_count = 0
+        self.setup_collision_sensor_count = 0
         self._on_tick = on_tick
         self._fail_on_tick = fail_on_tick
 
     def connect(self):
         pass
 
-    def load_map(self, _map_name):
-        pass
+    def load_map(self, map_name, *, force_reload=False):
+        self.loaded_maps.append((map_name, force_reload))
 
-    def spawn_ego_vehicle(self):
-        pass
+    def set_scenario_seed(self, seed):
+        self.scenario_seeds.append(seed)
+
+    def spawn_ego_vehicle(
+        self,
+        *,
+        spawn_index=None,
+        center_on_driving_lane=False,
+    ):
+        self.ego_spawn_requests.append(
+            {
+                "spawn_index": spawn_index,
+                "center_on_driving_lane": center_on_driving_lane,
+            }
+        )
 
     def enable_synchronous_mode(self):
         pass
 
-    def spawn_npcs(self, **_kwargs):
-        pass
+    def spawn_npcs(self, **kwargs):
+        self.npc_spawn_requests.append(dict(kwargs))
+
+    def get_non_ego_dynamic_actor_census(self):
+        return {
+            "non_ego_vehicle_count": 0,
+            "walker_count": 0,
+            "walker_controller_count": 0,
+        }
 
     def setup_cameras(self):
-        pass
+        self.setup_cameras_count += 1
 
     def setup_collision_sensor(self):
-        pass
+        self.setup_collision_sensor_count += 1
 
     def tick(self):
         next_tick = self.tick_count + 1
@@ -193,6 +227,153 @@ def test_episode_limit_stops_on_first_successful_tick_boundary(
     assert summary["loop_tick_count"] == expected_ticks
     assert summary["simulation_duration_proxy_s"] == pytest.approx(expected_duration_s)
     assert summary["event_counts"]["tick"] == expected_ticks
+    _assert_stream_summary_invariants(records)
+
+
+def test_empty_road_setup_forces_fresh_map_fixed_spawn_and_zero_npcs(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "empty-road.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    rng_events = []
+    monkeypatch.setattr(
+        closed_loop,
+        "seed_runtime_randomness",
+        lambda seed: rng_events.append(("seed", seed)),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "load_model",
+        lambda _quantization, device_map: (
+            rng_events.append(("load_model", device_map)) or object(),
+            object(),
+        ),
+    )
+    preflight = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.42,
+        quality="carla_ground_truth_spawn_preflight",
+    )
+    preflight_transforms = []
+    safety_adapter = types.SimpleNamespace(
+        assess_ego_transform=lambda transform: (
+            preflight_transforms.append(transform) or preflight
+        )
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        lambda world, ego_vehicle, policy: safety_adapter,
+    )
+
+    closed_loop.main()
+
+    assert rng_events == [
+        ("seed", closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED),
+        ("load_model", "auto"),
+        ("seed", closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED),
+    ]
+    assert carla_if.loaded_maps == [(closed_loop.cfg.CARLA_MAP, True)]
+    assert carla_if.scenario_seeds == [closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED]
+    assert carla_if.ego_spawn_requests == [
+        {
+            "spawn_index": closed_loop.cfg.EMPTY_ROAD_EGO_SPAWN_INDEX,
+            "center_on_driving_lane": True,
+        }
+    ]
+    assert carla_if.npc_spawn_requests == [
+        {"num_vehicles": 0, "num_walkers": 0}
+    ]
+    assert preflight_transforms == [carla_if.ego_vehicle.transform]
+
+    records = _read_jsonl(telemetry_path)
+    episode_start = next(
+        record for record in records if record["event_type"] == "episode_start"
+    )
+    assert episode_start["scenario"] == "empty_road"
+    assert episode_start["scenario_seed"] == 0
+    assert episode_start["ego_spawn_index"] == 0
+    assert episode_start["requested_npc_vehicle_count"] == 0
+    assert episode_start["requested_npc_walker_count"] == 0
+    assert episode_start["empty_road_footprint_preflight"] == preflight.to_json_dict()
+    _assert_stream_summary_invariants(records)
+
+
+def test_unsafe_empty_road_footprint_aborts_before_oom_free_model_load(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "unsafe-empty-road.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--oom-free",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    preflight = RoadContainmentAssessment.unsafe(
+        (
+            "road_not_contained",
+            "footprint_corner_off_driving_lane",
+        ),
+        sample_count=5,
+        min_margin_m=-0.52,
+        first_bad_sample_index=2,
+        quality="carla_ground_truth_spawn_preflight",
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        lambda world, ego_vehicle, policy: types.SimpleNamespace(
+            assess_ego_transform=lambda transform: preflight
+        ),
+    )
+    model_loads = []
+    monkeypatch.setitem(
+        sys.modules,
+        "module.oom_offload",
+        types.SimpleNamespace(
+            load_offloaded_model=lambda **_kwargs: (
+                model_loads.append("loaded") or object(),
+                object(),
+            )
+        ),
+    )
+
+    closed_loop.main()
+
+    assert model_loads == []
+    assert carla_if.setup_cameras_count == 0
+    assert carla_if.setup_collision_sensor_count == 0
+    assert carla_if.tick_count == 0
+    assert carla_if.cleanup_count == 1
+    assert carla_if.applied_controls[-1] == (0.0, 0.0, 1.0)
+
+    records = _read_jsonl(telemetry_path)
+    runtime_error = next(
+        record for record in records if record["event_type"] == "runtime_error"
+    )
+    assert "empty-road ego footprint is not safely contained" in runtime_error["error"]
+    assert not any(record["event_type"] == "episode_start" for record in records)
+    summary = records[-1]
+    assert summary["stop_reason"] == "error"
+    assert "empty-road ego footprint is not safely contained" in summary["error"]
     _assert_stream_summary_invariants(records)
 
 

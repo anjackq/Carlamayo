@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import queue
+import random
 import threading
 import time
 import traceback
@@ -20,6 +21,7 @@ from module.proposal_audit import coc_audit_fields
 from module.respawn_control import RespawnMonitor
 from module.runtime_metrics import JsonlWriter, RuntimeMetrics
 from module.safety_shield import (
+    AssessmentStatus,
     ControlCommand,
     ObstacleAssessment,
     RoadContainmentAssessment,
@@ -64,6 +66,80 @@ def format_vqa_answer_preview(answer, limit=160):
         return "(empty answer)"
     suffix = "..." if len(answer) > limit else ""
     return f"{answer[:limit]}{suffix}"
+
+
+def seed_runtime_randomness(seed):
+    """Seed host and accelerator RNGs used by the scenario and Alpamayo."""
+
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_safety_policy():
+    """Build the one policy shared by spawn preflight and runtime arbitration."""
+
+    return SafetyPolicy(
+        path_sample_spacing_m=cfg.SAFETY_PATH_SAMPLE_SPACING_M,
+        lateral_clearance_m=cfg.SAFETY_LATERAL_CLEARANCE_M,
+        longitudinal_clearance_m=cfg.SAFETY_LONGITUDINAL_CLEARANCE_M,
+        reaction_time_s=cfg.SAFETY_REACTION_TIME_S,
+        assumed_deceleration_mps2=cfg.SAFETY_ASSUMED_DECELERATION_MPS2,
+        stop_buffer_m=cfg.SAFETY_STOP_BUFFER_M,
+        hard_gap_m=cfg.SAFETY_HARD_GAP_M,
+        ttc_threshold_s=cfg.SAFETY_TTC_THRESHOLD_S,
+        minimum_closing_speed_mps=cfg.SAFETY_MINIMUM_CLOSING_SPEED_MPS,
+        prediction_horizon_s=cfg.SAFETY_PREDICTION_HORIZON_S,
+        prediction_time_step_s=cfg.SAFETY_PREDICTION_TIME_STEP_S,
+        emergency_hold_ticks=cfg.SAFETY_EMERGENCY_HOLD_TICKS,
+        clear_ticks_to_release=cfg.SAFETY_CLEAR_TICKS_TO_RELEASE,
+    )
+
+
+def smooth_controller_control(
+    *,
+    steering_raw,
+    throttle_raw,
+    brake_raw,
+    previous_nominal,
+    alpha,
+    bypass_smoothing=False,
+):
+    """Smooth controller intent without feeding safety overrides back into it."""
+
+    if bypass_smoothing:
+        return (
+            {
+                "steering": float(np.clip(steering_raw, -1.0, 1.0)),
+                "throttle": 0.0,
+                "brake": 1.0,
+            },
+            ("emergency_brake_bypass_ema",),
+        )
+
+    previous_steering = previous_nominal.get(
+        "steering",
+        previous_nominal.get("steer", 0.0),
+    )
+    steering = (1.0 - alpha) * previous_steering + alpha * steering_raw
+    throttle = (1.0 - alpha) * previous_nominal["throttle"] + alpha * throttle_raw
+    brake = (1.0 - alpha) * previous_nominal["brake"] + alpha * brake_raw
+    if throttle >= brake:
+        brake = 0.0
+    else:
+        throttle = 0.0
+    return (
+        {
+            "steering": float(np.clip(steering, -1.0, 1.0)),
+            "throttle": float(np.clip(throttle, 0.0, 1.0)),
+            "brake": float(np.clip(brake, 0.0, 1.0)),
+        },
+        ("ema_smoothing", "throttle_brake_arbitration"),
+    )
 
 
 def resolve_tick_identity(tick_context, loop_tick_id, simulation_tick_seconds):
@@ -116,10 +192,7 @@ def capture_control_observation(
     state = carla_if.get_ego_state()
     images = carla_if.get_camera_images()
     carla_if.update_history(state)
-    camera_ids = tuple(
-        int(spec["alpamayo_id"])
-        for spec in cfg.CAMERA_SPECS[: len(images)]
-    )
+    camera_ids = tuple(int(spec["alpamayo_id"]) for spec in cfg.CAMERA_SPECS[: len(images)])
     if len(camera_ids) != len(images):
         camera_ids = tuple(range(len(images)))
     capture_pose_world = state.get("pose_world") if isinstance(state, dict) else None
@@ -220,6 +293,32 @@ def parse_args(argv=None):
         help="Run internal async inference mode (non-blocking world tick).",
     )
     parser.add_argument(
+        "--empty-road",
+        action="store_true",
+        help=(
+            "Run a diagnostic scene with a freshly loaded map, fixed ego spawn, "
+            "and zero NPC vehicles or pedestrians."
+        ),
+    )
+    parser.add_argument(
+        "--scenario-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed CARLA, Python, NumPy, and Torch scenario/model randomness. "
+            "Empty-road default: 0; normal traffic default: unset."
+        ),
+    )
+    parser.add_argument(
+        "--ego-spawn-index",
+        type=int,
+        default=None,
+        help=(
+            "Use this CARLA map spawn-point index for the ego. Empty-road "
+            "default: 0; normal traffic default: random clear spawn."
+        ),
+    )
+    parser.add_argument(
         "--pygame-ui",
         action="store_true",
         help="Show a pygame camera UI with prompt input and pause/resume controls.",
@@ -289,10 +388,7 @@ def parse_args(argv=None):
         "--max-episode-seconds",
         type=float,
         default=None,
-        help=(
-            "Stop after this many seconds of successful simulation ticks. "
-            "Disabled by default."
-        ),
+        help=("Stop after this many seconds of successful simulation ticks. Disabled by default."),
     )
     args = parser.parse_args(argv)
     if args.oom_free and args.quantization:
@@ -301,16 +397,24 @@ def parse_args(argv=None):
         not math.isfinite(args.max_episode_seconds) or args.max_episode_seconds <= 0.0
     ):
         parser.error("--max-episode-seconds must be finite and greater than zero.")
+    if args.scenario_seed is not None and not (0 <= args.scenario_seed <= cfg.MAX_SCENARIO_SEED):
+        parser.error(f"--scenario-seed must be within [0, {cfg.MAX_SCENARIO_SEED}].")
+    if args.ego_spawn_index is not None and args.ego_spawn_index < 0:
+        parser.error("--ego-spawn-index must be nonnegative.")
+    if args.empty_road:
+        if args.scenario_seed is None:
+            args.scenario_seed = cfg.EMPTY_ROAD_SCENARIO_SEED
+        if args.ego_spawn_index is None:
+            args.ego_spawn_index = cfg.EMPTY_ROAD_EGO_SPAWN_INDEX
     args.start_paused = bool(args.pygame_ui)
-    args.pygame_ui_video = (
-        derive_pygame_ui_video_path(cfg.OUTPUT_VIDEO) if args.pygame_ui else None
-    )
+    args.pygame_ui_video = derive_pygame_ui_video_path(cfg.OUTPUT_VIDEO) if args.pygame_ui else None
     return args
 
 
 def main():
     args = parse_args()
     inference_interval_sec = 1.0
+    seed_runtime_randomness(args.scenario_seed)
 
     print("=" * 60)
     print("CARLA Real-time Control with Alpamayo")
@@ -323,6 +427,12 @@ def main():
     print(f"Inference mode: {args.mode}")
     print(f"Pygame UI: {'ON' if args.pygame_ui else 'OFF'}")
     print(f"CARLA map: {cfg.CARLA_MAP}")
+    print(f"Scenario: {'EMPTY ROAD' if args.empty_road else 'NORMAL TRAFFIC'}")
+    print(f"Scenario seed: {args.scenario_seed if args.scenario_seed is not None else 'random'}")
+    print(
+        "Ego spawn index: "
+        f"{args.ego_spawn_index if args.ego_spawn_index is not None else 'random clear'}"
+    )
     print(f"Device map: {args.device_map}")
     print(f"CUDA linalg library: {args.cuda_linalg_library}")
     print("Auto respawn: ON after collisions")
@@ -371,6 +481,10 @@ def main():
     worker_thread = None
     exact_observation_count = 0
     active_sync_request = None
+    scenario_actor_census = None
+    empty_road_preflight = None
+    safety_policy = build_safety_policy()
+    safety_adapter = None
 
     def apply_vehicle_control(command):
         """The single low-level gateway for all loop-owned vehicle commands."""
@@ -449,6 +563,7 @@ def main():
                 args.quantization,
                 device_map=args.device_map,
             )
+            seed_runtime_randomness(args.scenario_seed)
             print("Model loaded!")
             print(f"VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f} GB allocated")
         else:
@@ -457,13 +572,58 @@ def main():
             print("OOM-free mode: Alpamayo loads after CARLA is fully spawned.")
 
         carla_if.connect()
-        carla_if.load_map(cfg.CARLA_MAP)
-        carla_if.spawn_ego_vehicle()
+        carla_if.load_map(cfg.CARLA_MAP, force_reload=args.empty_road)
+        if args.scenario_seed is not None:
+            carla_if.set_scenario_seed(args.scenario_seed)
+        carla_if.spawn_ego_vehicle(
+            spawn_index=args.ego_spawn_index,
+            center_on_driving_lane=args.empty_road,
+        )
         carla_if.enable_synchronous_mode()
         fixed_delta_seconds = carla_if.world.get_settings().fixed_delta_seconds
         if fixed_delta_seconds is not None and float(fixed_delta_seconds) > 0.0:
             simulation_tick_seconds = float(fixed_delta_seconds)
-        carla_if.spawn_npcs(num_vehicles=cfg.NPC_VEHICLE_COUNT, num_walkers=cfg.NPC_WALKER_COUNT)
+        npc_vehicle_count = 0 if args.empty_road else cfg.NPC_VEHICLE_COUNT
+        npc_walker_count = 0 if args.empty_road else cfg.NPC_WALKER_COUNT
+        carla_if.spawn_npcs(
+            num_vehicles=npc_vehicle_count,
+            num_walkers=npc_walker_count,
+        )
+        scenario_actor_census = carla_if.get_non_ego_dynamic_actor_census()
+        print(f"Dynamic actor census: {scenario_actor_census}")
+        if args.empty_road and any(scenario_actor_census.values()):
+            raise RuntimeError(
+                f"empty-road preflight found unexpected dynamic actors: {scenario_actor_census}"
+            )
+        try:
+            safety_adapter = CarlaGroundTruthSafetyAdapter(
+                carla_if.world,
+                carla_if.ego_vehicle,
+                safety_policy,
+            )
+        except Exception as exc:
+            safety_adapter = None
+            if args.empty_road:
+                raise RuntimeError(
+                    "empty-road footprint preflight is unavailable"
+                ) from exc
+            print(
+                "Warning: CARLA ground-truth safety adapter unavailable; "
+                f"movement will fail closed ({exc})."
+            )
+        if args.empty_road:
+            empty_road_preflight = safety_adapter.assess_ego_transform(
+                carla_if.ego_vehicle.get_transform()
+            )
+            print(
+                "Empty-road footprint preflight: "
+                f"{empty_road_preflight.to_json_dict()}"
+            )
+            if empty_road_preflight.status is not AssessmentStatus.SAFE:
+                raise RuntimeError(
+                    "empty-road ego footprint is not safely contained: "
+                    f"{empty_road_preflight.to_json_dict()}"
+                )
         carla_if.setup_cameras()
         carla_if.setup_collision_sensor()
         time.sleep(1.0)
@@ -480,38 +640,14 @@ def main():
             if args.oom_free_resident is not None:
                 oom_kwargs["resident_override"] = args.oom_free_resident
             model, processor = load_offloaded_model(**oom_kwargs)
+            # The third-party OOM-free loader currently seeds Torch internally.
+            # Restore the requested run seed before the first sampled proposal.
+            seed_runtime_randomness(args.scenario_seed)
             print("Model loaded!")
             print(f"VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f} GB allocated")
 
         pid_follower = OfficialPIDFollower(carla_if.world, carla_if.ego_vehicle)
-        safety_policy = SafetyPolicy(
-            path_sample_spacing_m=cfg.SAFETY_PATH_SAMPLE_SPACING_M,
-            lateral_clearance_m=cfg.SAFETY_LATERAL_CLEARANCE_M,
-            longitudinal_clearance_m=cfg.SAFETY_LONGITUDINAL_CLEARANCE_M,
-            reaction_time_s=cfg.SAFETY_REACTION_TIME_S,
-            assumed_deceleration_mps2=cfg.SAFETY_ASSUMED_DECELERATION_MPS2,
-            stop_buffer_m=cfg.SAFETY_STOP_BUFFER_M,
-            hard_gap_m=cfg.SAFETY_HARD_GAP_M,
-            ttc_threshold_s=cfg.SAFETY_TTC_THRESHOLD_S,
-            minimum_closing_speed_mps=cfg.SAFETY_MINIMUM_CLOSING_SPEED_MPS,
-            prediction_horizon_s=cfg.SAFETY_PREDICTION_HORIZON_S,
-            prediction_time_step_s=cfg.SAFETY_PREDICTION_TIME_STEP_S,
-            emergency_hold_ticks=cfg.SAFETY_EMERGENCY_HOLD_TICKS,
-            clear_ticks_to_release=cfg.SAFETY_CLEAR_TICKS_TO_RELEASE,
-        )
         safety_shield = StopOnlySafetyShield(safety_policy)
-        try:
-            safety_adapter = CarlaGroundTruthSafetyAdapter(
-                carla_if.world,
-                carla_if.ego_vehicle,
-                safety_policy,
-            )
-        except Exception as exc:
-            safety_adapter = None
-            print(
-                "Warning: CARLA ground-truth safety adapter unavailable; "
-                f"movement will fail closed ({exc})."
-            )
 
         current_plan = None
         current_trajectory = None
@@ -521,9 +657,7 @@ def main():
         current_cot = ""
         current_inference_time = 0.0
         vlm_generate_timing = VlmGenerateTiming()
-        respawn_monitor = RespawnMonitor(
-            cooldown_frames=cfg.RESPAWN_COLLISION_COOLDOWN_FRAMES
-        )
+        respawn_monitor = RespawnMonitor(cooldown_frames=cfg.RESPAWN_COLLISION_COOLDOWN_FRAMES)
         frame_buffer = []
         current_trajectory_ts = None
         current_plan_id = None
@@ -534,6 +668,11 @@ def main():
         current_frame_id_quality = "loop_counter_proxy"
         current_observation_entry = None
         prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 0.0}
+        prev_nominal_control = {
+            "steering": 0.0,
+            "throttle": 0.0,
+            "brake": 0.0,
+        }
 
         pending_inference = False
         pending_request_id = None
@@ -620,9 +759,7 @@ def main():
                 if source_carla_frame_id is None:
                     source_carla_frame_id = current_observation_entry["frame_id"]
                 if source_simulation_time_s is None:
-                    source_simulation_time_s = current_observation_entry[
-                        "simulation_time_s"
-                    ]
+                    source_simulation_time_s = current_observation_entry["simulation_time_s"]
                 if frame_id_quality is None:
                     frame_id_quality = current_observation_entry["frame_id_quality"]
             source_loop_tick_id = (
@@ -664,9 +801,8 @@ def main():
                 source_plan_id=source_plan_id,
                 coc_sha256=coc_sha256,
             )
-            if (
-                active_sync_request is not None
-                and int(active_sync_request["request_id"]) == int(request_id)
+            if active_sync_request is not None and int(active_sync_request["request_id"]) == int(
+                request_id
             ):
                 active_sync_request = None
             return payload
@@ -732,9 +868,7 @@ def main():
                     frame_id_quality=result.get("frame_id_quality", "loop_counter_proxy"),
                     camera_ids=list(result.get("camera_ids", tuple())),
                     prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
-                    respawn_revision=int(
-                        result.get("respawn_revision", respawn_revision)
-                    ),
+                    respawn_revision=int(result.get("respawn_revision", respawn_revision)),
                     selected_candidate_index=None,
                     candidate_count=0,
                     candidate_similarity_scores=[],
@@ -766,8 +900,7 @@ def main():
                 selected_candidate_index=int(selected_idx),
                 candidate_count=int(len(traj_samples)),
                 candidate_similarity_scores=[
-                    None if value is None else float(value)
-                    for value in similarity_scores
+                    None if value is None else float(value) for value in similarity_scores
                 ],
                 candidate_trajectories_model=np.asarray(traj_samples, dtype=np.float64),
                 model_inference_latency_s=float(model_inference_latency_s),
@@ -811,9 +944,7 @@ def main():
                 candidate_similarity_scores=None,
                 candidate_trajectories_model=None,
                 model_inference_latency_s=float(
-                    result.get("model_inference_time")
-                    or result.get("inference_time")
-                    or 0.0
+                    result.get("model_inference_time") or result.get("inference_time") or 0.0
                 ),
                 **audit,
             )
@@ -852,9 +983,7 @@ def main():
                 arrival_carla_frame_id=current_carla_frame_id,
                 arrival_simulation_time_s=current_simulation_time_s,
                 valid=bool(validity.valid and alignment.valid),
-                rejection_reason=(
-                    validity.rejection_reason or alignment.rejection_reason
-                ),
+                rejection_reason=(validity.rejection_reason or alignment.rejection_reason),
                 source_age_s=validity.source_age_s,
                 remaining_horizon_s=validity.remaining_horizon_s,
                 tracking_error_m=alignment.tracking_error_m,
@@ -933,9 +1062,7 @@ def main():
                 event_type,
                 loop_tick_id=int(frame_count),
                 carla_frame_id=(current_carla_frame_id if identity_available else None),
-                simulation_time_s=(
-                    current_simulation_time_s if identity_available else None
-                ),
+                simulation_time_s=(current_simulation_time_s if identity_available else None),
                 simulation_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
                 frame_id_quality=(
                     current_frame_id_quality if identity_available else "unavailable"
@@ -952,9 +1079,7 @@ def main():
                 plan_source_age_proxy_s=(
                     plan_age_s if current_frame_id_quality == "loop_counter_proxy" else None
                 ),
-                remaining_horizon_s=(
-                    remaining_horizon_s if current_plan is not None else None
-                ),
+                remaining_horizon_s=(remaining_horizon_s if current_plan is not None else None),
                 remaining_horizon_proxy_s=(
                     remaining_horizon_s
                     if current_frame_id_quality == "loop_counter_proxy"
@@ -1040,11 +1165,7 @@ def main():
 
             adapter_assessment = None
             try:
-                if (
-                    plan is None
-                    and nominal_command is not None
-                    and not arbitration_errors
-                ):
+                if plan is None and nominal_command is not None and not arbitration_errors:
                     safety_decision = safety_shield.decide_fallback(
                         controller_requested_control=requested_command,
                         nominal_control=nominal_command,
@@ -1124,14 +1245,10 @@ def main():
                     state=state,
                     controller_state=controller_state,
                     requested_control=(
-                        requested_command.to_json_dict()
-                        if requested_command is not None
-                        else None
+                        requested_command.to_json_dict() if requested_command is not None else None
                     ),
                     nominal_control=(
-                        nominal_command.to_json_dict()
-                        if nominal_command is not None
-                        else None
+                        nominal_command.to_json_dict() if nominal_command is not None else None
                     ),
                     applied_control=safety_decision.applied_control.to_json_dict(),
                     fallback_state=fallback_state,
@@ -1148,6 +1265,36 @@ def main():
                         "safety_source": safety_source,
                         "adapter_assessment_available": adapter_assessment is not None,
                         "arbitration_errors": arbitration_errors,
+                        "current_ego_road_containment": (
+                            getattr(
+                                adapter_assessment,
+                                "current_ego_road",
+                                None,
+                            ).to_json_dict()
+                            if adapter_assessment is not None
+                            and getattr(
+                                adapter_assessment,
+                                "current_ego_road",
+                                None,
+                            )
+                            is not None
+                            else None
+                        ),
+                        "proposed_path_road_containment": (
+                            getattr(
+                                adapter_assessment,
+                                "proposed_path_road",
+                                None,
+                            ).to_json_dict()
+                            if adapter_assessment is not None
+                            and getattr(
+                                adapter_assessment,
+                                "proposed_path_road",
+                                None,
+                            )
+                            is not None
+                            else None
+                        ),
                         **safety_decision.to_json_dict(),
                     },
                     applied_control_source=safety_decision.applied_control_source,
@@ -1160,14 +1307,18 @@ def main():
             nonlocal current_plan
             nonlocal current_trajectory, current_pred_xyz, prev_selected_trajectory
             nonlocal current_selected_traj_idx, current_cot, current_inference_time
-            nonlocal current_trajectory_ts, prev_control, pending_inference, pid_follower
+            nonlocal current_trajectory_ts, prev_control, prev_nominal_control
+            nonlocal pending_inference, pid_follower
             nonlocal pending_request_id
             nonlocal respawn_revision, last_vqa_submitted_revision, last_vqa_completed_revision
             nonlocal current_plan_id, current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s, respawn_count
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
-            carla_if.respawn_ego_vehicle()
+            carla_if.respawn_ego_vehicle(
+                spawn_index=args.ego_spawn_index,
+                center_on_driving_lane=args.empty_road,
+            )
             respawn_count += 1
             pid_follower = OfficialPIDFollower(carla_if.world, carla_if.ego_vehicle)
             safety_shield.reset()
@@ -1185,6 +1336,11 @@ def main():
             current_plan_source_loop_tick_id = None
             current_plan_source_elapsed_proxy_s = None
             prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
+            prev_nominal_control = {
+                "steering": 0.0,
+                "throttle": 0.0,
+                "brake": 0.0,
+            }
             pending_inference = False
             pending_request_id = None
             respawn_revision += 1
@@ -1275,9 +1431,7 @@ def main():
             for temporal_index, frame_entry in enumerate(frame_buffer):
                 frame_images = frame_entry["images"]
                 for camera_index in range(cfg.NUM_CAMERAS):
-                    images_array[camera_index, temporal_index] = frame_images[
-                        camera_index
-                    ]
+                    images_array[camera_index, temporal_index] = frame_images[camera_index]
             history_xyz, history_rot = carla_if.get_history_in_local_frame()
             source_entry = frame_buffer[-1]
             return (
@@ -1451,9 +1605,7 @@ def main():
                             superseded = inference_result_q.get_nowait()
                         except queue.Empty:
                             break
-                        superseded_request_ids.extend(
-                            superseded.get("superseded_request_ids", ())
-                        )
+                        superseded_request_ids.extend(superseded.get("superseded_request_ids", ()))
                         if superseded.get("request_id") is not None:
                             superseded_request_ids.append(superseded["request_id"])
                     if superseded_request_ids:
@@ -1498,6 +1650,17 @@ def main():
         emit_runtime_event(
             "episode_start",
             mode=args.mode,
+            scenario="empty_road" if args.empty_road else "normal_traffic",
+            scenario_seed=args.scenario_seed,
+            ego_spawn_index=args.ego_spawn_index,
+            requested_npc_vehicle_count=(0 if args.empty_road else cfg.NPC_VEHICLE_COUNT),
+            requested_npc_walker_count=(0 if args.empty_road else cfg.NPC_WALKER_COUNT),
+            dynamic_actor_census=scenario_actor_census,
+            empty_road_footprint_preflight=(
+                empty_road_preflight.to_json_dict()
+                if empty_road_preflight is not None
+                else None
+            ),
             execution="async" if args.async_mode else "sync",
             frame_id_quality=(
                 "exact_carla_snapshot"
@@ -1683,8 +1846,7 @@ def main():
                 frame_buffer
                 and current_frame_id_quality == "exact_carla_snapshot"
                 and frame_buffer[-1]["frame_id_quality"] == "exact_carla_snapshot"
-                and int(observation_entry["frame_id"])
-                != int(frame_buffer[-1]["frame_id"]) + 1
+                and int(observation_entry["frame_id"]) != int(frame_buffer[-1]["frame_id"]) + 1
             ):
                 emit_runtime_event(
                     "sensor_sequence_reset",
@@ -1749,9 +1911,7 @@ def main():
                             "respawn_revision",
                         )
                     }
-                    last_inference_submit_simulation_time_s = float(
-                        current_simulation_time_s
-                    )
+                    last_inference_submit_simulation_time_s = float(current_simulation_time_s)
                     emit_runtime_event(
                         "inference_submitted",
                         request_id=req["request_id"],
@@ -1774,9 +1934,7 @@ def main():
                     except queue.Empty:
                         break
                 if latest_result is not None:
-                    for superseded_request_id in latest_result.get(
-                        "superseded_request_ids", ()
-                    ):
+                    for superseded_request_id in latest_result.get("superseded_request_ids", ()):
                         _emit_async_terminal(
                             superseded_request_id,
                             "discarded",
@@ -1817,10 +1975,7 @@ def main():
                             )
                             result_status = "discarded"
                             result_rejection_reason = "stale_respawn_revision"
-                        elif (
-                            "error" not in latest_result
-                            and latest_result.get("mode") == "vqa"
-                        ):
+                        elif "error" not in latest_result and latest_result.get("mode") == "vqa":
                             answer = latest_result.get("answer") or extract_answer_text(
                                 latest_result.get("extra")
                             )
@@ -1895,8 +2050,7 @@ def main():
                                 print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
                         else:
                             print(
-                                f"[Frame {frame_count}] Inference error: "
-                                f"{latest_result['error']}"
+                                f"[Frame {frame_count}] Inference error: {latest_result['error']}"
                             )
                             result_status = "error"
                             result_rejection_reason = str(latest_result["error"])
@@ -1909,9 +2063,7 @@ def main():
                             f"result_processing_error:{exc}",
                             result=latest_result,
                         )
-                        print(
-                            f"[Frame {frame_count}] Rejected malformed inference result: {exc}"
-                        )
+                        print(f"[Frame {frame_count}] Rejected malformed inference result: {exc}")
                     else:
                         _emit_async_terminal(
                             latest_result.get("request_id"),
@@ -1933,10 +2085,7 @@ def main():
                         - float(last_inference_submit_simulation_time_s)
                         >= inference_interval_sec
                     )
-                if (
-                    len(frame_buffer) >= cfg.NUM_FRAMES
-                    and should_prepare_sync_input
-                ):
+                if len(frame_buffer) >= cfg.NUM_FRAMES and should_prepare_sync_input:
                     source_entry = frame_buffer[-1]
                     model_input_error = None
                     try:
@@ -1973,9 +2122,7 @@ def main():
                                 source_loop_tick_id=int(frame_count),
                                 source_elapsed_proxy_s=_simulation_elapsed_proxy_s(),
                                 source_carla_frame_id=int(source_entry["frame_id"]),
-                                source_simulation_time_s=float(
-                                    source_entry["simulation_time_s"]
-                                ),
+                                source_simulation_time_s=float(source_entry["simulation_time_s"]),
                                 frame_id_quality=source_entry["frame_id_quality"],
                                 prompt_revision=nav_state.revision,
                                 respawn_revision=respawn_revision,
@@ -1984,9 +2131,7 @@ def main():
                             stage = "model_inference"
                             try:
                                 if model_input_error is not None:
-                                    raise RuntimeError(
-                                        f"model_input_error:{model_input_error}"
-                                    )
+                                    raise RuntimeError(f"model_input_error:{model_input_error}")
                                 extra = _run_vqa_with_linalg_fallback(
                                     model_data,
                                     question=nav_state.vqa_question,
@@ -1997,10 +2142,7 @@ def main():
                                 nav_state.set_vqa_answer(answer)
                                 current_inference_time = model_inference_time
                                 last_vqa_completed_revision = nav_state.revision
-                                print(
-                                    f"[Frame {frame_count}] VQA: "
-                                    f"{model_inference_time:.2f}s"
-                                )
+                                print(f"[Frame {frame_count}] VQA: {model_inference_time:.2f}s")
                                 print(f"    Q: {nav_state.vqa_question}")
                                 print(f"    A: {format_vqa_answer_preview(answer)}")
                             except Exception as exc:
@@ -2042,9 +2184,7 @@ def main():
                         )
                         request_sequence += 1
                         request_id = request_sequence
-                        last_inference_submit_simulation_time_s = float(
-                            current_simulation_time_s
-                        )
+                        last_inference_submit_simulation_time_s = float(current_simulation_time_s)
                         submission_monotonic_s = time.monotonic()
                         active_sync_request = {
                             "request_id": request_id,
@@ -2052,9 +2192,7 @@ def main():
                             "submission_monotonic_s": submission_monotonic_s,
                             "source_loop_tick_id": int(frame_count),
                             "source_carla_frame_id": int(source_entry["frame_id"]),
-                            "source_simulation_time_s": float(
-                                source_entry["simulation_time_s"]
-                            ),
+                            "source_simulation_time_s": float(source_entry["simulation_time_s"]),
                             "frame_id_quality": source_entry["frame_id_quality"],
                         }
                         emit_runtime_event(
@@ -2073,9 +2211,7 @@ def main():
                         stage = "model_inference"
                         try:
                             if model_input_error is not None:
-                                raise RuntimeError(
-                                    f"model_input_error:{model_input_error}"
-                                )
+                                raise RuntimeError(f"model_input_error:{model_input_error}")
                             pred_xyz, extra = _run_inference_with_nav_fallback(
                                 model_data,
                                 navigation_text=navigation_text,
@@ -2121,11 +2257,7 @@ def main():
                             _emit_sync_terminal(
                                 request_id=request_id,
                                 mode=args.mode,
-                                status=(
-                                    "rejected_plan"
-                                    if rejected_output
-                                    else "error"
-                                ),
+                                status=("rejected_plan" if rejected_output else "error"),
                                 rejection_reason=rejection_reason,
                                 submission_monotonic_s=submission_monotonic_s,
                                 model_inference_latency_s=(
@@ -2152,14 +2284,9 @@ def main():
                             current_trajectory_ts = time.monotonic()
                             current_plan_id = candidate_plan.plan_id
                             current_plan_source_loop_tick_id = int(frame_count)
-                            current_plan_source_elapsed_proxy_s = (
-                                _simulation_elapsed_proxy_s()
-                            )
+                            current_plan_source_elapsed_proxy_s = _simulation_elapsed_proxy_s()
 
-                            print(
-                                f"[Frame {frame_count}] Inference: "
-                                f"{model_inference_time:.2f}s"
-                            )
+                            print(f"[Frame {frame_count}] Inference: {model_inference_time:.2f}s")
                             print(f"    CoT: {current_cot[:60]}...")
                             if args.mode == "navigation":
                                 print(
@@ -2197,8 +2324,7 @@ def main():
                 )
                 if not execution_validity.valid or not alignment_validity.valid:
                     expired_plan_reason = (
-                        execution_validity.rejection_reason
-                        or alignment_validity.rejection_reason
+                        execution_validity.rejection_reason or alignment_validity.rejection_reason
                     )
                     emit_runtime_event(
                         "plan_validation",
@@ -2242,43 +2368,15 @@ def main():
                         "brake": float(brake_raw),
                     }
 
-                    alpha = cfg.CONTROL_SMOOTH_ALPHA
-                    emergency_stop_requested = bool(
-                        ctrl_debug.get("bypass_smoothing", False)
+                    emergency_stop_requested = bool(ctrl_debug.get("bypass_smoothing", False))
+                    nominal_control, postprocessing = smooth_controller_control(
+                        steering_raw=steering_raw,
+                        throttle_raw=throttle_raw,
+                        brake_raw=brake_raw,
+                        previous_nominal=prev_nominal_control,
+                        alpha=cfg.CONTROL_SMOOTH_ALPHA,
+                        bypass_smoothing=emergency_stop_requested,
                     )
-                    if emergency_stop_requested:
-                        steering = float(steering_raw)
-                        throttle = 0.0
-                        brake = 1.0
-                        postprocessing = ("emergency_brake_bypass_ema",)
-                    else:
-                        steering = (
-                            (1.0 - alpha) * prev_control["steer"]
-                            + alpha * steering_raw
-                        )
-                        throttle = (
-                            (1.0 - alpha) * prev_control["throttle"]
-                            + alpha * throttle_raw
-                        )
-                        brake = (
-                            (1.0 - alpha) * prev_control["brake"]
-                            + alpha * brake_raw
-                        )
-                        postprocessing = (
-                            "ema_smoothing",
-                            "throttle_brake_arbitration",
-                        )
-
-                    if throttle >= brake:
-                        brake = 0.0
-                    else:
-                        throttle = 0.0
-
-                    nominal_control = {
-                        "steering": float(np.clip(steering, -1.0, 1.0)),
-                        "throttle": float(np.clip(throttle, 0.0, 1.0)),
-                        "brake": float(np.clip(brake, 0.0, 1.0)),
-                    }
                 except Exception as exc:
                     requested_control = None
                     nominal_control = None
@@ -2298,6 +2396,8 @@ def main():
                     postprocessing=postprocessing,
                     controller_debug=ctrl_debug,
                 )
+                if nominal_control is not None:
+                    prev_nominal_control = dict(nominal_control)
                 steering, throttle, brake = safety_decision.applied_control.as_tuple()
 
                 if current_pred_xyz is not None:
@@ -2311,12 +2411,11 @@ def main():
                     camera_pose_world = None
                     camera_intrinsic = None
                     if observation is not None:
-                        camera_pose_world = (
-                            np.asarray(observation.ego_pose_world, dtype=np.float64)
-                            @ np.asarray(
-                                observation.camera_extrinsics[1],
-                                dtype=np.float64,
-                            )
+                        camera_pose_world = np.asarray(
+                            observation.ego_pose_world, dtype=np.float64
+                        ) @ np.asarray(
+                            observation.camera_extrinsics[1],
+                            dtype=np.float64,
                         )
                         camera_intrinsic = observation.camera_intrinsics[1]
                     first_future_index = int(
@@ -2338,9 +2437,7 @@ def main():
                         navigation_text=nav_state.navigation_text,
                         navigation_weight=nav_state.navigation_weight,
                         paused=nav_state.paused,
-                        world_trajectory=current_plan.world_points[
-                            first_future_index:
-                        ],
+                        world_trajectory=current_plan.world_points[first_future_index:],
                         camera_pose_world=camera_pose_world,
                         camera_intrinsic=camera_intrinsic,
                         source_frame_id=current_plan.source_frame_id,
@@ -2355,12 +2452,8 @@ def main():
                             else None
                         ),
                         applied_control=safety_decision.applied_control.to_json_dict(),
-                        applied_control_source=(
-                            safety_decision.applied_control_source
-                        ),
-                        safety_override_applied=(
-                            safety_decision.safety_override_applied
-                        ),
+                        applied_control_source=(safety_decision.applied_control_source),
+                        safety_override_applied=(safety_decision.safety_override_applied),
                         safety_override_reason=safety_decision.primary_reason,
                     )
                     latest_ui_frame = vis_frame
@@ -2378,34 +2471,24 @@ def main():
                         "controller_state",
                         "TRACKING",
                     ),
-                    "applied_control_source": (
-                        safety_decision.applied_control_source
-                    ),
-                    "safety_override_applied": (
-                        safety_decision.safety_override_applied
-                    ),
+                    "applied_control_source": (safety_decision.applied_control_source),
+                    "safety_override_applied": (safety_decision.safety_override_applied),
                     "safety_override_reason": safety_decision.primary_reason,
                 }
                 if pygame_ui is not None:
                     draw_pygame_ui(latest_ui_frame, latest_telemetry)
 
                 print(
-                    f"[Frame {frame_count}] Speed: {state['speed']*3.6:.1f} km/h, "
+                    f"[Frame {frame_count}] Speed: {state['speed'] * 3.6:.1f} km/h, "
                     f"Steer: {steering:.4f}, Throttle: {throttle:.3f}, Brake: {brake:.3f}"
                 )
                 if current_plan is not None:
-                    print(
-                        "    Trajectory source age (CARLA simulation time): "
-                        f"{plan_age_s:.2f}s"
-                    )
+                    print(f"    Trajectory source age (CARLA simulation time): {plan_age_s:.2f}s")
             else:
-                waiting_reason = (
-                    expired_plan_reason
-                    or (
-                        "vqa_mode_has_no_trajectory_control"
-                        if args.mode == "vqa"
-                        else "waiting_for_valid_plan"
-                    )
+                waiting_reason = expired_plan_reason or (
+                    "vqa_mode_has_no_trajectory_control"
+                    if args.mode == "vqa"
+                    else "waiting_for_valid_plan"
                 )
                 safety_decision = _apply_arbitrated_control(
                     state=state,
@@ -2498,9 +2581,7 @@ def main():
                     frame_id_quality=request["frame_id_quality"],
                 )
             except Exception as terminal_exc:
-                sync_terminal_error = (
-                    f"{type(terminal_exc).__name__}:{terminal_exc}"
-                )
+                sync_terminal_error = f"{type(terminal_exc).__name__}:{terminal_exc}"
         emit_runtime_event(
             "runtime_error",
             status="error",
@@ -2555,9 +2636,7 @@ def main():
         runtime_metrics.record_collision_count(carla_if.get_episode_collision_count())
         exact_timing_available = exact_observation_count > 0
         get_camera_sync_stats = getattr(carla_if, "get_camera_sync_stats", None)
-        camera_sync_stats = (
-            get_camera_sync_stats() if callable(get_camera_sync_stats) else None
-        )
+        camera_sync_stats = get_camera_sync_stats() if callable(get_camera_sync_stats) else None
         summary = runtime_metrics.final_summary(
             run_id=run_id,
             stop_reason=stop_reason,
@@ -2578,9 +2657,7 @@ def main():
             async_shutdown_error=async_shutdown_error,
             cleanup_error=cleanup_error,
         )
-        summary["exact_plan_age_available"] = bool(
-            summary["source_age_s"]["count"] > 0
-        )
+        summary["exact_plan_age_available"] = bool(summary["source_age_s"]["count"] > 0)
         if telemetry_writer is not None and not telemetry_write_failed:
             try:
                 telemetry_writer.append(summary)

@@ -49,7 +49,10 @@ deferred until the basic-driving gate passes.
   persistent proposal/controller/override labels and requested versus applied
   control, but the four thumbnails, dedicated CoC panel, BEV, and full telemetry
   panel remain pending.
-- PR 7, deterministic CARLA validation harness and the release-gate runs: pending.
+- PR 7, deterministic CARLA validation harness and the release-gate runs: in
+  progress. The empty-road diagnostic and CARLA-only spawn/drivetrain smoke
+  matrix are implemented; fixed-route scoring and release-gate repetition
+  remain pending.
 
 Simulator-free tests cover the implemented contracts. No release claim should be
 made until the fixed-route CARLA criteria below have also passed.
@@ -154,6 +157,49 @@ audit. That gate should distinguish valid adjacent/rear/crossing hazards from
 shield geometry errors before any safety threshold is relaxed. Only after that
 gate should inference cadence, controller handoff, and traffic-heavy scenarios
 be tuned for route progress.
+
+### Deterministic empty-road evidence
+
+Three follow-up diagnostics were recorded on 2026-07-23:
+
+- Empty-road run `22848896` forced seed `0`, Town03 spawn index `0`, and zero
+  NPCs. All 200 synchronized ticks were collision-free, but the authored spawn
+  was approximately `0.914 m` off the OpenDRIVE lane center. The Tesla footprint
+  therefore had a negative buffered road margin and every evaluated command was
+  stopped by `road_containment_failed`.
+- Run `22848926` reprojected that spawn onto the exact driving-lane center and
+  added an actual-ego-footprint preflight. The preflight and all 197 runtime
+  ego-footprint assessments were safe with a `+0.418 m` minimum margin; actor
+  census and obstacle assessment remained empty/safe. The run completed 200
+  exact ticks without collision or respawn. One later Alpamayo proposal drifted
+  outside the lane and correctly caused 12 stop-only safety-override ticks.
+- The centered run still had zero planar progress. The initial plan requested
+  throttle for only six consecutive ticks; EMA produced applied throttle
+  `0.150, 0.263, 0.347, 0.410, 0.458, 0.493`, after which a new plan with a
+  nearly stationary prefix replaced it. Only 7 of 197 plan-bearing ticks
+  requested positive throttle, 70 controller ticks were explicitly `STOPPED`,
+  and the 20 proposals alternated between 12 moving and 8 stop trajectories.
+  Alpamayo also hallucinated a rear-left vehicle once despite the zero-actor
+  census.
+- CARLA-only smoke job `22849227` removed the model, cameras, controller, and
+  shield. Both the authored and centered automatic-transmission cases moved
+  about `11.98 m` during 30 ticks at throttle `0.6`; forced-first-gear cases
+  moved about `12.74 m`. In automatic mode CARLA stayed in gear `0` through
+  drive tick 6 and selected gear `1` on tick 7. This rules out lane centering
+  and disabled vehicle physics as the stopped-run cause.
+
+The current blocker is therefore a receding-horizon launch deadlock, not traffic
+or CARLA physics. One-second proposal replacement repeatedly discards an active
+launch or resets execution to the stationary prefix of a fresh trajectory before
+the automatic gearbox engages. The next control slice must:
+
+1. log CARLA's echoed control and gear state in the main runtime telemetry;
+2. preserve automatic transmission and validate a launch-aware actuator policy;
+3. define a safety-gated action-chunk/plan-handoff rule that cannot indefinitely
+   postpone motion;
+4. always give explicit/terminal stop plans and safety overrides immediate
+   braking authority; and
+5. rerun the same seed/spawn before attempting the ten-episode release gate.
 
 ### Sequencing correction
 
@@ -660,7 +706,15 @@ Telemetry panel:
   in a replay test.
 - Dashboard composition and video recording pass headless simulator-free tests.
 
-### PR 7: Deterministic CARLA validation harness — pending
+### PR 7: Deterministic CARLA validation harness — in progress
+
+The current implementation supplies `--empty-road`, `--scenario-seed`, and
+`--ego-spawn-index`, forces a fresh map for the diagnostic, suppresses all NPC
+spawn calls, checks a dynamic-actor census, centers the ego on a driving lane,
+and fails before model loading if the real ego footprint is not safely
+contained. `scripts/carla_spawn_control_smoke.py` plus its Slurm wrapper isolate
+spawn and drivetrain behavior. This is diagnostic infrastructure, not yet the
+fixed-route evaluator and scoring harness described below.
 
 #### Files
 

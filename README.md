@@ -89,6 +89,33 @@ python carlamayo_closed_loop.py \
   --max-episode-seconds 60
 ```
 
+To isolate Alpamayo/controller behavior from surrounding traffic, use the
+deterministic empty-road diagnostic:
+
+```bash
+python carlamayo_closed_loop.py \
+  --empty-road \
+  --telemetry-jsonl runs/empty-road/runtime.jsonl \
+  --max-episode-seconds 20
+```
+
+This forces a fresh map, scenario/model seed `0`, Town03 ego spawn index `0`
+reprojected onto the exact driving-lane center, and zero NPC vehicles or
+pedestrians. The run aborts if a preflight census finds any non-ego dynamic
+actor or if the full ego footprint does not fit inside the lane. Override the
+reproducibility defaults with `--scenario-seed` or `--ego-spawn-index`.
+
+If an empty-road run remains stationary, isolate CARLA spawn and drivetrain
+behavior from Alpamayo with the four-case smoke matrix:
+
+```bash
+sbatch scripts/run_carla_spawn_smoke_slurm.sh
+```
+
+It compares the authored and lane-centered spawn with automatic and forced
+first gear, then writes per-tick pose, speed, echoed control, and gear state to
+`/home/aqiu/carlamayo-runs/<job-id>/spawn-control-smoke/results.jsonl`.
+
 #### Closed-Loop Artifacts
 
 | Artifact | Default location |

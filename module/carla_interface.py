@@ -60,17 +60,12 @@ def _validated_camera_specs():
         raise ValueError("CAMERA_SPECS Alpamayo IDs must be unique")
     if camera_ids != EXPECTED_ALPAMAYO_CAMERA_IDS:
         raise ValueError(
-            "CAMERA_SPECS must use Alpamayo camera IDs [0, 1, 2, 6] "
-            "in left/wide/right/tele order"
+            "CAMERA_SPECS must use Alpamayo camera IDs [0, 1, 2, 6] in left/wide/right/tele order"
         )
     if names != EXPECTED_ALPAMAYO_CAMERA_NAMES:
-        raise ValueError(
-            "CAMERA_SPECS must use left/wide/right/tele camera names in model order"
-        )
+        raise ValueError("CAMERA_SPECS must use left/wide/right/tele camera names in model order")
     if camera_fovs != EXPECTED_ALPAMAYO_CAMERA_FOVS:
-        raise ValueError(
-            "CAMERA_SPECS must use nominal Alpamayo FOVs [120, 120, 120, 30]"
-        )
+        raise ValueError("CAMERA_SPECS must use nominal Alpamayo FOVs [120, 120, 120, 30]")
     return specs
 
 
@@ -133,9 +128,9 @@ class CARLAInterface:
         self.world = self.client.get_world()
         print("Connected to CARLA")
 
-    def load_map(self, map_name):
+    def load_map(self, map_name, *, force_reload=False):
         current_map = self.world.get_map().name
-        if map_name not in current_map:
+        if force_reload or map_name not in current_map:
             print(f"Loading map: {map_name}...")
             self.world = self.client.load_world(map_name)
             print("Map load requested. Waiting for world tick...")
@@ -144,6 +139,23 @@ class CARLAInterface:
             print(f"Map loaded: {map_name}")
         else:
             print(f"Already on map: {current_map}")
+
+    def set_scenario_seed(self, seed):
+        """Seed CARLA traffic, pedestrians, and local spawn selection."""
+
+        seed = int(seed)
+        if seed < 0 or seed > cfg.MAX_SCENARIO_SEED:
+            raise ValueError(f"scenario seed must be within [0, {cfg.MAX_SCENARIO_SEED}]")
+        random.seed(seed)
+        np.random.seed(seed)
+        traffic_manager = self.client.get_trafficmanager(self.tm_port)
+        set_tm_seed = getattr(traffic_manager, "set_random_device_seed", None)
+        if callable(set_tm_seed):
+            set_tm_seed(seed)
+        set_pedestrian_seed = getattr(self.world, "set_pedestrians_seed", None)
+        if callable(set_pedestrian_seed):
+            set_pedestrian_seed(seed)
+        print(f"CARLA scenario seed: {seed}")
 
     def enable_synchronous_mode(self):
         settings = self.world.get_settings()
@@ -155,6 +167,14 @@ class CARLAInterface:
         print("Synchronous mode enabled.")
 
     def spawn_npcs(self, num_vehicles=cfg.NPC_VEHICLE_COUNT, num_walkers=cfg.NPC_WALKER_COUNT):
+        num_vehicles = int(num_vehicles)
+        num_walkers = int(num_walkers)
+        if num_vehicles < 0 or num_walkers < 0:
+            raise ValueError("NPC counts must be nonnegative")
+        if num_vehicles == 0 and num_walkers == 0:
+            print("Empty-road mode: NPC vehicle and pedestrian spawning skipped.")
+            return
+
         bp_lib = self.world.get_blueprint_library()
         traffic_manager = self.client.get_trafficmanager(self.tm_port)
         traffic_manager.set_global_distance_to_leading_vehicle(2.0)
@@ -223,7 +243,9 @@ class CARLAInterface:
             for wid in self.npc_walker_ids
         ]
         controller_results = self.client.apply_batch_sync(controller_batch, True)
-        self.npc_walker_controller_ids = [res.actor_id for res in controller_results if not res.error]
+        self.npc_walker_controller_ids = [
+            res.actor_id for res in controller_results if not res.error
+        ]
         controller_actors = self.world.get_actors(self.npc_walker_controller_ids)
 
         for i, controller in enumerate(controller_actors):
@@ -231,9 +253,25 @@ class CARLAInterface:
             dest = self.world.get_random_location_from_navigation()
             if dest is not None:
                 controller.go_to_location(dest)
-            controller.set_max_speed(float(spawned_walker_speeds[i] if i < len(spawned_walker_speeds) else 1.4))
+            controller.set_max_speed(
+                float(spawned_walker_speeds[i] if i < len(spawned_walker_speeds) else 1.4)
+            )
 
         print(f"Spawned NPC walkers: {len(self.npc_walker_ids)}/{num_walkers}")
+
+    def get_non_ego_dynamic_actor_census(self):
+        """Count non-ego dynamic road users currently present in the world."""
+
+        actors = self.world.get_actors()
+        ego_id = int(self.ego_vehicle.id) if self.ego_vehicle is not None else None
+        vehicle_count = sum(int(actor.id) != ego_id for actor in actors.filter("vehicle.*"))
+        walker_count = len(actors.filter("walker.pedestrian.*"))
+        walker_controller_count = len(actors.filter("controller.ai.walker"))
+        return {
+            "non_ego_vehicle_count": int(vehicle_count),
+            "walker_count": int(walker_count),
+            "walker_controller_count": int(walker_controller_count),
+        }
 
     def _is_spawn_point_clear(self, spawn_point, min_distance=8.0):
         if self.world is None:
@@ -246,9 +284,42 @@ class CARLAInterface:
                 return False
         return True
 
-    def _select_ego_spawn_point(self):
+    def _center_spawn_point_on_driving_lane(self, spawn_point):
+        """Return the exact driving-lane center near a CARLA spawn point."""
+
+        waypoint = self.world.get_map().get_waypoint(
+            spawn_point.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if waypoint is None:
+            raise RuntimeError("configured spawn point has no nearby driving lane")
+        centered = waypoint.transform
+        # Preserve CARLA's authored spawn height while replacing its lateral
+        # offset and heading with the OpenDRIVE lane center. Some Town03 spawn
+        # points are close enough to a lane edge that a Tesla footprint does
+        # not fit inside the lane even though the actor origin is on the road.
+        centered.location.z = float(spawn_point.location.z)
+        return centered
+
+    def _select_ego_spawn_point(self, spawn_index=None, *, center_on_driving_lane=False):
         print("Selecting spawn point...")
-        spawn_points = self.world.get_map().get_spawn_points()
+        spawn_points = list(self.world.get_map().get_spawn_points())
+        if not spawn_points:
+            raise RuntimeError("CARLA map has no ego spawn points")
+        if spawn_index is not None:
+            spawn_index = int(spawn_index)
+            if spawn_index < 0 or spawn_index >= len(spawn_points):
+                raise ValueError(
+                    f"ego spawn index {spawn_index} is outside [0, {len(spawn_points) - 1}]"
+                )
+            spawn_point = spawn_points[spawn_index]
+            if center_on_driving_lane:
+                spawn_point = self._center_spawn_point_on_driving_lane(spawn_point)
+            if not self._is_spawn_point_clear(spawn_point):
+                raise RuntimeError(f"configured ego spawn point {spawn_index} is not clear")
+            print(f"Selected configured spawn point {spawn_index}.")
+            return spawn_point
         shuffled_points = list(spawn_points)
         random.shuffle(shuffled_points)
         for spawn_point in shuffled_points:
@@ -259,23 +330,32 @@ class CARLAInterface:
         print("No clear spawn point found; selected random spawn point.")
         return spawn_point
 
-    def spawn_ego_vehicle(self):
+    def spawn_ego_vehicle(self, *, spawn_index=None, center_on_driving_lane=False):
         bp_lib = self.world.get_blueprint_library()
         vehicle_bp = bp_lib.find("vehicle.tesla.model3")
         vehicle_bp.set_attribute("role_name", "hero")
-        spawn_point = self._select_ego_spawn_point()
+        spawn_point = self._select_ego_spawn_point(
+            spawn_index,
+            center_on_driving_lane=center_on_driving_lane,
+        )
         print("Spawning ego vehicle...")
         self.ego_vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
         print(f"Spawned ego vehicle at {spawn_point.location}")
         return self.ego_vehicle
 
-    def respawn_ego_vehicle(self):
+    def respawn_ego_vehicle(self, *, spawn_index=None, center_on_driving_lane=False):
         """Teleport the ego vehicle to a clear spawn point and reset ego-local state."""
 
         if self.ego_vehicle is None:
-            return self.spawn_ego_vehicle()
+            return self.spawn_ego_vehicle(
+                spawn_index=spawn_index,
+                center_on_driving_lane=center_on_driving_lane,
+            )
 
-        spawn_point = self._select_ego_spawn_point()
+        spawn_point = self._select_ego_spawn_point(
+            spawn_index,
+            center_on_driving_lane=center_on_driving_lane,
+        )
         print(f"Respawning ego vehicle at {spawn_point.location}")
         self.apply_control(0.0, 0.0, 1.0)
         self.ego_vehicle.set_target_velocity(carla.Vector3D())
@@ -301,7 +381,9 @@ class CARLAInterface:
             cam_bp.set_attribute("image_size_x", str(cfg.IMG_WIDTH))
             cam_bp.set_attribute("image_size_y", str(cfg.IMG_HEIGHT))
             cam_bp.set_attribute("fov", str(cfg_cam["fov"]))
-            cam_bp.set_attribute("enable_postprocess_effects", str(cfg.CAMERA_ENABLE_POSTPROCESS_EFFECTS))
+            cam_bp.set_attribute(
+                "enable_postprocess_effects", str(cfg.CAMERA_ENABLE_POSTPROCESS_EFFECTS)
+            )
             cam_bp.set_attribute("sensor_tick", "0.0")
 
             transform = carla.Transform(
@@ -405,9 +487,7 @@ class CARLAInterface:
         missing = [name for name in self.camera_order if name not in packets]
         if missing:
             self._missing_camera_bundles += 1
-            raise TimeoutError(
-                f"Missing camera frames for CARLA frame {target_frame}: {missing}"
-            )
+            raise TimeoutError(f"Missing camera frames for CARLA frame {target_frame}: {missing}")
 
         for name, packet in packets.items():
             packet_frame = int(getattr(packet, "frame", target_frame))
@@ -553,9 +633,7 @@ class CARLAInterface:
         current_rotation_inv = current_pose[:3, :3].T
         history_rot = np.stack(
             [
-                carla_relative_rotation_to_model(
-                    current_rotation_inv @ pose[:3, :3]
-                )
+                carla_relative_rotation_to_model(current_rotation_inv @ pose[:3, :3])
                 for pose in poses
             ],
             axis=0,
@@ -647,12 +725,10 @@ class CARLAInterface:
             camera_extrinsics=extrinsics,
             ego_history=history_poses,
             ego_history_frame_ids=tuple(
-                int(history_state["frame_id"])
-                for history_state in identified_history
+                int(history_state["frame_id"]) for history_state in identified_history
             ),
             ego_history_simulation_times_s=tuple(
-                float(history_state["simulation_time_s"])
-                for history_state in identified_history
+                float(history_state["simulation_time_s"]) for history_state in identified_history
             ),
         )
 
