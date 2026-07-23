@@ -79,6 +79,34 @@ def test_calibrated_world_trajectory_draws_on_the_current_image():
     assert rendered[..., 1].max() == 255
 
 
+def test_calibrated_world_trajectory_distinguishes_safe_future_and_first_bad():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [
+            [2.0, 0.0, 0.0],
+            [4.0, 1.0, 0.0],
+            [6.0, 3.0, 0.0],
+            [8.0, 6.0, 0.0],
+        ]
+    )
+
+    rendered = project_world_trajectory_to_image(
+        image,
+        points,
+        np.eye(4),
+        intrinsic,
+        last_safe_waypoint_index=1,
+    )
+
+    assert np.any(np.all(rendered == (0, 255, 80), axis=2))
+    assert np.any(np.all(rendered == (255, 210, 0), axis=2))
+    assert np.any(np.all(rendered == (255, 0, 0), axis=2))
+
+
 def test_create_visualization_frame_preserves_rgb_shape_and_adds_overlay():
     image = np.zeros((180, 240, 3), dtype=np.uint8)
     trajectory = np.array([[[2.0, 0.0, 0.0], [5.0, 0.2, 0.0], [8.0, 0.4, 0.0]]])

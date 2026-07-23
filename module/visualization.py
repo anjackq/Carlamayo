@@ -60,8 +60,10 @@ def project_world_trajectory_to_image(
     world_points,
     camera_pose_world,
     camera_intrinsic,
+    *,
+    last_safe_waypoint_index=None,
 ):
-    """Draw the fixed-world controller path on its current calibrated image."""
+    """Draw an authorized prefix and advisory future path on the current image."""
 
     result = np.asarray(cam_img).copy()
     pixels, valid = project_world_points_to_camera(
@@ -81,16 +83,38 @@ def project_world_trajectory_to_image(
         if inside[index] and inside[index + 1]:
             start = tuple(np.rint(pixels[index]).astype(np.int32))
             end = tuple(np.rint(pixels[index + 1]).astype(np.int32))
-            cv2.line(result, start, end, (0, 255, 80), 8, cv2.LINE_AA)
-    for pixel in pixels[inside]:
+            segment_is_safe = (
+                last_safe_waypoint_index is None
+                or index + 1 <= int(last_safe_waypoint_index)
+            )
+            color = (0, 255, 80) if segment_is_safe else (255, 210, 0)
+            cv2.line(result, start, end, color, 8, cv2.LINE_AA)
+    for index, pixel in enumerate(pixels):
+        if not inside[index]:
+            continue
+        point_is_safe = (
+            last_safe_waypoint_index is None
+            or index <= int(last_safe_waypoint_index)
+        )
         cv2.circle(
             result,
             tuple(np.rint(pixel).astype(np.int32)),
             5,
-            (80, 255, 120),
+            (80, 255, 120) if point_is_safe else (255, 225, 40),
             -1,
             cv2.LINE_AA,
         )
+    if last_safe_waypoint_index is not None:
+        first_bad_index = int(last_safe_waypoint_index) + 1
+        if 0 <= first_bad_index < len(pixels) and inside[first_bad_index]:
+            cv2.circle(
+                result,
+                tuple(np.rint(pixels[first_bad_index]).astype(np.int32)),
+                10,
+                (255, 0, 0),
+                -1,
+                cv2.LINE_AA,
+            )
     return result
 
 
@@ -207,6 +231,11 @@ def create_visualization_frame(
     applied_control_source="FALLBACK",
     safety_override_applied=False,
     safety_override_reason=None,
+    plan_admission_status=None,
+    near_term_road_status=None,
+    full_path_road_status=None,
+    road_speed_cap_mps=None,
+    last_safe_waypoint_index=None,
 ):
     """Create a single visualization frame with all overlays."""
     if (
@@ -219,6 +248,7 @@ def create_visualization_frame(
             world_trajectory,
             camera_pose_world,
             camera_intrinsic,
+            last_safe_waypoint_index=last_safe_waypoint_index,
         )
     else:
         vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
@@ -263,7 +293,10 @@ def create_visualization_frame(
     applied = applied_control or {}
     layer_lines = (
         (
-            f"ALPAMAYO PROPOSAL | source frame {source_text} | age {age_text}",
+            f"ALPAMAYO PROPOSAL | source frame {source_text} | age {age_text} | "
+            f"admission={plan_admission_status or 'unknown'} | "
+            f"road={near_term_road_status or 'unknown'}/"
+            f"{full_path_road_status or 'unknown'}",
             (255, 255, 0),
         ),
         (
@@ -271,7 +304,9 @@ def create_visualization_frame(
             f"{controller_state} | request "
             f"S/T/B={requested.get('steering', 0.0):.2f}/"
             f"{requested.get('throttle', 0.0):.2f}/"
-            f"{requested.get('brake', 0.0):.2f}",
+            f"{requested.get('brake', 0.0):.2f} | "
+            f"road cap="
+            f"{'none' if road_speed_cap_mps is None else f'{road_speed_cap_mps:.2f}m/s'}",
             (80, 255, 120),
         ),
         (

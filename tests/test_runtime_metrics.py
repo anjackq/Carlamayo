@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from module.runtime_metrics import JsonlWriter, RuntimeMetrics, to_json_safe
+from module.runtime_metrics import (
+    JsonlWriter,
+    RUNTIME_SCHEMA_VERSION,
+    SUPPORTED_RUNTIME_SCHEMA_VERSIONS,
+    RuntimeMetrics,
+    to_json_safe,
+)
 
 
 class ControllerState(Enum):
@@ -180,6 +186,21 @@ def test_runtime_metrics_can_exclude_intermediate_age_and_rejection_events():
     assert summary["source_age_s"]["p50"] == pytest.approx(1.25)
     assert summary["source_age_proxy_s"]["count"] == 0
     assert summary["rejections"] == {"total": 1, "reasons": {"expired": 1}}
+
+
+def test_runtime_metrics_accepts_v1_and_v2_events_and_emits_v2_summary():
+    metrics = RuntimeMetrics()
+
+    for schema_version in SUPPORTED_RUNTIME_SCHEMA_VERSIONS:
+        metrics.record_event(
+            "tick",
+            {"schema_version": schema_version, "controller_state": "TRACKING"},
+        )
+
+    summary = metrics.final_summary()
+
+    assert summary["schema_version"] == RUNTIME_SCHEMA_VERSION
+    assert summary["event_counts"] == {"tick": 2}
 
 
 def test_collision_total_survives_per_ego_counter_reset():

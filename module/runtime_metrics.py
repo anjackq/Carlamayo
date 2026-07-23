@@ -23,6 +23,10 @@ from pathlib import Path
 from typing import Any, Callable, TextIO
 
 
+RUNTIME_SCHEMA_VERSION = 2
+SUPPORTED_RUNTIME_SCHEMA_VERSIONS = (1, RUNTIME_SCHEMA_VERSION)
+
+
 def to_json_safe(value: Any) -> Any:
     """Recursively convert common runtime values to strict JSON-safe values.
 
@@ -521,7 +525,7 @@ class RuntimeMetrics:
                     0.0, self._last_simulation_time_s - self._first_simulation_time_s
                 )
             summary = {
-                "schema_version": 1,
+                "schema_version": RUNTIME_SCHEMA_VERSION,
                 "event_type": "episode_summary",
                 "wall_duration_s": max(0.0, float(self._clock()) - self._started_at),
                 "simulation_duration_s": simulation_duration,

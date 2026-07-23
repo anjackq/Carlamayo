@@ -134,10 +134,16 @@ class ClosedLoopPygameUI:
         frame = telemetry.get("frame", 0)
         inference_time = telemetry.get("inference_time", 0.0)
         steer = telemetry.get("steering", 0.0)
+        admission = telemetry.get("plan_admission_status") or "WAITING"
+        near_road = telemetry.get("near_term_road_status") or "unknown"
+        full_road = telemetry.get("full_path_road_status") or "unknown"
+        road_cap = telemetry.get("road_speed_cap_mps")
+        road_cap_text = "none" if road_cap is None else f"{float(road_cap):.1f}m/s"
 
         status_text = (
             f"{status} | frame {frame} | {speed:.1f} km/h | "
-            f"steer {steer:.2f} | inference {inference_time:.2f}s"
+            f"steer {steer:.2f} | inference {inference_time:.2f}s | "
+            f"{admission} | road {near_road}/{full_road} | cap {road_cap_text}"
         )
         self._draw_text(status_text, 18, y0 + 14, self.font, status_color)
         if nav_state.mode == "navigation":
