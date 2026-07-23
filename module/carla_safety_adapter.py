@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -49,6 +49,7 @@ class PlanAdmissionStatus(str, Enum):
 
     ACCEPT_FULLY_SAFE = "ACCEPT_FULLY_SAFE"
     ACCEPT_SAFE_PREFIX = "ACCEPT_SAFE_PREFIX"
+    ACCEPT_RECOVERY_PREFIX = "ACCEPT_RECOVERY_PREFIX"
     REJECT_RETAIN_ACTIVE = "REJECT_RETAIN_ACTIVE"
     REJECT_FALLBACK_STOP = "REJECT_FALLBACK_STOP"
 
@@ -65,17 +66,39 @@ class RoadExecutionEnvelope:
     distance_to_first_bad_m: float | None
     target_speed_cap_mps: float | None
     emergency_required: bool
+    current_ego_clearance_road: RoadContainmentAssessment | None = None
+    near_term_path_surface: RoadContainmentAssessment | None = None
+    full_path_surface: RoadContainmentAssessment | None = None
+    junction_context: bool = False
+    recovery_required: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "current_ego_road": self.current_ego_road.to_json_dict(),
+            "current_ego_clearance_road": (
+                self.current_ego_clearance_road.to_json_dict()
+                if self.current_ego_clearance_road is not None
+                else None
+            ),
             "near_term_path_road": self.near_term_path_road.to_json_dict(),
             "full_path_road": self.full_path_road.to_json_dict(),
+            "near_term_path_surface": (
+                self.near_term_path_surface.to_json_dict()
+                if self.near_term_path_surface is not None
+                else None
+            ),
+            "full_path_surface": (
+                self.full_path_surface.to_json_dict()
+                if self.full_path_surface is not None
+                else None
+            ),
             "last_safe_waypoint_index": self.last_safe_waypoint_index,
             "time_to_first_bad_s": self.time_to_first_bad_s,
             "distance_to_first_bad_m": self.distance_to_first_bad_m,
             "target_speed_cap_mps": self.target_speed_cap_mps,
             "emergency_required": bool(self.emergency_required),
+            "junction_context": bool(self.junction_context),
+            "recovery_required": bool(self.recovery_required),
         }
 
 
@@ -98,8 +121,12 @@ def decide_plan_admission(
 ) -> PlanAdmissionStatus:
     """Choose a plan handoff without letting an unsafe prefix replace a safe plan."""
 
+    current_clearance = (
+        candidate.current_ego_clearance_road or candidate.current_ego_road
+    )
     candidate_admissible = (
         candidate.current_ego_road.status is AssessmentStatus.SAFE
+        and current_clearance.status is AssessmentStatus.SAFE
         and candidate.near_term_path_road.status is AssessmentStatus.SAFE
         and candidate.last_safe_waypoint_index is not None
         and not candidate.emergency_required
@@ -109,9 +136,30 @@ def decide_plan_admission(
             return PlanAdmissionStatus.ACCEPT_FULLY_SAFE
         return PlanAdmissionStatus.ACCEPT_SAFE_PREFIX
 
+    near_surface = candidate.near_term_path_surface
+    recovery_admissible = (
+        candidate.current_ego_road.status is AssessmentStatus.SAFE
+        and current_clearance.status is AssessmentStatus.UNSAFE
+        and candidate.junction_context
+        and near_surface is not None
+        and near_surface.status is AssessmentStatus.SAFE
+        and candidate.last_safe_waypoint_index is not None
+        and candidate.recovery_required
+        and not candidate.emergency_required
+    )
+    if recovery_admissible:
+        return PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX
+
+    active_clearance = None
+    if active is not None:
+        active_clearance = active.current_ego_clearance_road or active.current_ego_road
     active_executable = (
         active is not None
         and active.current_ego_road.status is AssessmentStatus.SAFE
+        and (
+            active_clearance.status is AssessmentStatus.SAFE
+            or active.recovery_required
+        )
         and active.last_safe_waypoint_index is not None
         and not active.emergency_required
     )
@@ -139,6 +187,41 @@ def road_stopping_speed_cap_mps(
         ),
     )
     return min(speed_cap, float(cfg.TRAJECTORY_MAX_SPEED_MPS))
+
+
+def _remove_lateral_clearance(
+    samples: tuple[RoadContainmentSample, ...],
+    lateral_clearance_m: float,
+) -> tuple[RoadContainmentSample, ...]:
+    """Convert buffered lane samples into physical Driving-surface samples.
+
+    Exact center/corner Driving queries are unchanged.  Only the analytic
+    non-junction lane margin has the planning clearance removed, so a vehicle
+    that merely enters the clearance buffer is not mislabeled physically
+    off-road.
+    """
+
+    clearance = max(0.0, float(lateral_clearance_m))
+    physical_samples = []
+    for sample in samples:
+        if sample.margin_m is None:
+            physical_samples.append(sample)
+            continue
+        physical_margin = float(sample.margin_m) + clearance
+        contained = sample.contained
+        reason = sample.reason
+        if reason == "ego_footprint_exceeds_lane":
+            contained = physical_margin >= 0.0
+            reason = None if contained else reason
+        physical_samples.append(
+            replace(
+                sample,
+                contained=contained,
+                margin_m=physical_margin,
+                reason=reason,
+            )
+        )
+    return tuple(physical_samples)
 
 
 def _yaw_rad(transform: Any, bounding_box: Any | None = None) -> float:
@@ -498,6 +581,8 @@ class CarlaGroundTruthSafetyAdapter:
         indices: np.ndarray,
         *,
         empty_reason: str,
+        physical_surface: bool = False,
+        lateral_clearance_m: float = 0.0,
     ) -> RoadContainmentAssessment:
         if len(indices) == 0:
             return RoadContainmentAssessment.unknown(
@@ -509,21 +594,44 @@ class CarlaGroundTruthSafetyAdapter:
             for index in indices
             for sample in profile.samples_by_pose[int(index)]
         )
-        return assess_road_containment(samples, quality=profile.quality)
+        quality = profile.quality
+        if physical_surface:
+            samples = _remove_lateral_clearance(samples, lateral_clearance_m)
+            quality = f"{quality}_physical_surface"
+        return assess_road_containment(samples, quality=quality)
 
     @staticmethod
     def _first_bad_profile_index(
         profile: _TimedRoadProfile,
         remaining_indices: np.ndarray,
+        *,
+        physical_surface: bool = False,
+        lateral_clearance_m: float = 0.0,
     ) -> int | None:
         for index in remaining_indices:
+            samples = profile.samples_by_pose[int(index)]
+            quality = profile.quality
+            if physical_surface:
+                samples = _remove_lateral_clearance(samples, lateral_clearance_m)
+                quality = f"{quality}_physical_surface"
             pose = assess_road_containment(
-                profile.samples_by_pose[int(index)],
-                quality=profile.quality,
+                samples,
+                quality=quality,
             )
             if pose.status is not AssessmentStatus.SAFE:
                 return int(index)
         return None
+
+    @staticmethod
+    def _indices_have_junction(
+        profile: _TimedRoadProfile,
+        indices: np.ndarray,
+    ) -> bool:
+        return any(
+            sample.is_junction is True
+            for index in indices
+            for sample in profile.samples_by_pose[int(index)]
+        )
 
     def _unknown_envelope(
         self,
@@ -544,6 +652,9 @@ class CarlaGroundTruthSafetyAdapter:
             distance_to_first_bad_m=None,
             target_speed_cap_mps=0.0,
             emergency_required=True,
+            current_ego_clearance_road=current_road or unknown,
+            near_term_path_surface=unknown,
+            full_path_surface=unknown,
         )
 
     def _road_execution_envelope(
@@ -554,6 +665,8 @@ class CarlaGroundTruthSafetyAdapter:
         ego: EgoKinematics,
         current_time_s: float,
         current_road: RoadContainmentAssessment,
+        current_clearance_road: RoadContainmentAssessment,
+        current_junction_context: bool,
     ) -> RoadExecutionEnvelope:
         remaining_indices = np.flatnonzero(
             profile.times_s > float(current_time_s) + float(cfg.TRAJECTORY_TIME_EPSILON_S)
@@ -572,6 +685,33 @@ class CarlaGroundTruthSafetyAdapter:
             near_term_indices,
             empty_reason="near_term_path_exhausted",
         )
+        full_surface = self._assess_profile_indices(
+            profile,
+            remaining_indices,
+            empty_reason="safety_surface_path_exhausted",
+            physical_surface=True,
+            lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
+        near_surface = self._assess_profile_indices(
+            profile,
+            near_term_indices,
+            empty_reason="near_term_surface_path_exhausted",
+            physical_surface=True,
+            lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
+        junction_context = bool(
+            current_junction_context
+            or self._indices_have_junction(profile, near_term_indices)
+        )
+        recovery_required = bool(
+            current_road.status is AssessmentStatus.SAFE
+            and junction_context
+            and near_surface.status is AssessmentStatus.SAFE
+            and (
+                current_clearance_road.status is AssessmentStatus.UNSAFE
+                or near_term.status is AssessmentStatus.UNSAFE
+            )
+        )
         if len(remaining_indices) == 0:
             return RoadExecutionEnvelope(
                 current_ego_road=current_road,
@@ -582,9 +722,19 @@ class CarlaGroundTruthSafetyAdapter:
                 distance_to_first_bad_m=None,
                 target_speed_cap_mps=0.0,
                 emergency_required=True,
+                current_ego_clearance_road=current_clearance_road,
+                near_term_path_surface=near_surface,
+                full_path_surface=full_surface,
+                junction_context=junction_context,
+                recovery_required=recovery_required,
             )
 
-        first_bad = self._first_bad_profile_index(profile, remaining_indices)
+        first_bad = self._first_bad_profile_index(
+            profile,
+            remaining_indices,
+            physical_surface=recovery_required,
+            lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
         if first_bad is None:
             return RoadExecutionEnvelope(
                 current_ego_road=current_road,
@@ -593,8 +743,17 @@ class CarlaGroundTruthSafetyAdapter:
                 last_safe_waypoint_index=int(len(plan.world_points) - 1),
                 time_to_first_bad_s=None,
                 distance_to_first_bad_m=None,
-                target_speed_cap_mps=None,
+                target_speed_cap_mps=(
+                    float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS)
+                    if recovery_required
+                    else None
+                ),
                 emergency_required=False,
+                current_ego_clearance_road=current_clearance_road,
+                near_term_path_surface=near_surface,
+                full_path_surface=full_surface,
+                junction_context=junction_context,
+                recovery_required=recovery_required,
             )
 
         first_remaining = int(remaining_indices[0])
@@ -625,11 +784,17 @@ class CarlaGroundTruthSafetyAdapter:
         if last_safe_index < first_future_waypoint:
             last_safe_index = None
 
-        speed_cap = road_stopping_speed_cap_mps(distance_to_bad, self.policy)
+        stopping_speed_cap = road_stopping_speed_cap_mps(distance_to_bad, self.policy)
+        target_speed_cap = stopping_speed_cap
+        if recovery_required:
+            target_speed_cap = min(
+                target_speed_cap,
+                float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS),
+            )
         current_speed = float(math.hypot(*ego.velocity_xy))
         emergency_required = (
             current_speed
-            > speed_cap + float(cfg.SAFETY_SPEED_CAP_EPSILON_MPS)
+            > stopping_speed_cap + float(cfg.SAFETY_SPEED_CAP_EPSILON_MPS)
         )
         return RoadExecutionEnvelope(
             current_ego_road=current_road,
@@ -638,8 +803,13 @@ class CarlaGroundTruthSafetyAdapter:
             last_safe_waypoint_index=last_safe_index,
             time_to_first_bad_s=time_to_bad,
             distance_to_first_bad_m=distance_to_bad,
-            target_speed_cap_mps=speed_cap,
+            target_speed_cap_mps=target_speed_cap,
             emergency_required=emergency_required,
+            current_ego_clearance_road=current_clearance_road,
+            near_term_path_surface=near_surface,
+            full_path_surface=full_surface,
+            junction_context=junction_context,
+            recovery_required=recovery_required,
         )
 
     def assess_ego_transform(self, transform: Any) -> RoadContainmentAssessment:
@@ -767,15 +937,26 @@ class CarlaGroundTruthSafetyAdapter:
             )
 
         ego_center_z = float(tick_context.ego_transform.location.z)
+        current_samples = self._query_footprint(
+            center_xyz=np.array([*ego.center_xy, ego_center_z], dtype=np.float64),
+            yaw_rad=ego.yaw_rad,
+            half_length_m=ego.half_length_m,
+            half_width_m=ego.half_width_m,
+            sample_index_start=0,
+        )
+        current_clearance_road = assess_road_containment(
+            current_samples,
+            quality="carla_ground_truth_current_ego_clearance",
+        )
         current_road = assess_road_containment(
-            self._query_footprint(
-                center_xyz=np.array([*ego.center_xy, ego_center_z], dtype=np.float64),
-                yaw_rad=ego.yaw_rad,
-                half_length_m=ego.half_length_m,
-                half_width_m=ego.half_width_m,
-                sample_index_start=0,
+            _remove_lateral_clearance(
+                current_samples,
+                self.policy.lateral_clearance_m,
             ),
-            quality="carla_ground_truth_current_ego",
+            quality="carla_ground_truth_current_ego_surface",
+        )
+        current_junction_context = any(
+            sample.is_junction is True for sample in current_samples
         )
         try:
             profile = self._profile_for_plan(plan, ego)
@@ -785,6 +966,8 @@ class CarlaGroundTruthSafetyAdapter:
                 ego=ego,
                 current_time_s=float(tick_context.simulation_time_s),
                 current_road=current_road,
+                current_clearance_road=current_clearance_road,
+                current_junction_context=current_junction_context,
             )
         except Exception as exc:
             return self._unknown_envelope(

@@ -113,6 +113,7 @@ def smooth_controller_control(
     previous_nominal,
     alpha,
     bypass_smoothing=False,
+    constrained_deceleration=False,
 ):
     """Smooth controller intent without feeding safety overrides back into it."""
 
@@ -131,6 +132,18 @@ def smooth_controller_control(
         previous_nominal.get("steer", 0.0),
     )
     steering = (1.0 - alpha) * previous_steering + alpha * steering_raw
+    if constrained_deceleration and float(brake_raw) > 0.0:
+        return (
+            {
+                "steering": float(np.clip(steering, -1.0, 1.0)),
+                "throttle": 0.0,
+                "brake": float(np.clip(brake_raw, 0.0, 1.0)),
+            },
+            (
+                "steering_ema_smoothing",
+                "road_deceleration_bypass_longitudinal_ema",
+            ),
+        )
     throttle = (1.0 - alpha) * previous_nominal["throttle"] + alpha * throttle_raw
     brake = (1.0 - alpha) * previous_nominal["brake"] + alpha * brake_raw
     if throttle >= brake:
@@ -1107,6 +1120,7 @@ def main():
                 admitted=admission in (
                     PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
                     PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
+                    PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
                 ),
                 admission_error=admission_error,
                 candidate_road_envelope=(
@@ -2661,6 +2675,10 @@ def main():
                         previous_nominal=prev_nominal_control,
                         alpha=cfg.CONTROL_SMOOTH_ALPHA,
                         bypass_smoothing=emergency_stop_requested,
+                        constrained_deceleration=(
+                            ctrl_debug.get("controller_state")
+                            == "ROAD_CONSTRAINED_DECELERATING"
+                        ),
                     )
                 except Exception as exc:
                     requested_control = None

@@ -55,3 +55,30 @@ def test_emergency_controller_stop_bypasses_smoothing():
         "brake": 1.0,
     }
     assert postprocessing == ("emergency_brake_bypass_ema",)
+
+
+def test_road_constrained_brake_cuts_throttle_without_longitudinal_ema():
+    nominal, postprocessing = smooth_controller_control(
+        steering_raw=0.4,
+        throttle_raw=0.0,
+        brake_raw=0.079,
+        previous_nominal={
+            "steering": -0.2,
+            "throttle": 0.41,
+            "brake": 0.0,
+        },
+        alpha=0.25,
+        constrained_deceleration=True,
+    )
+
+    assert nominal == pytest.approx(
+        {
+            "steering": -0.05,
+            "throttle": 0.0,
+            "brake": 0.079,
+        }
+    )
+    assert postprocessing == (
+        "steering_ema_smoothing",
+        "road_deceleration_bypass_longitudinal_ema",
+    )

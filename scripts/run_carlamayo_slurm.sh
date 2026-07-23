@@ -36,9 +36,18 @@ export CARLAMAYO_CARLA_PORT="$CARLAMAYO_RPC_PORT"
 export CARLAMAYO_TRAFFIC_MANAGER_PORT=$((CARLAMAYO_RPC_PORT + 3))
 
 IFS=, read -r CARLAMAYO_CARLA_GPU CARLAMAYO_MODEL_GPU _ <<< "${CUDA_VISIBLE_DEVICES:-}"
-if [[ -z "${CARLAMAYO_CARLA_GPU:-}" || -z "${CARLAMAYO_MODEL_GPU:-}" ]]; then
-    echo "Expected two assigned GPUs, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}" >&2
+if [[ -z "${CARLAMAYO_CARLA_GPU:-}" ]]; then
+    echo "Expected at least one assigned GPU, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}" >&2
     exit 1
+fi
+if [[ -z "${CARLAMAYO_MODEL_GPU:-}" ]]; then
+    if [[ "${CARLAMAYO_ALLOW_SHARED_GPU:-0}" == "1" ]]; then
+        CARLAMAYO_MODEL_GPU="$CARLAMAYO_CARLA_GPU"
+        echo "Validation mode: CARLA and Alpamayo share one explicitly authorized GPU."
+    else
+        echo "Expected two assigned GPUs, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}" >&2
+        exit 1
+    fi
 fi
 
 echo "Node: $(hostname)"

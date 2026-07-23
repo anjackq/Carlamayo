@@ -597,6 +597,99 @@ def test_current_ego_off_lane_remains_an_immediate_fail_closed_trigger(
     assert assessment.road.status is AssessmentStatus.UNSAFE
 
 
+def test_current_ego_surface_is_separate_from_buffered_lane_clearance(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=_long_plan(),
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.current_ego_road.min_margin_m == pytest.approx(0.2)
+    assert (
+        envelope.current_ego_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.current_ego_clearance_road.min_margin_m == pytest.approx(-0.05)
+
+
+def test_junction_transition_can_admit_low_speed_physical_recovery_prefix(
+    driving_lane_type,
+):
+    def resolve(location):
+        return FakeWaypoint(
+            location,
+            lane_width=2.0,
+            is_junction=location.x > 0.0,
+        )
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    plan = _long_plan()
+    plan.world_points[:, 1] = 0.5
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert (
+        envelope.current_ego_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
+    assert envelope.junction_context is True
+    assert envelope.recovery_required is True
+    assert envelope.target_speed_cap_mps == pytest.approx(
+        carla_safety_adapter.cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS
+    )
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX
+    )
+
+
+def test_nonjunction_clearance_violation_does_not_receive_recovery_grace(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan()
+    plan.world_points[:, 1] = 0.5
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert (
+        envelope.current_ego_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.junction_context is False
+    assert envelope.recovery_required is False
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
 def test_timed_profile_cache_reuses_map_queries_and_slices_elapsed_prefix(
     driving_lane_type,
 ):

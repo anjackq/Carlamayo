@@ -162,6 +162,10 @@ SAFETY_EXECUTION_HORIZON_S = 1.5
 # Avoid turning tiny floating-point differences at the stopping-envelope
 # boundary into an emergency brake.
 SAFETY_SPEED_CAP_EPSILON_MPS = 0.1
+# When the physical ego footprint is still on CARLA's Driving surface but the
+# buffered 0.25 m planning clearance is temporarily unavailable at a junction
+# transition, admit only a low-speed physically-contained recovery prefix.
+SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS = 0.75
 # Road profiles are immutable per fixed-world plan.  Keep a small bounded cache
 # so candidate admission can reuse the same exact CARLA map queries at control
 # time without growing for the whole episode.
