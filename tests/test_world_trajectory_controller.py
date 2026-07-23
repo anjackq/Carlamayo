@@ -3,6 +3,7 @@ import types
 import numpy as np
 import pytest
 
+from module import config as cfg
 from module import pid_controller
 from module.trajectory_runtime import detect_terminal_stop_index
 
@@ -72,6 +73,143 @@ def _straight_path(step_m):
 
 def _times():
     return np.arange(1, 65, dtype=np.float64) * 0.1
+
+
+def _launch_path(prefix_step_m=0.02, cruise_step_m=0.5, prefix_points=6):
+    """A moving plan that barely moves for its prefix then accelerates to cruise.
+
+    This is the shape Alpamayo emits for a stopped ego it predicts will launch:
+    a near-stationary prefix (~0.2 m/s) followed by real forward motion (~5 m/s).
+    Reading the fresh-plan target speed off the prefix is what deadlocks the
+    launch under 1 s proposal replacement.
+    """
+
+    steps = np.full(64, cruise_step_m, dtype=np.float64)
+    steps[:prefix_points] = prefix_step_m
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = np.cumsum(steps)
+    return points
+
+
+def test_launch_floor_pulls_stopped_ego_off_the_line_across_plan_swaps(follower):
+    points = _launch_path()
+
+    # Simulate the ~1 s proposal-replacement cadence: a brand-new plan_id every
+    # call, each freshly anchored (current_time=0) with the ego still stopped.
+    # Without the floor every call would target the ~0.2 m/s prefix and the
+    # launch would never complete.  The floor must hold across all swaps.
+    for plan_id in ("p1", "p2", "p3"):
+        _, throttle, brake, debug = follower.compute_world_control(
+            plan_id=plan_id,
+            wp_world=points,
+            waypoint_times_s=_times(),
+            current_simulation_time_s=0.0,
+            speed_mps=0.0,
+        )
+        assert debug["launch_floor_mps"] == pytest.approx(cfg.PID_LAUNCH_SPEED_MPS)
+        assert debug["target_speed_mps"] >= cfg.PID_LAUNCH_SPEED_MPS
+        assert throttle > 0.0
+        assert brake == pytest.approx(0.0)
+        assert follower.pid.calls[-1][0] == pytest.approx(cfg.PID_LAUNCH_SPEED_MPS * 3.6)
+
+
+def test_launch_floor_never_overrides_a_faster_timestamp_profile(follower):
+    # A constant 5 m/s plan already exceeds the launch floor, so the floor must
+    # not reduce or alter the timestamp-derived target.
+    points = _straight_path(0.5)
+    _, _, _, debug = follower.compute_world_control(
+        plan_id="cruise",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+    )
+    assert debug["target_speed_mps"] == pytest.approx(5.0)
+    assert debug["launch_floor_mps"] == pytest.approx(cfg.PID_LAUNCH_SPEED_MPS)
+
+
+def test_launch_floor_exempts_low_intent_creep_plans(follower):
+    # A uniform 0.2 m/s creep plan intends less than the minimum launch intent,
+    # so no floor is applied and no motion the model did not predict is invented.
+    points = _straight_path(0.02)
+    _, _, _, debug = follower.compute_world_control(
+        plan_id="creep",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+    )
+    assert debug["launch_floor_mps"] == pytest.approx(0.0)
+    assert debug["target_speed_mps"] == pytest.approx(0.2)
+
+
+def test_launch_floor_disengages_once_ego_is_rolling(follower):
+    # Once the ego is above the engaged speed the gearbox has bitten; the floor
+    # must release so the timestamp profile governs cruise and deceleration.
+    points = _launch_path()
+    _, _, _, debug = follower.compute_world_control(
+        plan_id="rolling",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=cfg.PID_LAUNCH_ENGAGE_SPEED_MPS + 0.5,
+    )
+    assert debug["launch_floor_mps"] == pytest.approx(0.0)
+
+
+def test_road_speed_cap_overrides_launch_floor(follower):
+    points = _launch_path()
+
+    _, throttle, brake, debug = follower.compute_world_control(
+        plan_id="road-limited-launch",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+        target_speed_cap_mps=1.0,
+        maximum_authorized_waypoint_index=20,
+    )
+
+    assert debug["launch_floor_mps"] == pytest.approx(cfg.PID_LAUNCH_SPEED_MPS)
+    assert debug["unconstrained_target_speed_mps"] >= cfg.PID_LAUNCH_SPEED_MPS
+    assert debug["target_speed_mps"] == pytest.approx(1.0)
+    assert debug["road_speed_limited"] is True
+    assert debug["controller_state"] == "ROAD_CONSTRAINED_DECELERATING"
+    assert follower.pid.calls[-1][0] == pytest.approx(3.6)
+    assert throttle > 0.0
+    assert brake == pytest.approx(0.0)
+
+
+def test_controller_target_never_exceeds_last_safe_waypoint(follower):
+    points = _straight_path(0.5)
+
+    *_, debug = follower.compute_world_control(
+        plan_id="bounded-target",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+        maximum_authorized_waypoint_index=4,
+    )
+
+    assert debug["target_idx"] <= 4
+    assert debug["maximum_authorized_waypoint_index"] == 4
+
+
+def test_exhausted_safe_prefix_commands_controller_brake(follower):
+    steer, throttle, brake, debug = follower.compute_world_control(
+        plan_id="safe-prefix-exhausted",
+        wp_world=_straight_path(0.5),
+        waypoint_times_s=_times(),
+        current_simulation_time_s=1.0,
+        speed_mps=0.0,
+        target_speed_cap_mps=0.0,
+        maximum_authorized_waypoint_index=4,
+    )
+
+    assert (steer, throttle, brake) == pytest.approx((0.0, 0.0, 1.0))
+    assert debug["mode"] == "road_safe_prefix_exhausted"
+    assert debug["controller_state"] == "ROAD_CONSTRAINED_DECELERATING"
 
 
 def test_timestamp_spacing_sets_speed_without_positive_minimum(follower):

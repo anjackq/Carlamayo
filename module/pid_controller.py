@@ -169,6 +169,56 @@ class OfficialPIDFollower:
         return float(np.clip(target_speed_mps, 0.0, cfg.TRAJECTORY_MAX_SPEED_MPS))
 
     @staticmethod
+    def _launch_floor_speed(
+        wp_world,
+        waypoint_times_s,
+        start_idx,
+        current_speed,
+        *,
+        terminal_stop_index=None,
+    ):
+        """Minimum launch speed so a fresh moving plan pulls a stopped ego off the line.
+
+        Returns 0.0 (no floor) once the ego is already rolling, or whenever the
+        plan does not intend meaningful forward motion over the near horizon --
+        so stop, creep, and terminal-stop plans are unaffected.  The floor keys
+        off the ego's actual speed rather than plan age or progress, which is what
+        makes it survive the ~1 s proposal-replacement cadence: a fresh plan can
+        no longer reset an in-progress launch back to its stationary prefix.  It
+        never exceeds the plan's own intended near-horizon peak speed.
+        """
+
+        if current_speed >= float(cfg.PID_LAUNCH_ENGAGE_SPEED_MPS):
+            return 0.0
+
+        points = np.asarray(wp_world, dtype=np.float64)
+        times = np.asarray(waypoint_times_s, dtype=np.float64)
+        if len(points) < 2 or len(points) != len(times):
+            return 0.0
+
+        segment_distance = np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)
+        segment_dt = np.diff(times)
+        speeds = np.divide(
+            segment_distance,
+            segment_dt,
+            out=np.zeros_like(segment_distance),
+            where=segment_dt > 1e-6,
+        )
+        window_end = len(speeds)
+        if terminal_stop_index is not None:
+            window_end = min(window_end, max(0, int(terminal_stop_index)))
+        window_start = min(max(0, int(start_idx)), window_end)
+        horizon_segments = max(
+            1,
+            int(round(float(cfg.PID_LAUNCH_HORIZON_S) / float(cfg.TRAJECTORY_WAYPOINT_DT))),
+        )
+        window = speeds[window_start : min(window_end, window_start + horizon_segments)]
+        intended_peak = float(np.max(window)) if len(window) else 0.0
+        if intended_peak < float(cfg.PID_LAUNCH_MIN_INTENT_MPS):
+            return 0.0
+        return float(min(intended_peak, float(cfg.PID_LAUNCH_SPEED_MPS)))
+
+    @staticmethod
     def _full_brake(mode, *, controller_state="FALLBACK", **debug):
         return 0.0, 0.0, 1.0, {
             "mode": mode,
@@ -232,6 +282,7 @@ class OfficialPIDFollower:
         speed_mps,
         *,
         terminal_stop_index=None,
+        maximum_authorized_waypoint_index=None,
     ):
         """Project progress monotonically and choose a fixed-world lookahead."""
 
@@ -258,6 +309,13 @@ class OfficialPIDFollower:
                 maximum_target_index,
                 max(0, int(terminal_stop_index)),
             )
+        if maximum_authorized_waypoint_index is not None:
+            maximum_target_index = min(
+                maximum_target_index,
+                max(0, int(maximum_authorized_waypoint_index)),
+            )
+        if maximum_target_index < first_future_idx:
+            return None, first_future_idx, lookahead_m, float("inf"), progress_s, cumulative
         maximum_target_s = float(cumulative[maximum_target_index])
         target_s = min(reference_s + lookahead_m, maximum_target_s)
         target_idx = int(np.searchsorted(cumulative, target_s, side="left"))
@@ -344,6 +402,8 @@ class OfficialPIDFollower:
         stop_requested=False,
         terminal_stop_index=None,
         capture_origin_world=None,
+        target_speed_cap_mps=None,
+        maximum_authorized_waypoint_index=None,
     ):
         """Track a timestamped fixed-world path without re-anchoring it to ego.
 
@@ -382,6 +442,23 @@ class OfficialPIDFollower:
 
         if plan_id != self._active_plan_id:
             self.reset_plan_progress(plan_id)
+
+        try:
+            if target_speed_cap_mps is not None:
+                target_speed_cap_mps = float(target_speed_cap_mps)
+                if not math.isfinite(target_speed_cap_mps) or target_speed_cap_mps < 0.0:
+                    raise ValueError
+            if maximum_authorized_waypoint_index is not None:
+                maximum_authorized_waypoint_index = int(
+                    maximum_authorized_waypoint_index
+                )
+                if not 0 <= maximum_authorized_waypoint_index < len(points):
+                    raise ValueError
+        except (TypeError, ValueError):
+            return self._full_brake(
+                "invalid_safety_constraint",
+                rejection_reason="invalid_road_execution_constraint",
+            )
 
         first_future_idx = int(
             np.searchsorted(times, current_time, side="right")
@@ -426,6 +503,15 @@ class OfficialPIDFollower:
                 ),
                 target_idx=int(terminal_stop_index),
             )
+        if (
+            maximum_authorized_waypoint_index is not None
+            and first_future_idx > maximum_authorized_waypoint_index
+        ):
+            return self._full_brake(
+                "road_safe_prefix_exhausted",
+                controller_state="ROAD_CONSTRAINED_DECELERATING",
+                target_idx=int(maximum_authorized_waypoint_index),
+            )
 
         (
             target_wp,
@@ -439,18 +525,40 @@ class OfficialPIDFollower:
             first_future_idx,
             current_speed,
             terminal_stop_index=terminal_stop_index,
+            maximum_authorized_waypoint_index=maximum_authorized_waypoint_index,
         )
         if target_wp is None:
             return self._full_brake("invalid_trajectory", rejection_reason="no_target")
 
         profile_index = max(first_future_idx, self._progress_index)
+        control_limit_index = terminal_stop_index
+        if maximum_authorized_waypoint_index is not None:
+            control_limit_index = (
+                maximum_authorized_waypoint_index
+                if control_limit_index is None
+                else min(control_limit_index, maximum_authorized_waypoint_index)
+            )
+
         target_speed_mps = self._target_speed_from_timestamps(
             points,
             times,
             profile_index,
             capture_origin_world=capture_origin_world,
-            terminal_stop_index=terminal_stop_index,
+            terminal_stop_index=control_limit_index,
         )
+
+        # Break the launch deadlock: pull a stopped ego off the line when the plan
+        # intends forward motion, before the terminal-stop braking clamp so an
+        # approaching stop can still override the floor downward.
+        launch_floor_mps = self._launch_floor_speed(
+            points,
+            times,
+            first_future_idx,
+            current_speed,
+            terminal_stop_index=control_limit_index,
+        )
+        if launch_floor_mps > 0.0:
+            target_speed_mps = max(target_speed_mps, launch_floor_mps)
 
         distance_to_stop = None
         if terminal_stop_index is not None:
@@ -473,12 +581,23 @@ class OfficialPIDFollower:
                     progress_s_m=progress_s,
                 )
 
-        control = self.pid.run_step(target_speed_mps * 3.6, target_wp)
-        controller_state = (
-            "DECELERATING"
-            if target_speed_mps + float(cfg.PID_DECELERATION_STATE_DELTA_MPS) < current_speed
-            else "TRACKING"
+        unconstrained_target_speed_mps = target_speed_mps
+        road_speed_limited = (
+            target_speed_cap_mps is not None
+            and target_speed_cap_mps < target_speed_mps
         )
+        if target_speed_cap_mps is not None:
+            target_speed_mps = min(target_speed_mps, target_speed_cap_mps)
+
+        control = self.pid.run_step(target_speed_mps * 3.6, target_wp)
+        if road_speed_limited:
+            controller_state = "ROAD_CONSTRAINED_DECELERATING"
+        else:
+            controller_state = (
+                "DECELERATING"
+                if target_speed_mps + float(cfg.PID_DECELERATION_STATE_DELTA_MPS) < current_speed
+                else "TRACKING"
+            )
         throttle = float(control.throttle)
         brake = float(control.brake)
         if target_speed_mps <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS):
@@ -499,5 +618,10 @@ class OfficialPIDFollower:
             "progress_s_m": progress_s,
             "terminal_stop_index": terminal_stop_index,
             "distance_to_stop_m": distance_to_stop,
+            "launch_floor_mps": launch_floor_mps,
+            "unconstrained_target_speed_mps": unconstrained_target_speed_mps,
+            "road_speed_cap_mps": target_speed_cap_mps,
+            "road_speed_limited": road_speed_limited,
+            "maximum_authorized_waypoint_index": maximum_authorized_waypoint_index,
             "bypass_smoothing": False,
         }
