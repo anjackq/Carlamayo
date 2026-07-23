@@ -8,6 +8,7 @@ from collections import Counter
 
 import pytest
 
+from module.carla_safety_adapter import RoadExecutionEnvelope
 from module.safety_shield import ObstacleAssessment, RoadContainmentAssessment
 
 
@@ -128,6 +129,17 @@ class _FakeCarlaInterface:
     def apply_control(self, steering, throttle, brake):
         self.applied_controls.append((steering, throttle, brake))
 
+    def get_applied_control(self):
+        if not self.applied_controls:
+            return None
+        steer, throttle, brake = self.applied_controls[-1]
+        return {
+            "echoed_steer": float(steer),
+            "echoed_throttle": float(throttle),
+            "echoed_brake": float(brake),
+            "gear": 1 if throttle > 0.0 else 0,
+        }
+
     def cleanup(self):
         self.cleanup_count += 1
 
@@ -144,7 +156,7 @@ def _assert_stream_summary_invariants(records):
     run_ids = {record["run_id"] for record in records}
     assert len(run_ids) == 1
     for record in records:
-        assert record["schema_version"] == 1
+        assert record["schema_version"] == closed_loop.RUNTIME_SCHEMA_VERSION
         assert isinstance(record["event_type"], str)
         json.dumps(record, allow_nan=False)
 
@@ -987,6 +999,130 @@ def test_sync_normal_inference_uses_one_second_simulation_time_cadence(
     assert records[-1]["stop_reason"] == "max_episode_seconds"
 
 
+def test_near_term_unsafe_candidate_does_not_replace_active_safe_plan(
+    monkeypatch,
+    tmp_path,
+):
+    safe_road = RoadContainmentAssessment.safe(sample_count=5)
+    unsafe_road = RoadContainmentAssessment.unsafe(
+        ("road_not_contained",),
+        sample_count=5,
+        first_bad_sample_index=0,
+    )
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _AdmissionAdapter:
+        def __init__(self, *_args):
+            pass
+
+        @staticmethod
+        def _envelope(plan):
+            candidate_is_unsafe = str(plan.plan_id).endswith(":2")
+            path_road = unsafe_road if candidate_is_unsafe else safe_road
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                near_term_path_road=path_road,
+                full_path_road=path_road,
+                last_safe_waypoint_index=(5 if candidate_is_unsafe else 63),
+                time_to_first_bad_s=(0.8 if candidate_is_unsafe else None),
+                distance_to_first_bad_m=(1.0 if candidate_is_unsafe else None),
+                target_speed_cap_mps=(0.0 if candidate_is_unsafe else None),
+                emergency_required=False,
+            )
+
+        def assess_plan_road(self, *, plan, **_kwargs):
+            return self._envelope(plan)
+
+        def assess(self, *, plan, **_kwargs):
+            envelope = self._envelope(plan)
+            return types.SimpleNamespace(
+                road=safe_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=safe_road,
+                proposed_path_road=envelope.full_path_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "road-admission.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "1.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: _TrackingFollower())
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _AdmissionAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    admissions = [
+        record for record in records if record["event_type"] == "plan_admission"
+    ]
+    assert [record["admission_status"] for record in admissions] == [
+        "ACCEPT_FULLY_SAFE",
+        "REJECT_RETAIN_ACTIVE",
+    ]
+    inference_results = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert [record["status"] for record in inference_results] == [
+        "accepted_plan",
+        "rejected_plan",
+    ]
+    ticks_after_rejection = [
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] >= 11
+    ]
+    assert ticks_after_rejection
+    assert all(
+        str(record["active_plan_id"]).endswith(":1")
+        for record in ticks_after_rejection
+    )
+    assert all(record["applied_control_source"] == "CONTROLLER_EXECUTION"
+               for record in ticks_after_rejection)
+
+
 def test_obstacle_override_is_the_only_control_applied_for_a_nominal_throttle(
     monkeypatch,
     tmp_path,
@@ -1066,6 +1202,20 @@ def test_obstacle_override_is_the_only_control_applied_for_a_nominal_throttle(
     assert tick["applied_control_source"] == "SAFETY_OVERRIDE"
     assert tick["safety_override_applied"] is True
     assert tick["safety_override_reason"] == "obstacle_assessment_unknown"
+    assert tick["direct_safety_trigger"] is True
+    assert tick["latch_only"] is False
+    assert tick["echoed_control"] == {
+        "echoed_steer": 0.0,
+        "echoed_throttle": 0.0,
+        "echoed_brake": 1.0,
+        "gear": 0,
+    }
+    assert tick["gear"] == 0
+    admissions = [
+        record for record in records if record["event_type"] == "plan_admission"
+    ]
+    assert len(admissions) == 1
+    assert admissions[0]["admission_status"] == "ACCEPT_FULLY_SAFE"
     proposals = [
         record for record in records if record["event_type"] == "alpamayo_proposal"
     ]

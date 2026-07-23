@@ -84,6 +84,39 @@ def _tick_context(frame_id=20, simulation_time_s=2.0):
     )
 
 
+def test_environment_ports_configure_rpc_and_traffic_manager(monkeypatch):
+    clients = []
+
+    class FakeClient:
+        def __init__(self, host, port):
+            self.host = host
+            self.port = port
+            clients.append(self)
+
+        def set_timeout(self, timeout):
+            self.timeout = timeout
+
+        def get_world(self):
+            return object()
+
+    monkeypatch.setenv("CARLAMAYO_CARLA_HOST", "127.0.0.1")
+    monkeypatch.setenv("CARLAMAYO_CARLA_PORT", "23456")
+    monkeypatch.setenv("CARLAMAYO_TRAFFIC_MANAGER_PORT", "23458")
+    monkeypatch.setattr(
+        carla_interface_module,
+        "carla",
+        types.SimpleNamespace(Client=FakeClient),
+    )
+
+    carla_if = CARLAInterface()
+    carla_if.connect()
+
+    assert clients[0].host == "127.0.0.1"
+    assert clients[0].port == 23456
+    assert clients[0].timeout == pytest.approx(20.0)
+    assert carla_if.tm_port == 23458
+
+
 class EmptyCameraQueue:
     def get(self, timeout):
         raise queue.Empty

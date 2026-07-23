@@ -13,13 +13,18 @@ import numpy as np
 import torch
 
 from module import config as cfg
-from module.carla_safety_adapter import CarlaGroundTruthSafetyAdapter
+from module.carla_safety_adapter import (
+    CarlaGroundTruthSafetyAdapter,
+    PlanAdmissionStatus,
+    RoadExecutionEnvelope,
+    decide_plan_admission,
+)
 from module.geometry import pose_matrix_from_state
 from module.navigation_control import NavigationControlState
 from module.pid_controller import OfficialPIDFollower
 from module.proposal_audit import coc_audit_fields
 from module.respawn_control import RespawnMonitor
-from module.runtime_metrics import JsonlWriter, RuntimeMetrics
+from module.runtime_metrics import JsonlWriter, RUNTIME_SCHEMA_VERSION, RuntimeMetrics
 from module.safety_shield import (
     AssessmentStatus,
     ControlCommand,
@@ -406,6 +411,8 @@ def parse_args(argv=None):
             args.scenario_seed = cfg.EMPTY_ROAD_SCENARIO_SEED
         if args.ego_spawn_index is None:
             args.ego_spawn_index = cfg.EMPTY_ROAD_EGO_SPAWN_INDEX
+        if args.mode == "navigation" and not args.navigation_text.strip():
+            args.navigation_text = cfg.EMPTY_ROAD_NAVIGATION_TEXT
     args.start_paused = bool(args.pygame_ui)
     args.pygame_ui_video = derive_pygame_ui_video_path(cfg.OUTPUT_VIDEO) if args.pygame_ui else None
     return args
@@ -506,7 +513,7 @@ def main():
         if runtime_metrics is None:
             runtime_metrics = RuntimeMetrics()
         event = {
-            "schema_version": 1,
+            "schema_version": RUNTIME_SCHEMA_VERSION,
             "run_id": run_id,
             "wall_time_unix_s": time.time(),
             "wall_elapsed_s": max(0.0, time.monotonic() - run_started_monotonic_s),
@@ -663,6 +670,9 @@ def main():
         current_plan_id = None
         current_plan_source_loop_tick_id = None
         current_plan_source_elapsed_proxy_s = None
+        current_plan_admission_status = None
+        current_road_envelope = None
+        latest_proposal_plan_id = None
         current_carla_frame_id = None
         current_simulation_time_s = None
         current_frame_id_quality = "loop_counter_proxy"
@@ -673,6 +683,7 @@ def main():
             "throttle": 0.0,
             "brake": 0.0,
         }
+        last_applied_control_echo = None
 
         pending_inference = False
         pending_request_id = None
@@ -1003,6 +1014,115 @@ def main():
                 raise TrajectoryValidationError(str(alignment.rejection_reason))
             return plan, validity
 
+        def _clear_active_plan_state():
+            nonlocal current_plan, current_trajectory, current_plan_id
+            nonlocal current_plan_source_loop_tick_id
+            nonlocal current_plan_source_elapsed_proxy_s
+            nonlocal current_road_envelope
+
+            current_plan = None
+            current_trajectory = None
+            current_plan_id = None
+            current_plan_source_loop_tick_id = None
+            current_plan_source_elapsed_proxy_s = None
+            current_road_envelope = None
+            pid_follower.reset_plan_progress()
+
+        def _admit_candidate_plan(candidate_plan):
+            """Map-gate one validated candidate before it can replace the active plan."""
+
+            nonlocal current_plan_admission_status, latest_proposal_plan_id
+
+            def assess_road_envelope(plan):
+                assess_plan_road = getattr(safety_adapter, "assess_plan_road", None)
+                if callable(assess_plan_road):
+                    return assess_plan_road(tick_context=tick_context, plan=plan)
+                legacy = safety_adapter.assess(tick_context=tick_context, plan=plan)
+                envelope = getattr(legacy, "road_envelope", None)
+                if envelope is not None:
+                    return envelope
+                current = getattr(legacy, "current_ego_road", None) or legacy.road
+                path = getattr(legacy, "proposed_path_road", None) or legacy.road
+                return RoadExecutionEnvelope(
+                    current_ego_road=current,
+                    near_term_path_road=path,
+                    full_path_road=path,
+                    last_safe_waypoint_index=(
+                        len(plan.world_points) - 1
+                        if legacy.road.status is AssessmentStatus.SAFE
+                        else None
+                    ),
+                    time_to_first_bad_s=None,
+                    distance_to_first_bad_m=None,
+                    target_speed_cap_mps=None,
+                    emergency_required=legacy.road.status is not AssessmentStatus.SAFE,
+                )
+
+            latest_proposal_plan_id = candidate_plan.plan_id
+            candidate_envelope = None
+            active_envelope = None
+            admission_error = None
+            if safety_adapter is None or tick_context is None:
+                admission_error = "carla_safety_adapter_unavailable"
+            else:
+                try:
+                    candidate_envelope = assess_road_envelope(candidate_plan)
+                except Exception as exc:
+                    admission_error = (
+                        f"candidate_road_assessment_error:{type(exc).__name__}"
+                    )
+
+            if current_plan is not None and safety_adapter is not None and tick_context is not None:
+                active_validity = validate_plan_for_execution(
+                    current_plan,
+                    float(current_simulation_time_s),
+                    current_prompt_revision=nav_state.revision,
+                    current_respawn_revision=respawn_revision,
+                )
+                active_alignment = validate_plan_alignment(
+                    current_plan,
+                    float(current_simulation_time_s),
+                    current_observation_entry["capture_pose_world"],
+                )
+                if active_validity.valid and active_alignment.valid:
+                    try:
+                        active_envelope = assess_road_envelope(current_plan)
+                    except Exception:
+                        active_envelope = None
+
+            if candidate_envelope is None:
+                admission = PlanAdmissionStatus.REJECT_FALLBACK_STOP
+            else:
+                admission = decide_plan_admission(candidate_envelope, active_envelope)
+            current_plan_admission_status = admission
+
+            emit_runtime_event(
+                "plan_admission",
+                aggregate_age=False,
+                aggregate_rejection=False,
+                layer="ALPAMAYO_PROPOSAL",
+                proposal_id=candidate_plan.plan_id,
+                active_plan_id=(current_plan.plan_id if current_plan is not None else None),
+                admission_status=admission.value,
+                admitted=admission in (
+                    PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
+                    PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
+                ),
+                admission_error=admission_error,
+                candidate_road_envelope=(
+                    candidate_envelope.to_json_dict()
+                    if candidate_envelope is not None
+                    else None
+                ),
+                retained_active_road_envelope=(
+                    active_envelope.to_json_dict()
+                    if admission is PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+                    and active_envelope is not None
+                    else None
+                ),
+            )
+            return admission, candidate_envelope
+
         def _current_plan_timing_proxies():
             if current_plan is not None and current_simulation_time_s is not None:
                 validity = validate_plan_for_execution(
@@ -1046,6 +1166,9 @@ def main():
             safety_assessment=None,
             applied_control_source=None,
             controller_debug=None,
+            applied_control_echo=None,
+            direct_safety_trigger=False,
+            latch_only=False,
             identity_available=True,
             control_timing="command_applied_after_observation",
         ):
@@ -1086,6 +1209,19 @@ def main():
                     else None
                 ),
                 speed_mps=float(state["speed"]),
+                ego_position_world=(
+                    {
+                        "x": float(state["x"]),
+                        "y": float(state["y"]),
+                        "z": float(state["z"]),
+                    }
+                    if all(axis in state for axis in ("x", "y", "z"))
+                    else None
+                ),
+                ego_yaw_deg=(
+                    float(state["yaw"]) if state.get("yaw") is not None else None
+                ),
+                ego_velocity_world=state.get("velocity_world"),
                 controller_state=controller_state,
                 control_timing=control_timing,
                 control_origin=control_origin,
@@ -1100,8 +1236,28 @@ def main():
                 safety_override_type=safety_override_type,
                 safety_override_reason=safety_override_reason,
                 safety_reason_codes=list(safety_reason_codes),
+                direct_safety_trigger=bool(direct_safety_trigger),
+                latch_only=bool(latch_only),
                 safety_assessment=safety_assessment,
                 rejection_reason=rejection_reason,
+                proposal_plan_id=latest_proposal_plan_id,
+                active_plan_id=current_plan_id,
+                plan_admission_status=(
+                    current_plan_admission_status.value
+                    if isinstance(current_plan_admission_status, PlanAdmissionStatus)
+                    else current_plan_admission_status
+                ),
+                road_execution_envelope=(
+                    current_road_envelope.to_json_dict()
+                    if current_road_envelope is not None
+                    else None
+                ),
+                echoed_control=applied_control_echo,
+                gear=(
+                    applied_control_echo.get("gear")
+                    if isinstance(applied_control_echo, dict)
+                    else None
+                ),
                 source_plan_id=current_plan_id,
                 source_plan_frame_id=(
                     current_plan.source_frame_id if current_plan is not None else None
@@ -1142,6 +1298,7 @@ def main():
             control_origin="nominal_controller",
             postprocessing=(),
             controller_debug=None,
+            adapter_assessment=None,
             event_type="tick",
             emit_event=True,
             identity_available=True,
@@ -1149,7 +1306,8 @@ def main():
         ):
             """Validate, safety-arbitrate, apply, and audit one vehicle command."""
 
-            nonlocal prev_control
+            nonlocal prev_control, current_road_envelope
+            nonlocal last_applied_control_echo
 
             arbitration_errors = []
             try:
@@ -1163,9 +1321,9 @@ def main():
                 nominal_command = None
                 arbitration_errors.append(f"invalid_nominal_control:{exc}")
 
-            adapter_assessment = None
             try:
                 if plan is None and nominal_command is not None and not arbitration_errors:
+                    current_road_envelope = None
                     safety_decision = safety_shield.decide_fallback(
                         controller_requested_control=requested_command,
                         nominal_control=nominal_command,
@@ -1178,13 +1336,20 @@ def main():
                             raise RuntimeError("no_executable_plan_context")
                         if safety_adapter is None:
                             raise RuntimeError("carla_safety_adapter_unavailable")
-                        adapter_assessment = safety_adapter.assess(
-                            tick_context=tick_context,
-                            plan=plan,
-                        )
+                        if adapter_assessment is None:
+                            adapter_assessment = safety_adapter.assess(
+                                tick_context=tick_context,
+                                plan=plan,
+                            )
                         road_assessment = adapter_assessment.road
                         obstacle_assessment = adapter_assessment.obstacles
+                        current_road_envelope = getattr(
+                            adapter_assessment,
+                            "road_envelope",
+                            None,
+                        )
                     except Exception as exc:
+                        current_road_envelope = None
                         adapter_error = f"safety_adapter_error:{type(exc).__name__}"
                         road_assessment = RoadContainmentAssessment.unknown(
                             (adapter_error,),
@@ -1240,6 +1405,17 @@ def main():
 
             # Every control-loop command reaches CARLA through this one call.
             apply_vehicle_control(safety_decision.applied_control)
+            get_applied_control = getattr(carla_if, "get_applied_control", None)
+            last_applied_control_echo = (
+                get_applied_control() if callable(get_applied_control) else None
+            )
+            latch_only = bool(
+                safety_decision.safety_override_applied
+                and "emergency_brake_latched" in safety_decision.reason_codes
+            )
+            direct_safety_trigger = bool(
+                safety_decision.safety_override_applied and not latch_only
+            )
             if emit_event:
                 _emit_control_tick(
                     state=state,
@@ -1261,6 +1437,8 @@ def main():
                     safety_override_type=safety_decision.override_type,
                     safety_override_reason=safety_decision.primary_reason,
                     safety_reason_codes=safety_decision.reason_codes,
+                    direct_safety_trigger=direct_safety_trigger,
+                    latch_only=latch_only,
                     safety_assessment={
                         "safety_source": safety_source,
                         "adapter_assessment_available": adapter_assessment is not None,
@@ -1295,9 +1473,25 @@ def main():
                             is not None
                             else None
                         ),
+                        "road_execution_envelope": (
+                            getattr(
+                                adapter_assessment,
+                                "road_envelope",
+                                None,
+                            ).to_json_dict()
+                            if adapter_assessment is not None
+                            and getattr(
+                                adapter_assessment,
+                                "road_envelope",
+                                None,
+                            )
+                            is not None
+                            else None
+                        ),
                         **safety_decision.to_json_dict(),
                     },
                     applied_control_source=safety_decision.applied_control_source,
+                    applied_control_echo=last_applied_control_echo,
                     identity_available=identity_available,
                     control_timing=control_timing,
                 )
@@ -1313,6 +1507,9 @@ def main():
             nonlocal respawn_revision, last_vqa_submitted_revision, last_vqa_completed_revision
             nonlocal current_plan_id, current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s, respawn_count
+            nonlocal current_plan_admission_status, current_road_envelope
+            nonlocal latest_proposal_plan_id
+            nonlocal last_applied_control_echo
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
             carla_if.respawn_ego_vehicle(
@@ -1335,6 +1532,10 @@ def main():
             current_plan_id = None
             current_plan_source_loop_tick_id = None
             current_plan_source_elapsed_proxy_s = None
+            current_plan_admission_status = None
+            current_road_envelope = None
+            latest_proposal_plan_id = None
+            last_applied_control_echo = None
             prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
             prev_nominal_control = {
                 "steering": 0.0,
@@ -1721,6 +1922,9 @@ def main():
                     current_plan_id = None
                     current_plan_source_loop_tick_id = None
                     current_plan_source_elapsed_proxy_s = None
+                    current_plan_admission_status = None
+                    current_road_envelope = None
+                    latest_proposal_plan_id = None
                     pending_inference = False
                     pending_request_id = None
                     safety_shield.reset()
@@ -2000,7 +2204,6 @@ def main():
                             )
                             inference_time = float(latest_result["inference_time"])
                             current_inference_time = inference_time
-                            current_trajectory_ts = float(latest_result["result_ts"])
                             try:
                                 candidate_plan, _validity = _build_and_validate_fixed_plan(
                                     latest_result,
@@ -2014,40 +2217,60 @@ def main():
                                     f"{exc.reason}"
                                 )
                             else:
-                                current_plan = candidate_plan
-                                current_selected_traj_idx = proposal["selected_index"]
-                                current_trajectory = proposal["selected_points"]
-                                prev_selected_trajectory = current_trajectory.copy()
-                                current_pred_xyz = proposal["trajectory_samples"]
-                                current_cot = proposal["coc_text"]
-                                current_plan_id = candidate_plan.plan_id
-                                latest_result["accepted_plan_id"] = current_plan_id
-                                current_plan_source_loop_tick_id = int(
-                                    latest_result["source_loop_tick_id"]
+                                admission, candidate_envelope = _admit_candidate_plan(
+                                    candidate_plan
                                 )
-                                current_plan_source_elapsed_proxy_s = float(
-                                    latest_result["source_elapsed_proxy_s"]
-                                )
-                                result_status = "accepted_plan"
+                                if admission in (
+                                    PlanAdmissionStatus.REJECT_RETAIN_ACTIVE,
+                                    PlanAdmissionStatus.REJECT_FALLBACK_STOP,
+                                ):
+                                    result_status = "rejected_plan"
+                                    result_rejection_reason = (
+                                        f"road_admission:{admission.value}"
+                                    )
+                                    if admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
+                                        _clear_active_plan_state()
+                                    print(
+                                        f"[Frame {frame_count}] Rejected Alpamayo proposal: "
+                                        f"{result_rejection_reason}"
+                                    )
+                                else:
+                                    current_plan = candidate_plan
+                                    current_selected_traj_idx = proposal["selected_index"]
+                                    current_trajectory = proposal["selected_points"]
+                                    prev_selected_trajectory = current_trajectory.copy()
+                                    current_pred_xyz = proposal["trajectory_samples"]
+                                    current_cot = proposal["coc_text"]
+                                    current_trajectory_ts = float(latest_result["result_ts"])
+                                    current_plan_id = candidate_plan.plan_id
+                                    current_road_envelope = candidate_envelope
+                                    latest_result["accepted_plan_id"] = current_plan_id
+                                    current_plan_source_loop_tick_id = int(
+                                        latest_result["source_loop_tick_id"]
+                                    )
+                                    current_plan_source_elapsed_proxy_s = float(
+                                        latest_result["source_elapsed_proxy_s"]
+                                    )
+                                    result_status = "accepted_plan"
 
-                                print(
-                                    f"[Frame {frame_count}] Inference done: "
-                                    f"{inference_time:.2f}s "
-                                    f"(submitted at frame {latest_result['frame_submitted']})"
-                                )
-                                print(f"    CoT: {current_cot[:60]}...")
-                                print(
-                                    f"    Nav: "
-                                    f"{latest_result.get('navigation_text') or '(none)'} "
-                                    f"(weight="
-                                    f"{latest_result.get('navigation_weight', 1.0):.2f})"
-                                )
-                                print(
-                                    f"    Selected traj sample: "
-                                    f"{current_selected_traj_idx}/"
-                                    f"{cfg.NUM_TRAJ_SAMPLES - 1}"
-                                )
-                                print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
+                                    print(
+                                        f"[Frame {frame_count}] Inference done: "
+                                        f"{inference_time:.2f}s "
+                                        f"(submitted at frame {latest_result['frame_submitted']})"
+                                    )
+                                    print(f"    CoT: {current_cot[:60]}...")
+                                    print(
+                                        f"    Admission: {admission.value} | Nav: "
+                                        f"{latest_result.get('navigation_text') or '(none)'} "
+                                        f"(weight="
+                                        f"{latest_result.get('navigation_weight', 1.0):.2f})"
+                                    )
+                                    print(
+                                        f"    Selected traj sample: "
+                                        f"{current_selected_traj_idx}/"
+                                        f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                                    )
+                                    print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
                         else:
                             print(
                                 f"[Frame {frame_count}] Inference error: {latest_result['error']}"
@@ -2274,40 +2497,72 @@ def main():
                             nav_state.set_error(str(rejection_reason))
                             print(f"[Frame {frame_count}] {failure_kind}: {rejection_reason}")
                         else:
-                            current_plan = candidate_plan
-                            current_selected_traj_idx = proposal["selected_index"]
-                            current_trajectory = proposal["selected_points"]
-                            prev_selected_trajectory = current_trajectory.copy()
-                            current_pred_xyz = proposal["trajectory_samples"]
-                            current_cot = proposal["coc_text"]
-                            current_inference_time = model_inference_time
-                            current_trajectory_ts = time.monotonic()
-                            current_plan_id = candidate_plan.plan_id
-                            current_plan_source_loop_tick_id = int(frame_count)
-                            current_plan_source_elapsed_proxy_s = _simulation_elapsed_proxy_s()
-
-                            print(f"[Frame {frame_count}] Inference: {model_inference_time:.2f}s")
-                            print(f"    CoT: {current_cot[:60]}...")
-                            if args.mode == "navigation":
+                            admission, candidate_envelope = _admit_candidate_plan(
+                                candidate_plan
+                            )
+                            if admission in (
+                                PlanAdmissionStatus.REJECT_RETAIN_ACTIVE,
+                                PlanAdmissionStatus.REJECT_FALLBACK_STOP,
+                            ):
+                                rejection_reason = f"road_admission:{admission.value}"
+                                if admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
+                                    _clear_active_plan_state()
+                                nav_state.set_error(rejection_reason)
                                 print(
-                                    f"    Nav: {nav_state.navigation_text or '(none)'} "
-                                    f"(weight={nav_state.navigation_weight:.2f})"
+                                    f"[Frame {frame_count}] Rejected Alpamayo proposal: "
+                                    f"{rejection_reason}"
                                 )
-                            print(
-                                f"    Selected traj sample: {current_selected_traj_idx}/"
-                                f"{cfg.NUM_TRAJ_SAMPLES - 1}"
-                            )
-                            print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
-                            _emit_sync_terminal(
-                                request_id=request_id,
-                                mode=args.mode,
-                                status="accepted_plan",
-                                rejection_reason=None,
-                                submission_monotonic_s=submission_monotonic_s,
-                                model_inference_latency_s=model_inference_time,
-                                source_plan_id=current_plan_id,
-                                coc_sha256=proposal["coc_sha256"],
-                            )
+                                _emit_sync_terminal(
+                                    request_id=request_id,
+                                    mode=args.mode,
+                                    status="rejected_plan",
+                                    rejection_reason=rejection_reason,
+                                    submission_monotonic_s=submission_monotonic_s,
+                                    model_inference_latency_s=model_inference_time,
+                                    coc_sha256=proposal["coc_sha256"],
+                                )
+                            else:
+                                current_plan = candidate_plan
+                                current_selected_traj_idx = proposal["selected_index"]
+                                current_trajectory = proposal["selected_points"]
+                                prev_selected_trajectory = current_trajectory.copy()
+                                current_pred_xyz = proposal["trajectory_samples"]
+                                current_cot = proposal["coc_text"]
+                                current_inference_time = model_inference_time
+                                current_trajectory_ts = time.monotonic()
+                                current_plan_id = candidate_plan.plan_id
+                                current_road_envelope = candidate_envelope
+                                current_plan_source_loop_tick_id = int(frame_count)
+                                current_plan_source_elapsed_proxy_s = (
+                                    _simulation_elapsed_proxy_s()
+                                )
+
+                                print(
+                                    f"[Frame {frame_count}] Inference: "
+                                    f"{model_inference_time:.2f}s"
+                                )
+                                print(f"    CoT: {current_cot[:60]}...")
+                                print(f"    Admission: {admission.value}")
+                                if args.mode == "navigation":
+                                    print(
+                                        f"    Nav: {nav_state.navigation_text or '(none)'} "
+                                        f"(weight={nav_state.navigation_weight:.2f})"
+                                    )
+                                print(
+                                    f"    Selected traj sample: {current_selected_traj_idx}/"
+                                    f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                                )
+                                print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
+                                _emit_sync_terminal(
+                                    request_id=request_id,
+                                    mode=args.mode,
+                                    status="accepted_plan",
+                                    rejection_reason=None,
+                                    submission_monotonic_s=submission_monotonic_s,
+                                    model_inference_latency_s=model_inference_time,
+                                    source_plan_id=current_plan_id,
+                                    coc_sha256=proposal["coc_sha256"],
+                                )
 
             expired_plan_reason = None
             if current_plan is not None:
@@ -2346,9 +2601,35 @@ def main():
                     current_plan_id = None
                     current_plan_source_loop_tick_id = None
                     current_plan_source_elapsed_proxy_s = None
+                    current_plan_admission_status = None
+                    current_road_envelope = None
                     pid_follower.reset_plan_progress()
 
             if current_plan is not None:
+                adapter_assessment = None
+                road_speed_cap_mps = None
+                maximum_authorized_waypoint_index = None
+                if safety_adapter is not None:
+                    try:
+                        adapter_assessment = safety_adapter.assess(
+                            tick_context=tick_context,
+                            plan=current_plan,
+                        )
+                        current_road_envelope = getattr(
+                            adapter_assessment,
+                            "road_envelope",
+                            None,
+                        )
+                        if current_road_envelope is not None:
+                            road_speed_cap_mps = (
+                                current_road_envelope.target_speed_cap_mps
+                            )
+                            maximum_authorized_waypoint_index = (
+                                current_road_envelope.last_safe_waypoint_index
+                            )
+                    except Exception:
+                        adapter_assessment = None
+                        current_road_envelope = None
                 try:
                     steering_raw, throttle_raw, brake_raw, ctrl_debug = (
                         pid_follower.compute_world_control(
@@ -2360,6 +2641,10 @@ def main():
                             stop_requested=bool(current_plan.stop_requested),
                             terminal_stop_index=current_plan.terminal_stop_index,
                             capture_origin_world=current_plan.capture_pose_world[:3, 3],
+                            target_speed_cap_mps=road_speed_cap_mps,
+                            maximum_authorized_waypoint_index=(
+                                maximum_authorized_waypoint_index
+                            ),
                         )
                     )
                     requested_control = {
@@ -2395,6 +2680,7 @@ def main():
                     nominal_control=nominal_control,
                     postprocessing=postprocessing,
                     controller_debug=ctrl_debug,
+                    adapter_assessment=adapter_assessment,
                 )
                 if nominal_control is not None:
                     prev_nominal_control = dict(nominal_control)
@@ -2425,6 +2711,15 @@ def main():
                             side="right",
                         )
                     )
+                    relative_last_safe_index = None
+                    if current_road_envelope is not None:
+                        if current_road_envelope.last_safe_waypoint_index is None:
+                            relative_last_safe_index = -1
+                        else:
+                            relative_last_safe_index = (
+                                int(current_road_envelope.last_safe_waypoint_index)
+                                - first_future_index
+                            )
                     vis_frame = create_visualization_frame(
                         cam_img,
                         current_pred_xyz,
@@ -2455,11 +2750,36 @@ def main():
                         applied_control_source=(safety_decision.applied_control_source),
                         safety_override_applied=(safety_decision.safety_override_applied),
                         safety_override_reason=safety_decision.primary_reason,
+                        plan_admission_status=(
+                            current_plan_admission_status.value
+                            if isinstance(
+                                current_plan_admission_status,
+                                PlanAdmissionStatus,
+                            )
+                            else current_plan_admission_status
+                        ),
+                        near_term_road_status=(
+                            current_road_envelope.near_term_path_road.status.value
+                            if current_road_envelope is not None
+                            else None
+                        ),
+                        full_path_road_status=(
+                            current_road_envelope.full_path_road.status.value
+                            if current_road_envelope is not None
+                            else None
+                        ),
+                        road_speed_cap_mps=(
+                            current_road_envelope.target_speed_cap_mps
+                            if current_road_envelope is not None
+                            else None
+                        ),
+                        last_safe_waypoint_index=relative_last_safe_index,
                     )
                     latest_ui_frame = vis_frame
                     if cfg.SAVE_VIDEO:
                         video_recorder.add_frame(vis_frame)
 
+                applied_echo = last_applied_control_echo
                 latest_telemetry = {
                     "frame": frame_count,
                     "speed_kmh": state["speed"] * 3.6,
@@ -2471,6 +2791,41 @@ def main():
                         "controller_state",
                         "TRACKING",
                     ),
+                    "target_speed_mps": ctrl_debug.get("target_speed_mps"),
+                    "launch_floor_mps": ctrl_debug.get("launch_floor_mps"),
+                    "echoed_throttle": (
+                        applied_echo["echoed_throttle"] if applied_echo else None
+                    ),
+                    "echoed_brake": (
+                        applied_echo["echoed_brake"] if applied_echo else None
+                    ),
+                    "echoed_steering": (
+                        applied_echo["echoed_steer"] if applied_echo else None
+                    ),
+                    "gear": applied_echo["gear"] if applied_echo else None,
+                    "plan_admission_status": (
+                        current_plan_admission_status.value
+                        if isinstance(
+                            current_plan_admission_status,
+                            PlanAdmissionStatus,
+                        )
+                        else current_plan_admission_status
+                    ),
+                    "near_term_road_status": (
+                        current_road_envelope.near_term_path_road.status.value
+                        if current_road_envelope is not None
+                        else None
+                    ),
+                    "full_path_road_status": (
+                        current_road_envelope.full_path_road.status.value
+                        if current_road_envelope is not None
+                        else None
+                    ),
+                    "road_speed_cap_mps": (
+                        current_road_envelope.target_speed_cap_mps
+                        if current_road_envelope is not None
+                        else None
+                    ),
                     "applied_control_source": (safety_decision.applied_control_source),
                     "safety_override_applied": (safety_decision.safety_override_applied),
                     "safety_override_reason": safety_decision.primary_reason,
@@ -2478,9 +2833,11 @@ def main():
                 if pygame_ui is not None:
                     draw_pygame_ui(latest_ui_frame, latest_telemetry)
 
+                gear_display = "?" if applied_echo is None else applied_echo["gear"]
                 print(
                     f"[Frame {frame_count}] Speed: {state['speed'] * 3.6:.1f} km/h, "
-                    f"Steer: {steering:.4f}, Throttle: {throttle:.3f}, Brake: {brake:.3f}"
+                    f"Steer: {steering:.4f}, Throttle: {throttle:.3f}, Brake: {brake:.3f}, "
+                    f"Gear: {gear_display}"
                 )
                 if current_plan is not None:
                     print(f"    Trajectory source age (CARLA simulation time): {plan_age_s:.2f}s")

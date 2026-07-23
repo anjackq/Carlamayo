@@ -1,6 +1,7 @@
 """CARLA environment interface and lifecycle management."""
 
 import math
+import os
 import queue
 import random
 import time
@@ -31,6 +32,14 @@ EXPECTED_ALPAMAYO_CAMERA_NAMES = (
     "cam_front_right",
     "cam_front_tele",
 )
+
+
+def _environment_port(name, default):
+    raw = os.environ.get(name)
+    value = int(default if raw in (None, "") else raw)
+    if not 1024 <= value <= 65535:
+        raise ValueError(f"{name} must be within [1024, 65535]")
+    return value
 EXPECTED_ALPAMAYO_CAMERA_FOVS = (120.0, 120.0, 120.0, 30.0)
 
 
@@ -108,7 +117,7 @@ class CARLAInterface:
         self.npc_vehicle_ids = []
         self.npc_walker_ids = []
         self.npc_walker_controller_ids = []
-        self.tm_port = 8000
+        self.tm_port = _environment_port("CARLAMAYO_TRAFFIC_MANAGER_PORT", 8000)
         self.camera_specs = _validated_camera_specs()
         self.camera_configs = {spec["name"]: dict(spec) for spec in self.camera_specs}
         self.camera_order = [spec["name"] for spec in self.camera_specs]
@@ -121,7 +130,15 @@ class CARLAInterface:
         self._camera_timestamp_mismatches = 0
         self._history_sequence_resets = 0
 
-    def connect(self, host="localhost", port=2000):
+    def connect(self, host=None, port=None):
+        host = host or os.environ.get("CARLAMAYO_CARLA_HOST", "localhost")
+        port = (
+            _environment_port("CARLAMAYO_CARLA_PORT", 2000)
+            if port is None
+            else int(port)
+        )
+        if not 1024 <= port <= 65535:
+            raise ValueError("CARLA port must be within [1024, 65535]")
         print(f"Connecting to CARLA at {host}:{port}...")
         self.client = carla.Client(host, port)
         self.client.set_timeout(20.0)
@@ -750,6 +767,27 @@ class CARLAInterface:
         control.throttle = float(throttle)
         control.brake = float(brake)
         self.ego_vehicle.apply_control(control)
+
+    def get_applied_control(self):
+        """Return CARLA's echoed control and gear for launch/actuator telemetry.
+
+        The ego runs an automatic gearbox, so the deadlock and its fix are only
+        observable by logging the gear CARLA actually selected against the
+        throttle we commanded.  Returns ``None`` if the echo is unavailable.
+        """
+
+        if self.ego_vehicle is None:
+            return None
+        try:
+            control = self.ego_vehicle.get_control()
+        except Exception:
+            return None
+        return {
+            "echoed_steer": float(getattr(control, "steer", 0.0)),
+            "echoed_throttle": float(getattr(control, "throttle", 0.0)),
+            "echoed_brake": float(getattr(control, "brake", 0.0)),
+            "gear": int(getattr(control, "gear", 0)),
+        }
 
     def tick(self):
         tick_frame = self.world.tick()

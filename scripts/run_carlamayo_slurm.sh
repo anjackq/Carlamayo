@@ -16,6 +16,25 @@ CARLAMAYO_CARLA_ROOT="/home/aqiu/carla"
 
 cd "$CARLAMAYO_REPO_ROOT"
 
+# Per-job ports allow multiple seed runs to share the six-GPU node without
+# racing on CARLA's default RPC/streaming ports or Traffic Manager port.
+if [[ -n "${CARLAMAYO_CARLA_PORT:-}" ]]; then
+    CARLAMAYO_RPC_PORT="$CARLAMAYO_CARLA_PORT"
+elif [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
+    # CARLA uses the RPC port plus two adjacent streaming/secondary ports.
+    # Give each job a four-port slot so consecutive job IDs cannot overlap.
+    CARLAMAYO_RPC_PORT=$((20000 + 4 * (SLURM_JOB_ID % 10000)))
+else
+    CARLAMAYO_RPC_PORT=2000
+fi
+if ! [[ "$CARLAMAYO_RPC_PORT" =~ ^[0-9]+$ ]] \
+    || ((CARLAMAYO_RPC_PORT < 1024 || CARLAMAYO_RPC_PORT > 65532)); then
+    echo "Invalid CARLAMAYO_CARLA_PORT: ${CARLAMAYO_RPC_PORT}" >&2
+    exit 1
+fi
+export CARLAMAYO_CARLA_PORT="$CARLAMAYO_RPC_PORT"
+export CARLAMAYO_TRAFFIC_MANAGER_PORT=$((CARLAMAYO_RPC_PORT + 3))
+
 IFS=, read -r CARLAMAYO_CARLA_GPU CARLAMAYO_MODEL_GPU _ <<< "${CUDA_VISIBLE_DEVICES:-}"
 if [[ -z "${CARLAMAYO_CARLA_GPU:-}" || -z "${CARLAMAYO_MODEL_GPU:-}" ]]; then
     echo "Expected two assigned GPUs, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}" >&2
@@ -26,6 +45,8 @@ echo "Node: $(hostname)"
 echo "Assigned GPUs: ${CUDA_VISIBLE_DEVICES}"
 echo "CARLA GPU: ${CARLAMAYO_CARLA_GPU}"
 echo "Alpamayo GPU: ${CARLAMAYO_MODEL_GPU}"
+echo "CARLA RPC port: ${CARLAMAYO_CARLA_PORT}"
+echo "Traffic Manager port: ${CARLAMAYO_TRAFFIC_MANAGER_PORT}"
 nvidia-smi
 
 CARLAMAYO_CARLA_LOG="$CARLAMAYO_REPO_ROOT/carla-server-${SLURM_JOB_ID}.log"
@@ -44,6 +65,7 @@ echo "Starting CARLA; log: ${CARLAMAYO_CARLA_LOG}"
 CUDA_VISIBLE_DEVICES="$CARLAMAYO_CARLA_GPU" \
     "$CARLAMAYO_CARLA_ROOT/CarlaUE4.sh" \
     -RenderOffScreen \
+    "-carla-rpc-port=${CARLAMAYO_CARLA_PORT}" \
     "-ini:[/Script/Engine.RendererSettings]:r.GraphicsAdapter=${CARLAMAYO_CARLA_GPU}" \
     >"$CARLAMAYO_CARLA_LOG" 2>&1 &
 CARLAMAYO_CARLA_PID=$!
@@ -51,11 +73,11 @@ CARLAMAYO_CARLA_PID=$!
 CARLAMAYO_CARLA_READY=0
 for _ in $(seq 1 90); do
     if ! kill -0 "$CARLAMAYO_CARLA_PID" 2>/dev/null; then
-        echo "CARLA exited before opening port 2000." >&2
+        echo "CARLA exited before opening port ${CARLAMAYO_CARLA_PORT}." >&2
         tail -100 "$CARLAMAYO_CARLA_LOG" >&2 || true
         exit 1
     fi
-    if (exec 3<>/dev/tcp/127.0.0.1/2000) 2>/dev/null; then
+    if (exec 3<>"/dev/tcp/127.0.0.1/${CARLAMAYO_CARLA_PORT}") 2>/dev/null; then
         exec 3>&- 3<&-
         CARLAMAYO_CARLA_READY=1
         break
@@ -64,7 +86,7 @@ for _ in $(seq 1 90); do
 done
 
 if [[ "$CARLAMAYO_CARLA_READY" -ne 1 ]]; then
-    echo "CARLA did not open port 2000 within 90 seconds." >&2
+    echo "CARLA did not open port ${CARLAMAYO_CARLA_PORT} within 90 seconds." >&2
     tail -100 "$CARLAMAYO_CARLA_LOG" >&2 || true
     exit 1
 fi
