@@ -44,6 +44,56 @@ def test_sampling_diagnostic_arguments():
     assert args.diffusion_temperature == pytest.approx(0.6)
 
 
+def test_camera_alignment_arguments_and_environment(monkeypatch):
+    monkeypatch.setenv("CARLAMAYO_CAMERA_PROFILE", "/private/profile.json")
+
+    args = closed_loop.parse_args(
+        [
+            "--camera-alignment",
+            "pose-projection",
+            "--capture-inference-fixture",
+            "/private/fixture.npz",
+            "--capture-only",
+        ]
+    )
+
+    assert args.camera_alignment == "pose-projection"
+    assert args.camera_profile == "/private/profile.json"
+    assert args.capture_inference_fixture == "/private/fixture.npz"
+    assert args.capture_only is True
+
+
+def test_camera_profile_cli_overrides_environment(monkeypatch):
+    monkeypatch.setenv("CARLAMAYO_CAMERA_PROFILE", "/private/environment.json")
+
+    args = closed_loop.parse_args(
+        [
+            "--camera-alignment",
+            "pose-only",
+            "--camera-profile",
+            "/private/cli.json",
+        ]
+    )
+
+    assert args.camera_profile == "/private/cli.json"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--camera-alignment", "projection-only"],
+        ["--capture-only"],
+    ],
+)
+def test_camera_alignment_missing_required_inputs_fails_fast(monkeypatch, arguments):
+    monkeypatch.delenv("CARLAMAYO_CAMERA_PROFILE", raising=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        closed_loop.parse_args(arguments)
+
+    assert exc_info.value.code == 2
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

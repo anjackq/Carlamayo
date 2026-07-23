@@ -33,7 +33,8 @@ def test_synchronized_observation_is_frozen_and_summarizes_payloads():
         ego_velocity_world=FakeArray((3,)),
         camera_images=FakeArray((4, 1080, 1920, 3), dtype="uint8"),
         camera_ids=[0, 1, 2, 6],
-        camera_intrinsics={"front": FakeArray((3, 3))},
+        camera_source_intrinsics={"front": FakeArray((3, 3))},
+        camera_output_models=(object(), object(), object(), object()),
         camera_extrinsics={"front": FakeArray((4, 4))},
         ego_history=FakeArray((4, 4, 4)),
         ego_history_frame_ids=[9, 10, 11, 12],
@@ -63,7 +64,8 @@ def test_synchronized_observation_validates_bundle_and_history_identity():
         "ego_velocity_world": object(),
         "camera_images": FakeArray((1, 2, 2, 3)),
         "camera_ids": (0,),
-        "camera_intrinsics": {0: object()},
+        "camera_source_intrinsics": {0: object()},
+        "camera_output_models": (object(),),
         "camera_extrinsics": {0: object()},
         "ego_history": FakeArray((2, 4, 4)),
         "ego_history_frame_ids": (11, 12),
@@ -74,8 +76,10 @@ def test_synchronized_observation_validates_bundle_and_history_identity():
         SynchronizedObservation(**{**base, "camera_ids": (0, 1)})
     with pytest.raises(ValueError, match="ego_history length"):
         SynchronizedObservation(**{**base, "ego_history_frame_ids": (10, 11, 12)})
-    with pytest.raises(ValueError, match="camera_intrinsics"):
-        SynchronizedObservation(**{**base, "camera_intrinsics": None})
+    with pytest.raises(ValueError, match="camera_source_intrinsics"):
+        SynchronizedObservation(**{**base, "camera_source_intrinsics": None})
+    with pytest.raises(ValueError, match="camera_output_models"):
+        SynchronizedObservation(**{**base, "camera_output_models": None})
 
 
 def test_inference_request_keeps_source_identity_and_revision_metadata():

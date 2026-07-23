@@ -5,6 +5,7 @@ import os
 import queue
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,6 +14,15 @@ import cv2
 import numpy as np
 
 from . import config as cfg
+from .camera_geometry import (
+    CAMERA_ALIGNMENT_MODES,
+    PinholeProjection,
+    build_ftheta_remap,
+    camera_pose_in_carla_actor,
+    load_camera_rig_profile,
+    remap_rgb_image,
+    validate_vehicle_dimensions,
+)
 from .data_collection import ExactFrameCollector
 from .geometry import (
     camera_intrinsic_matrix,
@@ -93,7 +103,15 @@ def is_allowed_npc_vehicle_blueprint(blueprint):
 class CARLAInterface:
     """Interface for CARLA simulation."""
 
-    def __init__(self):
+    def __init__(self, *, camera_alignment="baseline", camera_profile=None):
+        if camera_alignment not in CAMERA_ALIGNMENT_MODES:
+            raise ValueError(
+                f"camera_alignment must be one of {CAMERA_ALIGNMENT_MODES}"
+            )
+        if camera_alignment != "baseline" and not camera_profile:
+            raise ValueError(
+                f"camera alignment mode {camera_alignment!r} requires a camera profile"
+            )
         self.client = None
         self.world = None
         self.ego_vehicle = None
@@ -122,6 +140,45 @@ class CARLAInterface:
         self.camera_configs = {spec["name"]: dict(spec) for spec in self.camera_specs}
         self.camera_order = [spec["name"] for spec in self.camera_specs]
         self.camera_ids = tuple(int(spec["alpamayo_id"]) for spec in self.camera_specs)
+        self.camera_alignment = camera_alignment
+        self._camera_remap_threads = None
+        if camera_alignment != "baseline":
+            requested_threads = os.environ.get(
+                "CARLAMAYO_CAMERA_REMAP_THREADS",
+                os.environ.get(
+                    "SLURM_CPUS_PER_TASK",
+                    str(min(8, os.cpu_count() or 1)),
+                ),
+            )
+            try:
+                requested_threads = int(requested_threads)
+            except ValueError as exc:
+                raise ValueError(
+                    "CARLAMAYO_CAMERA_REMAP_THREADS must be an integer"
+                ) from exc
+            if not 1 <= requested_threads <= 64:
+                raise ValueError(
+                    "CARLAMAYO_CAMERA_REMAP_THREADS must be within [1, 64]"
+                )
+            cv2.setNumThreads(requested_threads)
+            self._camera_remap_threads = requested_threads
+        self.camera_profile = (
+            load_camera_rig_profile(camera_profile)
+            if camera_alignment != "baseline"
+            else None
+        )
+        self._camera_source_models = {}
+        self._camera_output_models = {}
+        self._camera_remaps = {}
+        self._camera_vehicle_dimension_errors = {}
+        self._camera_model_validation_status = "pending"
+        self._camera_preprocessing_latencies_s = deque(maxlen=2048)
+        self._camera_decode_latencies_s = deque(maxlen=2048)
+        self._camera_remap_latencies_s = deque(maxlen=2048)
+        self._last_camera_preprocessing_latency_s = 0.0
+        self._last_camera_decode_latency_s = 0.0
+        self._last_camera_remap_latency_s = 0.0
+        self._last_conditioned_images = None
         self._last_tick_context = None
         self._last_camera_packets = None
         self._accepted_camera_bundles = 0
@@ -129,6 +186,75 @@ class CARLAInterface:
         self._camera_frame_mismatches = 0
         self._camera_timestamp_mismatches = 0
         self._history_sequence_resets = 0
+        self._configure_baseline_camera_models()
+
+    def _configure_baseline_camera_models(self):
+        for name in self.camera_order:
+            camera_config = self.camera_configs[name]
+            projection = PinholeProjection.from_horizontal_fov(
+                cfg.IMG_WIDTH,
+                cfg.IMG_HEIGHT,
+                camera_config["fov"],
+            )
+            self._camera_source_models[name] = projection
+            self._camera_output_models[name] = projection
+        if self.camera_alignment == "baseline":
+            self._camera_model_validation_status = "valid"
+
+    def _configure_camera_alignment(self):
+        """Resolve poses and source projections before spawning any sensor."""
+
+        self.camera_configs = {
+            spec["name"]: dict(spec) for spec in self.camera_specs
+        }
+        self._camera_source_models.clear()
+        self._camera_output_models.clear()
+        self._camera_remaps.clear()
+        self._camera_vehicle_dimension_errors = {}
+
+        if self.camera_alignment == "baseline":
+            self._configure_baseline_camera_models()
+            return
+
+        profile = self.camera_profile
+        if profile is None or self.ego_vehicle is None:
+            raise RuntimeError("camera profile and ego vehicle are required before setup")
+        bounding_box = self.ego_vehicle.bounding_box
+        self._camera_vehicle_dimension_errors = validate_vehicle_dimensions(
+            profile,
+            bounding_box,
+        )
+        use_profile_pose = self.camera_alignment in ("pose-only", "pose-projection")
+        use_profile_projection = self.camera_alignment in (
+            "projection-only",
+            "pose-projection",
+        )
+        for profile_camera in profile.cameras:
+            name = profile_camera.name
+            camera_config = self.camera_configs[name]
+            if use_profile_pose:
+                camera_config.update(
+                    camera_pose_in_carla_actor(
+                        profile,
+                        profile_camera,
+                        bounding_box,
+                    )
+                )
+            if use_profile_projection:
+                remap = build_ftheta_remap(profile_camera.projection)
+                camera_config["fov"] = remap.source_fov_deg
+                self._camera_source_models[name] = remap.source_projection
+                self._camera_output_models[name] = profile_camera.projection
+                self._camera_remaps[name] = remap
+            else:
+                source_projection = PinholeProjection.from_horizontal_fov(
+                    cfg.IMG_WIDTH,
+                    cfg.IMG_HEIGHT,
+                    camera_config["fov"],
+                )
+                self._camera_source_models[name] = source_projection
+                self._camera_output_models[name] = source_projection
+        self._camera_model_validation_status = "valid"
 
     def connect(self, host=None, port=None):
         host = host or os.environ.get("CARLAMAYO_CARLA_HOST", "localhost")
@@ -390,6 +516,7 @@ class CARLAInterface:
 
     def setup_cameras(self):
         print("Setting up cameras...")
+        self._configure_camera_alignment()
         bp_lib = self.world.get_blueprint_library()
         for name in self.camera_order:
             cfg_cam = self.camera_configs[name]
@@ -471,6 +598,7 @@ class CARLAInterface:
                 except queue.Empty:
                     break
         self._last_camera_packets = None
+        self._last_conditioned_images = None
 
     def _camera_callback(self, image, name):
         self.camera_collector.put(image.frame, name, image)
@@ -488,6 +616,43 @@ class CARLAInterface:
             )
         array = array.reshape((height, width, 4))[:, :, :3]
         return cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+
+    def _condition_camera_packets(self, packets):
+        frame_ids = {
+            int(getattr(packet, "frame", -1)) for packet in packets.values()
+        }
+        frame_id = next(iter(frame_ids)) if len(frame_ids) == 1 else None
+        if (
+            frame_id is not None
+            and self._last_conditioned_images is not None
+            and self._last_conditioned_images[0] == frame_id
+        ):
+            return self._last_conditioned_images[1]
+
+        started = time.perf_counter()
+        decode_latency = 0.0
+        remap_latency = 0.0
+        conditioned = {}
+        for name in self.camera_order:
+            stage_started = time.perf_counter()
+            image = self._decode_camera_image(packets[name])
+            decode_latency += time.perf_counter() - stage_started
+            remap = self._camera_remaps.get(name)
+            if remap is not None:
+                stage_started = time.perf_counter()
+                image = remap_rgb_image(image, remap)
+                remap_latency += time.perf_counter() - stage_started
+            conditioned[name] = image
+        latency = time.perf_counter() - started
+        self._last_camera_preprocessing_latency_s = float(latency)
+        self._last_camera_decode_latency_s = float(decode_latency)
+        self._last_camera_remap_latency_s = float(remap_latency)
+        self._camera_preprocessing_latencies_s.append(float(latency))
+        self._camera_decode_latencies_s.append(float(decode_latency))
+        self._camera_remap_latencies_s.append(float(remap_latency))
+        if frame_id is not None:
+            self._last_conditioned_images = (frame_id, conditioned)
+        return conditioned
 
     def _collect_camera_packets(self, frame_id, timeout):
         target_frame = int(frame_id)
@@ -522,7 +687,7 @@ class CARLAInterface:
     def _get_legacy_camera_images(self, timeout):
         """Read old per-camera queues when no tick context is available."""
 
-        images = []
+        packets = {}
         missing = []
         for name in self.camera_order:
             sensor_queue = self.sensor_queues.get(name)
@@ -530,12 +695,16 @@ class CARLAInterface:
                 missing.append(name)
                 continue
             try:
-                images.append(self._decode_camera_image(sensor_queue.get(timeout=timeout)))
+                packets[name] = sensor_queue.get(timeout=timeout)
             except queue.Empty:
                 missing.append(name)
         if missing:
             raise TimeoutError(f"Missing camera frames: {missing}")
-        return np.stack(images, axis=0)
+        conditioned = self._condition_camera_packets(packets)
+        return np.stack(
+            [conditioned[name] for name in self.camera_order],
+            axis=0,
+        )
 
     def get_camera_images(self, frame_id=None, timeout=1.0):
         """Return canonical RGB cameras for one exact CARLA frame.
@@ -553,8 +722,9 @@ class CARLAInterface:
             return self._get_legacy_camera_images(timeout)
 
         packets = self._collect_camera_packets(frame_id, timeout)
+        conditioned = self._condition_camera_packets(packets)
         return np.stack(
-            [self._decode_camera_image(packets[name]) for name in self.camera_order],
+            [conditioned[name] for name in self.camera_order],
             axis=0,
         )
 
@@ -661,23 +831,26 @@ class CARLAInterface:
         intrinsics = []
         extrinsics = []
         world_to_ego = np.linalg.inv(ego_pose_world)
-        for spec in self.camera_specs:
-            packet = packets[spec["name"]]
+        for name in self.camera_order:
+            camera_config = self.camera_configs[name]
+            packet = packets[name]
             width = int(getattr(packet, "width", cfg.IMG_WIDTH))
             height = int(getattr(packet, "height", cfg.IMG_HEIGHT))
-            intrinsics.append(camera_intrinsic_matrix(width, height, spec["fov"]))
+            intrinsics.append(
+                camera_intrinsic_matrix(width, height, camera_config["fov"])
+            )
 
             capture_transform = getattr(packet, "transform", None)
             if capture_transform is not None:
                 sensor_to_ego = world_to_ego @ pose_matrix_from_transform(capture_transform)
             else:
                 sensor_to_ego = pose_matrix_from_components(
-                    spec["x"],
-                    spec["y"],
-                    spec["z"],
-                    spec.get("roll", 0.0),
-                    spec.get("pitch", 0.0),
-                    spec.get("yaw", 0.0),
+                    camera_config["x"],
+                    camera_config["y"],
+                    camera_config["z"],
+                    camera_config.get("roll", 0.0),
+                    camera_config.get("pitch", 0.0),
+                    camera_config.get("yaw", 0.0),
                 )
             extrinsics.append(sensor_to_ego)
         return np.stack(intrinsics, axis=0), np.stack(extrinsics, axis=0)
@@ -709,10 +882,8 @@ class CARLAInterface:
                     f"Camera {name} timestamp {float(packet_timestamp):.6f}s does not "
                     f"match snapshot {context.simulation_time_s:.6f}s"
                 )
-        images = np.stack(
-            [self._decode_camera_image(packets[name]) for name in self.camera_order],
-            axis=0,
-        )
+        conditioned = self._condition_camera_packets(packets)
+        images = np.stack([conditioned[name] for name in self.camera_order], axis=0)
         state = self.get_ego_state(context)
         if update_history:
             self.update_history(state)
@@ -738,7 +909,10 @@ class CARLAInterface:
             ego_velocity_world=state["velocity_world"].copy(),
             camera_images=images,
             camera_ids=self.camera_ids,
-            camera_intrinsics=intrinsics,
+            camera_source_intrinsics=intrinsics,
+            camera_output_models=tuple(
+                self._camera_output_models[name] for name in self.camera_order
+            ),
             camera_extrinsics=extrinsics,
             ego_history=history_poses,
             ego_history_frame_ids=tuple(
@@ -748,6 +922,72 @@ class CARLAInterface:
                 float(history_state["simulation_time_s"]) for history_state in identified_history
             ),
         )
+
+    def has_complete_ego_history(self):
+        """Return whether 16 real contiguous samples are available without padding."""
+
+        return len(self.history_buffer) >= cfg.NUM_HISTORY
+
+    def get_camera_alignment_metadata(self):
+        """Return telemetry-safe alignment metadata without calibration values."""
+
+        def latency_summary(values, last_value):
+            latency_values = np.asarray(values, dtype=np.float64)
+            summary = {
+                "last_ms": float(last_value) * 1000.0,
+                "sample_count": int(len(latency_values)),
+            }
+            if len(latency_values):
+                summary.update(
+                    {
+                        "p50_ms": float(np.quantile(latency_values, 0.50) * 1000.0),
+                        "p95_ms": float(np.quantile(latency_values, 0.95) * 1000.0),
+                        "maximum_ms": float(np.max(latency_values) * 1000.0),
+                    }
+                )
+            return summary
+
+        preprocessing = {
+            "total": latency_summary(
+                self._camera_preprocessing_latencies_s,
+                self._last_camera_preprocessing_latency_s,
+            ),
+            "decode": latency_summary(
+                self._camera_decode_latencies_s,
+                self._last_camera_decode_latency_s,
+            ),
+            "remap": latency_summary(
+                self._camera_remap_latencies_s,
+                self._last_camera_remap_latency_s,
+            ),
+        }
+        profile_metadata = (
+            self.camera_profile.safe_metadata()
+            if self.camera_profile is not None
+            else None
+        )
+        return {
+            "alignment_mode": self.camera_alignment,
+            "profile": profile_metadata,
+            "source_fov_deg": {
+                name: float(self.camera_configs[name]["fov"])
+                for name in self.camera_order
+            },
+            "output_projection_type": {
+                name: self._camera_output_models[name].projection_type
+                for name in self.camera_order
+            },
+            "vehicle_dimension_relative_error": dict(
+                self._camera_vehicle_dimension_errors
+            ),
+            "remap_valid_ratio": {
+                name: float(remap.valid_ratio)
+                for name, remap in self._camera_remaps.items()
+            },
+            "preprocessing_latency": preprocessing,
+            "camera_model_validation_status": self._camera_model_validation_status,
+            "opencv_remap_threads": self._camera_remap_threads,
+        }
 
     def get_camera_sync_stats(self):
         """Return exact-frame bundle and packet health counters."""

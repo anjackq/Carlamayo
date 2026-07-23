@@ -1,9 +1,11 @@
+import math
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from module.camera_geometry import FThetaProjection, PinholeProjection
 from module.visualization import (
     VideoRecorder,
     create_open_loop_visualization_frame,
@@ -63,6 +65,64 @@ def test_exact_world_projection_uses_carla_camera_axes():
 
     np.testing.assert_allclose(pixels[:3], [[80.0, 60.0], [90.0, 60.0], [80.0, 50.0]])
     assert valid.tolist() == [True, True, True, False]
+
+
+def test_world_projection_uses_model_facing_projection_object():
+    projection = PinholeProjection(
+        width=160,
+        height=120,
+        fx=100.0,
+        fy=100.0,
+        cx=80.0,
+        cy=60.0,
+    )
+    points = np.array(
+        [[10.0, 0.0, 0.0], [10.0, 1.0, 0.0], [10.0, 0.0, 1.0]]
+    )
+
+    pixels, valid = project_world_points_to_camera(
+        points,
+        np.eye(4),
+        projection,
+    )
+
+    np.testing.assert_allclose(
+        pixels,
+        [[80.0, 60.0], [90.0, 60.0], [80.0, 50.0]],
+        atol=1e-9,
+    )
+    assert valid.all()
+
+
+def test_ftheta_world_projection_matches_known_angles():
+    projection = FThetaProjection(
+        width=100,
+        height=80,
+        cx=50.0,
+        cy=40.0,
+        angle_to_radius_coefficients=(0.0, 50.0),
+        radius_to_angle_coefficients=(0.0, 1.0 / 50.0),
+    )
+    points = np.array(
+        [
+            [10.0, 0.0, 0.0],
+            [10.0, 10.0 * math.tan(0.4), 0.0],
+            [10.0, 0.0, 10.0 * math.tan(0.2)],
+        ]
+    )
+
+    pixels, valid = project_world_points_to_camera(
+        points,
+        np.eye(4),
+        projection,
+    )
+
+    np.testing.assert_allclose(
+        pixels,
+        [[50.0, 40.0], [70.0, 40.0], [50.0, 30.0]],
+        atol=1e-6,
+    )
+    assert valid.all()
 
 
 def test_calibrated_world_trajectory_draws_on_the_current_image():

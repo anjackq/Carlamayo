@@ -177,6 +177,10 @@ carlamayo_runtime*.jsonl
 /outputs/
 /runs/
 /wandb/
+*.camera-profile.json
+*.camera-fixture.npz
+camera_profiles/
+camera_fixtures/
 *.safetensors
 *.ckpt
 *.pt

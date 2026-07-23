@@ -8,6 +8,7 @@ import random
 import threading
 import time
 import traceback
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,6 +20,7 @@ from module.carla_safety_adapter import (
     RoadExecutionEnvelope,
     decide_plan_admission,
 )
+from module.camera_fixture import save_camera_fixture
 from module.geometry import pose_matrix_from_state
 from module.navigation_control import NavigationControlState
 from module.pid_controller import OfficialPIDFollower
@@ -427,6 +429,35 @@ def parse_args(argv=None):
         default=None,
         help=("Stop after this many seconds of successful simulation ticks. Disabled by default."),
     )
+    parser.add_argument(
+        "--camera-alignment",
+        choices=("baseline", "pose-only", "projection-only", "pose-projection"),
+        default="baseline",
+        help=(
+            "Model-facing camera alignment mode. Default: baseline. "
+            "Every non-baseline mode requires --camera-profile."
+        ),
+    )
+    parser.add_argument(
+        "--camera-profile",
+        default=os.environ.get("CARLAMAYO_CAMERA_PROFILE", ""),
+        metavar="PATH",
+        help=(
+            "Local gated camera profile. CLI takes precedence over "
+            "CARLAMAYO_CAMERA_PROFILE."
+        ),
+    )
+    parser.add_argument(
+        "--capture-inference-fixture",
+        default=None,
+        metavar="PATH",
+        help="Capture one private frozen-input fixture after 16 real history ticks.",
+    )
+    parser.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="Hold the ego stopped, save the requested fixture, and exit before inference.",
+    )
     args = parser.parse_args(argv)
     if args.oom_free and args.quantization:
         parser.error("--oom-free and --quantization are mutually exclusive.")
@@ -442,6 +473,23 @@ def parse_args(argv=None):
         parser.error("--num-traj-samples must be within [1, 16].")
     if not math.isfinite(args.diffusion_temperature) or args.diffusion_temperature <= 0.0:
         parser.error("--diffusion-temperature must be finite and greater than zero.")
+    if args.camera_alignment != "baseline" and not args.camera_profile:
+        parser.error(
+            f"--camera-alignment {args.camera_alignment} requires --camera-profile "
+            "or CARLAMAYO_CAMERA_PROFILE."
+        )
+    if args.capture_only and not args.capture_inference_fixture:
+        parser.error("--capture-only requires --capture-inference-fixture.")
+    repository_root = Path(__file__).resolve().parent
+    for option_name, path_value in (
+        ("--camera-profile", args.camera_profile),
+        ("--capture-inference-fixture", args.capture_inference_fixture),
+    ):
+        if not path_value:
+            continue
+        resolved_path = Path(path_value).expanduser().resolve()
+        if resolved_path == repository_root or repository_root in resolved_path.parents:
+            parser.error(f"{option_name} must point outside the Git repository.")
     if args.empty_road:
         if args.scenario_seed is None:
             args.scenario_seed = cfg.EMPTY_ROAD_SCENARIO_SEED
@@ -480,6 +528,7 @@ def main():
     print(f"CUDA linalg library: {args.cuda_linalg_library}")
     print(f"Trajectory samples per inference: {args.num_traj_samples}")
     print(f"Diffusion temperature: {args.diffusion_temperature:.2f}")
+    print(f"Camera alignment: {args.camera_alignment}")
     print("Auto respawn: ON after collisions")
     print(f"Runtime telemetry: {args.telemetry_jsonl or 'OFF'}")
     if args.max_episode_seconds is not None:
@@ -502,7 +551,32 @@ def main():
 
     model = None
     processor = None
-    carla_if = CARLAInterface()
+    carla_if = (
+        CARLAInterface()
+        if args.camera_alignment == "baseline"
+        else CARLAInterface(
+            camera_alignment=args.camera_alignment,
+            camera_profile=args.camera_profile or None,
+        )
+    )
+
+    def camera_alignment_metadata():
+        getter = getattr(carla_if, "get_camera_alignment_metadata", None)
+        if callable(getter):
+            return getter()
+        return {
+            "alignment_mode": args.camera_alignment,
+            "profile": None,
+            "source_fov_deg": {},
+            "output_projection_type": {},
+            "vehicle_dimension_relative_error": {},
+            "remap_valid_ratio": {},
+            "preprocessing_latency": {
+                "last_ms": 0.0,
+                "sample_count": 0,
+            },
+            "camera_model_validation_status": "legacy_interface",
+        }
     video_recorder = None
     pygame_ui = None
     pygame_ui_recorder = None
@@ -526,6 +600,8 @@ def main():
     worker_thread = None
     exact_observation_count = 0
     active_sync_request = None
+    fixture_capture_complete = False
+    captured_fixture_identity = None
     scenario_actor_census = None
     empty_road_preflight = None
     safety_policy = build_safety_policy()
@@ -603,7 +679,9 @@ def main():
 
         print("\nLoading model...")
         configure_cuda_linalg_library(args.cuda_linalg_library)
-        if not args.oom_free:
+        if args.capture_only:
+            print("Capture-only mode: model loading skipped.")
+        elif not args.oom_free:
             model, processor = load_model(
                 args.quantization,
                 device_map=args.device_map,
@@ -670,10 +748,21 @@ def main():
                     f"{empty_road_preflight.to_json_dict()}"
                 )
         carla_if.setup_cameras()
+        alignment_metadata = camera_alignment_metadata()
+        print(
+            "Camera model validation: "
+            f"{alignment_metadata['camera_model_validation_status']}"
+        )
+        if alignment_metadata["profile"] is not None:
+            print(f"Camera profile: {alignment_metadata['profile']}")
         carla_if.setup_collision_sensor()
+        if args.capture_inference_fixture:
+            # Capture must observe a stationary ego with a real, echoed brake
+            # command. The loop keeps this hold until all 16 history ticks exist.
+            carla_if.apply_control(0.0, 0.0, 1.0)
         time.sleep(1.0)
 
-        if args.oom_free:
+        if args.oom_free and not args.capture_only:
             from module.oom_offload import load_offloaded_model
 
             print("Loading model (OOM-free CPU<->GPU demand layering)...")
@@ -1313,6 +1402,10 @@ def main():
                 inference_pending=bool(pending_inference),
                 collision_count=carla_if.get_episode_collision_count(),
                 controller_debug=controller_debug,
+                camera_alignment_mode=args.camera_alignment,
+                camera_preprocessing_latency=camera_alignment_metadata()[
+                    "preprocessing_latency"
+                ],
             )
 
         def _normalize_control_command(value):
@@ -1663,8 +1756,8 @@ def main():
                 configure_cuda_linalg_library("magma")
                 return run_vqa(model, processor, model_data, question=question)
 
-        def _prepare_current_model_input():
-            """Build model input from the current complete temporal frame buffer."""
+        def _current_input_arrays():
+            """Build exact conditioned arrays from the current temporal buffer."""
 
             images_array = np.zeros(
                 (
@@ -1682,6 +1775,12 @@ def main():
                     images_array[camera_index, temporal_index] = frame_images[camera_index]
             history_xyz, history_rot = carla_if.get_history_in_local_frame()
             source_entry = frame_buffer[-1]
+            return images_array, history_xyz, history_rot, source_entry
+
+        def _prepare_current_model_input():
+            """Build model input from the current complete temporal frame buffer."""
+
+            images_array, history_xyz, history_rot, source_entry = _current_input_arrays()
             return (
                 prepare_model_input(
                     images_array,
@@ -1699,22 +1798,12 @@ def main():
 
             def _build_inference_request():
                 nonlocal request_sequence
-                images_array = np.zeros(
-                    (
-                        cfg.NUM_CAMERAS,
-                        cfg.NUM_FRAMES,
-                        cfg.IMG_HEIGHT,
-                        cfg.IMG_WIDTH,
-                        cfg.IMG_CHANNELS,
-                    ),
-                    dtype=np.uint8,
-                )
-                for t, frame_entry in enumerate(frame_buffer):
-                    frame_images = frame_entry["images"]
-                    for c in range(cfg.NUM_CAMERAS):
-                        images_array[c, t] = frame_images[c]
-                history_xyz, history_rot = carla_if.get_history_in_local_frame()
-                source_entry = frame_buffer[-1]
+                (
+                    images_array,
+                    history_xyz,
+                    history_rot,
+                    source_entry,
+                ) = _current_input_arrays()
                 request_sequence += 1
                 return {
                     "request_id": request_sequence,
@@ -1914,6 +2003,7 @@ def main():
             diffusion_temperature=args.diffusion_temperature,
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
+            camera_alignment=camera_alignment_metadata(),
             frame_id_quality=(
                 "exact_carla_snapshot"
                 if callable(getattr(carla_if, "get_synchronized_observation", None))
@@ -2115,10 +2205,114 @@ def main():
             if len(frame_buffer) > cfg.NUM_FRAMES:
                 frame_buffer.pop(0)
 
+            if (
+                args.capture_inference_fixture
+                and not fixture_capture_complete
+                and len(frame_buffer) >= cfg.NUM_FRAMES
+                and carla_if.has_complete_ego_history()
+            ):
+                applied_echo = carla_if.get_applied_control()
+                brake_is_held = (
+                    isinstance(applied_echo, dict)
+                    and float(applied_echo.get("echoed_brake", 0.0)) >= 0.99
+                    and float(applied_echo.get("echoed_throttle", 1.0)) <= 0.01
+                )
+                if not brake_is_held:
+                    carla_if.apply_control(0.0, 0.0, 1.0)
+                else:
+                    (
+                        fixture_images,
+                        fixture_history_xyz,
+                        fixture_history_rot,
+                        fixture_source,
+                    ) = _current_input_arrays()
+                    alignment_metadata = camera_alignment_metadata()
+                    profile_metadata = alignment_metadata.get("profile") or {}
+                    captured_fixture_identity = save_camera_fixture(
+                        args.capture_inference_fixture,
+                        images_array=fixture_images,
+                        history_xyz=fixture_history_xyz,
+                        history_rot=fixture_history_rot,
+                        camera_ids=fixture_source["camera_ids"],
+                        frame_ids=tuple(
+                            int(entry["frame_id"]) for entry in frame_buffer
+                        ),
+                        simulation_times_s=tuple(
+                            float(entry["simulation_time_s"])
+                            for entry in frame_buffer
+                        ),
+                        capture_pose_world=fixture_source["capture_pose_world"],
+                        metadata={
+                            "camera_alignment_mode": args.camera_alignment,
+                            "camera_profile_sha256": profile_metadata.get(
+                                "profile_sha256"
+                            ),
+                            "camera_profile_id": profile_metadata.get("profile_id"),
+                            "dataset_revision": profile_metadata.get(
+                                "dataset_revision"
+                            ),
+                            "navigation_text": (
+                                nav_state.navigation_text
+                                if args.mode == "navigation"
+                                else ""
+                            ),
+                            "navigation_weight": (
+                                nav_state.navigation_weight
+                                if args.mode == "navigation"
+                                else 1.0
+                            ),
+                            "map": cfg.CARLA_MAP,
+                            "spawn_index": args.ego_spawn_index,
+                            "scenario_seed": args.scenario_seed,
+                            "synthetic_scene": {
+                                "empty_road": bool(args.empty_road),
+                                "npc_vehicle_count": (
+                                    0
+                                    if args.empty_road
+                                    else cfg.NPC_VEHICLE_COUNT
+                                ),
+                                "npc_walker_count": (
+                                    0
+                                    if args.empty_road
+                                    else cfg.NPC_WALKER_COUNT
+                                ),
+                            },
+                        },
+                    )
+                    fixture_capture_complete = True
+                    emit_runtime_event(
+                        "camera_fixture_captured",
+                        fixture_id=captured_fixture_identity["fixture_id"],
+                        fixture_sha256=captured_fixture_identity[
+                            "fixture_sha256"
+                        ],
+                        camera_alignment_mode=args.camera_alignment,
+                        source_carla_frame_id=int(fixture_source["frame_id"]),
+                        source_simulation_time_s=float(
+                            fixture_source["simulation_time_s"]
+                        ),
+                        ego_history_real_tick_count=len(
+                            carla_if.history_buffer
+                        ),
+                        brake_echo=applied_echo,
+                    )
+                    print(
+                        "Frozen camera fixture captured: "
+                        f"id={captured_fixture_identity['fixture_id']} "
+                        f"sha256={captured_fixture_identity['fixture_sha256']}"
+                    )
+                    if args.capture_only:
+                        stop_reason = "capture_only_complete"
+                        break
+
+            camera_capture_gate_open = (
+                not args.capture_inference_fixture or fixture_capture_complete
+            )
             if args.async_mode:
                 if args.mode == "vqa":
                     should_submit_inference = (
                         len(frame_buffer) >= cfg.NUM_FRAMES
+                        and camera_capture_gate_open
                         and bool(nav_state.vqa_question)
                         and not pending_inference
                         and nav_state.revision != last_vqa_submitted_revision
@@ -2127,6 +2321,7 @@ def main():
                 else:
                     should_submit_inference = (
                         len(frame_buffer) >= cfg.NUM_FRAMES
+                        and camera_capture_gate_open
                         and not pending_inference
                         and (
                             last_inference_submit_simulation_time_s is None
@@ -2359,7 +2554,11 @@ def main():
                         - float(last_inference_submit_simulation_time_s)
                         >= inference_interval_sec
                     )
-                if len(frame_buffer) >= cfg.NUM_FRAMES and should_prepare_sync_input:
+                if (
+                    len(frame_buffer) >= cfg.NUM_FRAMES
+                    and camera_capture_gate_open
+                    and should_prepare_sync_input
+                ):
                     source_entry = frame_buffer[-1]
                     model_input_error = None
                     try:
@@ -2758,7 +2957,7 @@ def main():
                             observation.camera_extrinsics[1],
                             dtype=np.float64,
                         )
-                        camera_intrinsic = observation.camera_intrinsics[1]
+                        camera_intrinsic = observation.camera_output_models[1]
                     first_future_index = int(
                         np.searchsorted(
                             current_plan.waypoint_times_s,
@@ -2829,6 +3028,7 @@ def main():
                             else None
                         ),
                         last_safe_waypoint_index=relative_last_safe_index,
+                        camera_alignment_mode=args.camera_alignment,
                     )
                     latest_ui_frame = vis_frame
                     if cfg.SAVE_VIDEO:
@@ -3062,6 +3262,8 @@ def main():
             exact_source_frame_ids_available=exact_timing_available,
             exact_plan_age_available=False,
             camera_sync_stats=camera_sync_stats,
+            camera_alignment=camera_alignment_metadata(),
+            camera_fixture=captured_fixture_identity,
             respawn_count=int(respawn_count),
             episode_collision_count=carla_if.get_episode_collision_count(),
             telemetry_path=args.telemetry_jsonl,

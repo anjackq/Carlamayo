@@ -275,7 +275,8 @@ class SynchronizedObservation:
     ego_velocity_world: Any = field(repr=False, compare=False)
     camera_images: Any = field(repr=False, compare=False)
     camera_ids: tuple[int, ...]
-    camera_intrinsics: Any = field(repr=False, compare=False)
+    camera_source_intrinsics: Any = field(repr=False, compare=False)
+    camera_output_models: Any = field(repr=False, compare=False)
     camera_extrinsics: Any = field(repr=False, compare=False)
     ego_history: Any = field(repr=False, compare=False)
     ego_history_frame_ids: tuple[int, ...]
@@ -308,8 +309,10 @@ class SynchronizedObservation:
             raise ValueError("ego_velocity_world must not be None")
         if self.camera_images is None:
             raise ValueError("camera_images must not be None")
-        if self.camera_intrinsics is None:
-            raise ValueError("camera_intrinsics must not be None")
+        if self.camera_source_intrinsics is None:
+            raise ValueError("camera_source_intrinsics must not be None")
+        if self.camera_output_models is None:
+            raise ValueError("camera_output_models must not be None")
         if self.camera_extrinsics is None:
             raise ValueError("camera_extrinsics must not be None")
         if self.ego_history is None:
@@ -317,6 +320,9 @@ class SynchronizedObservation:
         camera_count = _payload_length(self.camera_images)
         if camera_count is not None and camera_count != len(self.camera_ids):
             raise ValueError("camera_images length must match camera_ids")
+        output_model_count = _payload_length(self.camera_output_models)
+        if output_model_count is not None and output_model_count != len(self.camera_ids):
+            raise ValueError("camera_output_models length must match camera_ids")
         history_count = _payload_length(self.ego_history)
         if history_count is not None and history_count != len(self.ego_history_frame_ids):
             raise ValueError("ego_history length must match ego_history_frame_ids")
@@ -338,11 +344,22 @@ class SynchronizedObservation:
             "ego_pose_world": summarize_payload(self.ego_pose_world),
             "ego_velocity_world": summarize_payload(self.ego_velocity_world),
             "camera_images": summarize_payload(self.camera_images),
-            "camera_intrinsics": summarize_payload(self.camera_intrinsics),
+            "camera_source_intrinsics": summarize_payload(self.camera_source_intrinsics),
+            "camera_output_models": summarize_payload(self.camera_output_models),
             "camera_extrinsics": summarize_payload(self.camera_extrinsics),
             "ego_history": summarize_payload(self.ego_history),
             "payloads_summarized": True,
         }
+
+    @property
+    def camera_intrinsics(self) -> Any:
+        """Deprecated alias for the source CARLA pinhole intrinsics.
+
+        These matrices do not describe images after an F-theta remap.  New
+        projection code must use ``camera_output_models``.
+        """
+
+        return self.camera_source_intrinsics
 
 
 @dataclass(frozen=True)

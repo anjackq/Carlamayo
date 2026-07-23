@@ -25,15 +25,26 @@ def project_world_points_to_camera(
 
     points = np.asarray(world_points, dtype=np.float64)
     camera_pose = np.asarray(camera_pose_world, dtype=np.float64)
-    intrinsic = np.asarray(camera_intrinsic, dtype=np.float64)
+    projection_model = (
+        camera_intrinsic
+        if callable(getattr(camera_intrinsic, "ray_to_pixel", None))
+        else None
+    )
+    intrinsic = (
+        None
+        if projection_model is not None
+        else np.asarray(camera_intrinsic, dtype=np.float64)
+    )
     if points.ndim != 2 or points.shape[1] < 3:
         raise ValueError(f"world_points must have shape (N, >=3), got {points.shape}")
-    if camera_pose.shape != (4, 4) or intrinsic.shape != (3, 3):
-        raise ValueError("camera pose and intrinsic matrices must be 4x4 and 3x3")
+    if camera_pose.shape != (4, 4):
+        raise ValueError("camera pose matrix must be 4x4")
+    if projection_model is None and intrinsic.shape != (3, 3):
+        raise ValueError("camera intrinsic matrix must be 3x3")
     if not (
         np.isfinite(points[:, :3]).all()
         and np.isfinite(camera_pose).all()
-        and np.isfinite(intrinsic).all()
+        and (projection_model is not None or np.isfinite(intrinsic).all())
     ):
         raise ValueError("projection inputs must be finite")
 
@@ -42,15 +53,25 @@ def project_world_points_to_camera(
     depth = camera_points[:, 0]
     valid = depth > float(minimum_depth_m)
     pixels = np.full((len(points), 2), np.nan, dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pixels[valid, 0] = (
-            intrinsic[0, 0] * camera_points[valid, 1] / depth[valid]
-            + intrinsic[0, 2]
+    if projection_model is not None:
+        # CARLA camera x-forward/y-right/z-up -> OpenCV
+        # x-right/y-down/z-forward.
+        optical_rays = np.column_stack(
+            [camera_points[:, 1], -camera_points[:, 2], camera_points[:, 0]]
         )
-        pixels[valid, 1] = (
-            intrinsic[1, 2]
-            - intrinsic[1, 1] * camera_points[valid, 2] / depth[valid]
-        )
+        projected, projection_valid = projection_model.ray_to_pixel(optical_rays)
+        pixels[:] = projected
+        valid &= np.asarray(projection_valid, dtype=bool)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pixels[valid, 0] = (
+                intrinsic[0, 0] * camera_points[valid, 1] / depth[valid]
+                + intrinsic[0, 2]
+            )
+            pixels[valid, 1] = (
+                intrinsic[1, 2]
+                - intrinsic[1, 1] * camera_points[valid, 2] / depth[valid]
+            )
     valid &= np.isfinite(pixels).all(axis=1)
     return pixels, valid
 
@@ -236,6 +257,7 @@ def create_visualization_frame(
     full_path_road_status=None,
     road_speed_cap_mps=None,
     last_safe_waypoint_index=None,
+    camera_alignment_mode="baseline",
 ):
     """Create a single visualization frame with all overlays."""
     if (
@@ -259,9 +281,20 @@ def create_visualization_frame(
     cv2.rectangle(overlay, (10, h - 190), (w - 10, h - 10), (0, 0, 0), -1)
     vis_img = cv2.addWeighted(overlay, 0.6, vis_img, 0.4, 0)
 
+    alignment_labels = {
+        "baseline": "BASELINE PINHOLE",
+        "pose-only": "POSE ONLY",
+        "projection-only": "FTHETA ONLY",
+        "pose-projection": "POSE + FTHETA",
+    }
+    camera_input_label = alignment_labels.get(
+        camera_alignment_mode,
+        str(camera_alignment_mode).upper(),
+    )
     info_text = (
         f"Frame: {frame_count} | Inference: {inference_time:.2f}s | "
-        f"Speed: {speed_kmh:.1f} km/h | Steer: {steering:.2f}"
+        f"Speed: {speed_kmh:.1f} km/h | Steer: {steering:.2f} | "
+        f"CAMERA INPUT: {camera_input_label}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 1.0

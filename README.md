@@ -42,6 +42,7 @@ The closed-loop runner supports `normal`, `navigation`, and `vqa` modes through
 `--mode`. See the mode-specific usage guides:
 
 - [Navigation Mode](docs/navigation-mode.md)
+- [Camera Geometry Alignment](docs/camera-alignment.md)
 - [VQA Mode](docs/vqa-mode.md)
 
 ### Current Safe Closed-Loop Baseline
