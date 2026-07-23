@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 
 from module import carla_safety_adapter
-from module.carla_safety_adapter import CarlaGroundTruthSafetyAdapter
+from module.carla_safety_adapter import (
+    CarlaGroundTruthSafetyAdapter,
+    PlanAdmissionStatus,
+    decide_plan_admission,
+)
 from module.safety_shield import AssessmentStatus, EgoKinematics
 
 
@@ -187,9 +191,18 @@ def _adapter(carla_map, *, actors=(), ego_bounding_box=None):
     return CarlaGroundTruthSafetyAdapter(world, ego), world, ego
 
 
-def _tick_context(ego, *, frame=50, simulation_time_s=5.0, actor_snapshots=None):
-    ego_transform = FakeTransform()
-    ego_velocity = FakeVector()
+def _tick_context(
+    ego,
+    *,
+    frame=50,
+    simulation_time_s=5.0,
+    ego_x=0.0,
+    ego_y=0.0,
+    speed_x=0.0,
+    actor_snapshots=None,
+):
+    ego_transform = FakeTransform(x=ego_x, y=ego_y)
+    ego_velocity = FakeVector(x=speed_x)
     snapshots = {
         ego.id: FakeActorSnapshot(ego_transform, ego_velocity),
         **(actor_snapshots or {}),
@@ -214,6 +227,16 @@ def _plan(*, plan_id="plan-1", start_time_s=5.0):
             [start_time_s + 0.1, start_time_s + 0.2, start_time_s + 0.3],
             dtype=np.float64,
         ),
+    )
+
+
+def _long_plan(*, plan_id="long-plan", start_time_s=5.0, step_m=0.1):
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = step_m * np.arange(1, 65)
+    return types.SimpleNamespace(
+        plan_id=plan_id,
+        world_points=points,
+        waypoint_times_s=start_time_s + np.arange(1, 65, dtype=np.float64) * 0.1,
     )
 
 
@@ -473,3 +496,123 @@ def test_missing_actor_snapshot_makes_obstacle_assessment_unknown(driving_lane_t
     assert assessment.road.status is AssessmentStatus.SAFE
     assert assessment.obstacles.status is AssessmentStatus.UNKNOWN
     assert "obstacle_data_unavailable" in assessment.obstacles.reason_codes
+
+
+def test_far_future_road_violation_is_safe_prefix_not_immediate_override(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 4.5:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    context = _tick_context(ego, simulation_time_s=5.0)
+
+    assessment = adapter.assess(tick_context=context, plan=_long_plan())
+    envelope = assessment.road_envelope
+
+    assert assessment.road.status is AssessmentStatus.SAFE
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.time_to_first_bad_s > 4.0
+    assert envelope.distance_to_first_bad_m > 3.0
+    assert envelope.target_speed_cap_mps > 0.0
+    assert envelope.emergency_required is False
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.ACCEPT_SAFE_PREFIX
+    )
+
+
+def test_near_term_unsafe_candidate_retains_executable_active_plan(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 1.7:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    context = _tick_context(ego, simulation_time_s=5.0)
+    candidate = adapter.assess_plan_road(
+        tick_context=context,
+        plan=_long_plan(plan_id="candidate"),
+    )
+    safe_adapter, _, safe_ego = _adapter(RecordingMap())
+    active = safe_adapter.assess_plan_road(
+        tick_context=_tick_context(safe_ego, simulation_time_s=5.0),
+        plan=_long_plan(plan_id="active"),
+    )
+
+    assert candidate.near_term_path_road.status is AssessmentStatus.UNSAFE
+    assert (
+        decide_plan_admission(candidate, active)
+        is PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+    )
+    assert (
+        decide_plan_admission(candidate)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_stopping_envelope_escalates_only_when_current_speed_exceeds_cap(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 4.5:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    plan = _long_plan()
+    stopped = adapter.assess(
+        tick_context=_tick_context(ego, simulation_time_s=5.0, speed_x=0.0),
+        plan=plan,
+    )
+    fast = adapter.assess(
+        tick_context=_tick_context(ego, simulation_time_s=5.0, speed_x=5.0),
+        plan=plan,
+    )
+
+    assert stopped.road.status is AssessmentStatus.SAFE
+    assert stopped.road_envelope.emergency_required is False
+    assert fast.road_envelope.emergency_required is True
+    assert fast.road.status is AssessmentStatus.UNSAFE
+    assert "road_stopping_envelope_exhausted" in fast.road.reason_codes
+
+
+def test_current_ego_off_lane_remains_an_immediate_fail_closed_trigger(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(RecordingMap())
+
+    assessment = adapter.assess(
+        tick_context=_tick_context(ego, simulation_time_s=5.0, ego_y=3.0),
+        plan=_long_plan(),
+    )
+
+    assert assessment.road_envelope.current_ego_road.status is AssessmentStatus.UNSAFE
+    assert assessment.road.status is AssessmentStatus.UNSAFE
+
+
+def test_timed_profile_cache_reuses_map_queries_and_slices_elapsed_prefix(
+    driving_lane_type,
+):
+    carla_map = RecordingMap()
+    adapter, _, ego = _adapter(carla_map)
+    plan = _long_plan()
+
+    first = adapter.assess_plan_road(
+        tick_context=_tick_context(ego, simulation_time_s=5.0),
+        plan=plan,
+    )
+    calls_after_first = len(carla_map.calls)
+    second = adapter.assess_plan_road(
+        tick_context=_tick_context(ego, simulation_time_s=6.0),
+        plan=plan,
+    )
+
+    assert len(carla_map.calls) == calls_after_first + 5
+    assert second.full_path_road.sample_count < first.full_path_road.sample_count

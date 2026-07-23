@@ -90,6 +90,10 @@ NPC_WALKER_COUNT = 50
 # safety/controller changes can be compared against the same initial scene.
 EMPTY_ROAD_EGO_SPAWN_INDEX = 0
 EMPTY_ROAD_SCENARIO_SEED = 0
+EMPTY_ROAD_NAVIGATION_TEXT = (
+    "Continue in the current lane and follow its natural curvature; "
+    "do not change lanes."
+)
 MAX_SCENARIO_SEED = 2**32 - 1
 NPC_EXCLUDED_VEHICLE_KEYWORDS = (
     "ambulance",
@@ -150,6 +154,18 @@ SAFETY_PREDICTION_HORIZON_S = 3.0
 SAFETY_PREDICTION_TIME_STEP_S = 0.1
 SAFETY_EMERGENCY_HOLD_TICKS = 5
 SAFETY_CLEAR_TICKS_TO_RELEASE = 3
+# A newly generated plan must expose at least this much exact-map-safe future
+# before it may replace the active plan.  Later violations remain advisory and
+# constrain controller speed/target selection instead of immediately latching
+# the stop-only emergency shield.
+SAFETY_EXECUTION_HORIZON_S = 1.5
+# Avoid turning tiny floating-point differences at the stopping-envelope
+# boundary into an emergency brake.
+SAFETY_SPEED_CAP_EPSILON_MPS = 0.1
+# Road profiles are immutable per fixed-world plan.  Keep a small bounded cache
+# so candidate admission can reuse the same exact CARLA map queries at control
+# time without growing for the whole episode.
+SAFETY_ROAD_PROFILE_CACHE_SIZE = 8
 
 # Auto-respawn after collision.
 RESPAWN_COLLISION_COOLDOWN_FRAMES = 10
@@ -171,6 +187,20 @@ PID_STOP_SPEED_THRESHOLD_MPS = 0.3
 PID_STOP_POSITION_TOLERANCE_M = 0.5
 PID_COMFORTABLE_DECEL_MPS2 = 2.5
 PID_DECELERATION_STATE_DELTA_MPS = 0.25
+
+# Launch policy: break the receding-horizon launch deadlock.  A stopped ego
+# tracking a freshly anchored moving plan reads its target speed from the plan's
+# near-zero stationary prefix, and the ~1 s proposal cadence resets that prefix
+# before CARLA's automatic gearbox engages first gear -- so the vehicle never
+# pulls away.  When the ego is still below the engaged speed AND the plan itself
+# intends real forward motion over the near horizon, command at least a bounded
+# launch speed.  The floor keys off the ego's actual speed (not plan age), so a
+# new proposal every cycle can no longer reset an in-progress launch, and it is
+# capped by the plan's own intended peak so genuine stop/creep plans are exempt.
+PID_LAUNCH_ENGAGE_SPEED_MPS = 2.0  # below this actual speed the launch floor may apply
+PID_LAUNCH_SPEED_MPS = 2.5  # upper bound on the launch-floor target speed
+PID_LAUNCH_MIN_INTENT_MPS = 0.5  # plan must intend at least this near-horizon speed
+PID_LAUNCH_HORIZON_S = 1.5  # near-horizon window used to judge plan launch intent
 PID_LAT_KP = 1.1
 PID_LAT_KI = 0.02
 PID_LAT_KD = 0.15

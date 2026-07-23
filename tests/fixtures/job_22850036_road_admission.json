@@ -1,0 +1,66 @@
+{
+  "source_job_id": 22850036,
+  "source_runtime": "runtime.jsonl",
+  "scenario": {
+    "map": "Town03",
+    "ego_spawn_index": 0,
+    "scenario_seed": 0,
+    "npc_vehicle_count": 0,
+    "npc_walker_count": 0
+  },
+  "policy": {
+    "execution_horizon_s": 1.5,
+    "reaction_time_s": 0.5,
+    "assumed_deceleration_mps2": 4.0,
+    "stop_buffer_m": 2.0
+  },
+  "proposals": [
+    {
+      "proposal_number": 2,
+      "coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4",
+      "time_to_first_bad_s": 5.4,
+      "distance_to_first_bad_m": 38.94,
+      "min_margin_m": -1.154,
+      "reasoning_summary": "right curve",
+      "expected_admission": "ACCEPT_SAFE_PREFIX"
+    },
+    {
+      "proposal_number": 3,
+      "coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4",
+      "time_to_first_bad_s": 5.5,
+      "distance_to_first_bad_m": 20.72,
+      "min_margin_m": -0.294,
+      "reasoning_summary": "right curve",
+      "expected_admission": "ACCEPT_SAFE_PREFIX"
+    },
+    {
+      "proposal_number": 7,
+      "coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4",
+      "time_to_first_bad_s": 5.9,
+      "distance_to_first_bad_m": 46.03,
+      "min_margin_m": -0.011,
+      "reasoning_summary": "right curve",
+      "expected_admission": "ACCEPT_SAFE_PREFIX"
+    },
+    {
+      "proposal_number": 12,
+      "coc_sha256": "32b5bb25f2a97835aa6ee86d30b2755d3e8abe7f0e7ab7af7d16646355bb2304",
+      "time_to_first_bad_s": 4.2,
+      "distance_to_first_bad_m": 2.82,
+      "min_margin_m": -1.982,
+      "reasoning_summary": "keep lane",
+      "expected_admission": "ACCEPT_SAFE_PREFIX",
+      "expected_low_speed_cap": true
+    },
+    {
+      "proposal_number": 16,
+      "coc_sha256": "1edab8c5785d9352c439e7691aa9d44e619afe5a199f4b306290002f16fe983c",
+      "time_to_first_bad_s": 4.9,
+      "distance_to_first_bad_m": 43.91,
+      "min_margin_m": -0.082,
+      "reasoning_summary": "change to clear right lane",
+      "expected_admission": "ACCEPT_SAFE_PREFIX",
+      "known_conflict": "right side is a CARLA Shoulder lane"
+    }
+  ]
+}
