@@ -55,10 +55,31 @@ Then press `Enter`.
 Examples:
 
 ```text
-Turn right at the next intersection | 1.0
-Stay in the left lane | 1.0
-Prepare to stop at the traffic light | 1.0
+Turn right in 30m | 1.0
+Turn left onto Main Street in 40m | 1.0
+Continue straight for 50m | 1.0
+At the roundabout in 20m, take the first exit to the right | 1.0
 ```
+
+Prefer a concise route maneuver plus distance. Alpamayo 1.5 was demonstrated
+with instructions such as `Turn right in 30m`; long behavioral-policy prompts
+such as `never change lanes and obey every lane boundary` are not hard
+constraints and should be enforced by route, controller, and safety layers.
+
+The pretrained interface accepts navigation text between Alpamayo's route
+tokens. It does not accept a CARLA/OpenDRIVE map tensor or waypoint polyline
+directly. The intended CarlaMayo integration is therefore:
+
+```text
+CARLA GlobalRoutePlanner / OpenDRIVE route
+                  -> next maneuver + distance
+                  -> concise Alpamayo navigation text
+                  -> trajectory candidates
+```
+
+Structured map conditioning or a BEV map image would require a separately
+trained adapter/fine-tune; simply appending a long map dump to the navigation
+text is outside the released model's tested input contract.
 
 ## UI Controls
 
@@ -78,6 +99,13 @@ python carlamayo_closed_loop.py --mode navigation --pygame-ui --quantization
 
 # Exact returned-logits baseline for debugging memory changes.
 python carlamayo_closed_loop.py --mode navigation --pygame-ui --keep-generate-logits
+
+# Generate and audit three CoC/trajectory candidates per inference.
+python carlamayo_closed_loop.py --mode navigation --num-traj-samples 3
+
+# Lower-diversity diffusion diagnostic used by the Alpamayo navigation notebook.
+python carlamayo_closed_loop.py --mode navigation \
+  --num-traj-samples 3 --diffusion-temperature 0.6
 
 ```
 

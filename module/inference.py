@@ -219,6 +219,8 @@ def run_inference(
     data,
     navigation_text: str | None = None,
     navigation_weight: float = 1.0,
+    num_traj_samples: int | None = None,
+    diffusion_temperature: float = 1.0,
     vlm_generate_timing: VlmGenerateTiming | None = None,
     disable_unused_generate_logits: bool = True,
     vlm_image_pixels: int | None = None,
@@ -232,6 +234,16 @@ def run_inference(
     nav_text = navigation_text.strip() if isinstance(navigation_text, str) else ""
     if not math.isfinite(float(navigation_weight)) or float(navigation_weight) < 0:
         raise ValueError("navigation_weight must be a non-negative finite number")
+    if num_traj_samples is None:
+        num_traj_samples = cfg.NUM_TRAJ_SAMPLES
+    if isinstance(num_traj_samples, bool) or int(num_traj_samples) != num_traj_samples:
+        raise ValueError("num_traj_samples must be a positive integer")
+    num_traj_samples = int(num_traj_samples)
+    if num_traj_samples <= 0:
+        raise ValueError("num_traj_samples must be a positive integer")
+    diffusion_temperature = float(diffusion_temperature)
+    if not math.isfinite(diffusion_temperature) or diffusion_temperature <= 0.0:
+        raise ValueError("diffusion_temperature must be finite and greater than zero")
 
     messages = helper.create_message(
         data["image_frames"].flatten(0, 1),
@@ -264,7 +276,10 @@ def run_inference(
     }
     model_inputs = helper.to_device(model_inputs, "cuda")
 
-    diffusion_kwargs = {"inference_step": 10}
+    diffusion_kwargs = {
+        "inference_step": 10,
+        "temperature": diffusion_temperature,
+    }
     inference_fn = model.sample_trajectories_from_data_with_vlm_rollout
     use_cfg_nav = False
     if nav_text and not math.isclose(float(navigation_weight), 1.0):
@@ -291,7 +306,7 @@ def run_inference(
             data=model_inputs,
             top_p=0.98,
             temperature=0.6,
-            num_traj_samples=cfg.NUM_TRAJ_SAMPLES,
+            num_traj_samples=num_traj_samples,
             diffusion_kwargs=diffusion_kwargs,
             max_generation_length=256,
             return_extra=True,
@@ -441,6 +456,20 @@ def extract_cot_text(extra, candidate_index=0):
         candidate_index=candidate_index,
         preserve_whitespace=True,
     )
+
+
+def extract_cot_texts(extra, candidate_count):
+    """Return the CoT associated with every generated trajectory candidate."""
+
+    if isinstance(candidate_count, bool) or int(candidate_count) != candidate_count:
+        raise ValueError("candidate_count must be a non-negative integer")
+    candidate_count = int(candidate_count)
+    if candidate_count < 0:
+        raise ValueError("candidate_count must be a non-negative integer")
+    return [
+        extract_cot_text(extra, candidate_index=candidate_index)
+        for candidate_index in range(candidate_count)
+    ]
 
 
 def extract_answer_text(extra):

@@ -139,8 +139,9 @@ driving stack. In particular:
   generation;
 - traffic lights, stop signs, right-of-way, and other traffic rules are not
   handled as driving policy;
-- `NUM_TRAJ_SAMPLES` is currently `1`, so multi-candidate safety ranking and
-  rerouting around hazards are not implemented;
+- the default remains one trajectory sample. `--num-traj-samples 3` enables a
+  diagnostic that records all three CoCs and trajectories, but selection is
+  continuity-based and is not yet full multi-candidate safety ranking;
 - the safety shield is a privileged CARLA-ground-truth integration layer, not an
   onboard perception system or evidence that Alpamayo itself made a safe choice;
 - the current video/Pygame overlay labels `ALPAMAYO PROPOSAL`,

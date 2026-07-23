@@ -117,6 +117,16 @@ def test_extract_cot_text_selects_matching_candidate_without_normalizing_text():
     assert inference.extract_cot_text(extra, candidate_index=1) == " second\n"
 
 
+def test_extract_cot_texts_preserves_candidate_alignment():
+    extra = {"cot": np.array([[[" first ", " second\n", " third "]]], dtype=object)}
+
+    assert inference.extract_cot_texts(extra, candidate_count=3) == [
+        " first ",
+        " second\n",
+        " third ",
+    ]
+
+
 def test_extract_answer_text_removes_special_tokens_and_terminators():
     extra = {
         "answer": np.array(

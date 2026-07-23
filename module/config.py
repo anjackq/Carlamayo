@@ -91,8 +91,7 @@ NPC_WALKER_COUNT = 50
 EMPTY_ROAD_EGO_SPAWN_INDEX = 0
 EMPTY_ROAD_SCENARIO_SEED = 0
 EMPTY_ROAD_NAVIGATION_TEXT = (
-    "Continue in the current lane and follow its natural curvature; "
-    "do not change lanes."
+    "At the roundabout in 20m, take the first exit to the right."
 )
 MAX_SCENARIO_SEED = 2**32 - 1
 NPC_EXCLUDED_VEHICLE_KEYWORDS = (

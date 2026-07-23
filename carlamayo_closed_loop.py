@@ -47,6 +47,7 @@ from module.inference import (
     configure_cuda_linalg_library,
     extract_answer_text,
     extract_cot_text,
+    extract_cot_texts,
     extract_trajectory_samples,
     load_model,
     prepare_model_input,
@@ -359,6 +360,24 @@ def parse_args(argv=None):
         help="Navigation CFG weight. 1.0 uses normal nav conditioning; other values use CFG nav.",
     )
     parser.add_argument(
+        "--num-traj-samples",
+        type=int,
+        default=cfg.NUM_TRAJ_SAMPLES,
+        help=(
+            "Number of Alpamayo CoC/trajectory samples generated per inference. "
+            f"Default: {cfg.NUM_TRAJ_SAMPLES}; use 3 for the multi-sample diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Initial diffusion-noise temperature. Default: 1.0; Alpamayo's "
+            "navigation notebook uses 0.6 as a lower-diversity diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--vqa-question",
         default="",
         help='Initial VQA question for --mode vqa, e.g. "Describe the scene.".',
@@ -419,6 +438,10 @@ def parse_args(argv=None):
         parser.error(f"--scenario-seed must be within [0, {cfg.MAX_SCENARIO_SEED}].")
     if args.ego_spawn_index is not None and args.ego_spawn_index < 0:
         parser.error("--ego-spawn-index must be nonnegative.")
+    if args.num_traj_samples < 1 or args.num_traj_samples > 16:
+        parser.error("--num-traj-samples must be within [1, 16].")
+    if not math.isfinite(args.diffusion_temperature) or args.diffusion_temperature <= 0.0:
+        parser.error("--diffusion-temperature must be finite and greater than zero.")
     if args.empty_road:
         if args.scenario_seed is None:
             args.scenario_seed = cfg.EMPTY_ROAD_SCENARIO_SEED
@@ -455,6 +478,8 @@ def main():
     )
     print(f"Device map: {args.device_map}")
     print(f"CUDA linalg library: {args.cuda_linalg_library}")
+    print(f"Trajectory samples per inference: {args.num_traj_samples}")
+    print(f"Diffusion temperature: {args.diffusion_temperature:.2f}")
     print("Auto respawn: ON after collisions")
     print(f"Runtime telemetry: {args.telemetry_jsonl or 'OFF'}")
     if args.max_episode_seconds is not None:
@@ -902,10 +927,12 @@ def main():
                     **audit,
                 )
                 raise TrajectoryValidationError(f"trajectory_extraction_error:{exc}") from exc
-            cot_text = extract_cot_text(
+            candidate_cot_texts = extract_cot_texts(
                 result.get("extra"),
-                candidate_index=int(selected_idx),
+                candidate_count=len(traj_samples),
             )
+            candidate_coc_audits = [coc_audit_fields(text) for text in candidate_cot_texts]
+            cot_text = candidate_cot_texts[int(selected_idx)]
             audit = coc_audit_fields(cot_text)
             result["coc_sha256"] = audit["coc_sha256"]
             emit_runtime_event(
@@ -927,6 +954,10 @@ def main():
                     None if value is None else float(value) for value in similarity_scores
                 ],
                 candidate_trajectories_model=np.asarray(traj_samples, dtype=np.float64),
+                candidate_coc_texts_full=candidate_cot_texts,
+                candidate_coc_sha256=[
+                    candidate_audit["coc_sha256"] for candidate_audit in candidate_coc_audits
+                ],
                 model_inference_latency_s=float(model_inference_latency_s),
                 **audit,
             )
@@ -1585,6 +1616,8 @@ def main():
                     model_data,
                     navigation_text=navigation_text,
                     navigation_weight=weight,
+                    num_traj_samples=args.num_traj_samples,
+                    diffusion_temperature=args.diffusion_temperature,
                     vlm_generate_timing=vlm_generate_timing,
                     disable_unused_generate_logits=args.disable_unused_generate_logits,
                     vlm_image_pixels=cfg.VLM_IMAGE_PIXELS,
@@ -1877,6 +1910,10 @@ def main():
                 else None
             ),
             execution="async" if args.async_mode else "sync",
+            num_traj_samples=args.num_traj_samples,
+            diffusion_temperature=args.diffusion_temperature,
+            navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
+            navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
             frame_id_quality=(
                 "exact_carla_snapshot"
                 if callable(getattr(carla_if, "get_synchronized_observation", None))
@@ -2282,7 +2319,7 @@ def main():
                                     print(
                                         f"    Selected traj sample: "
                                         f"{current_selected_traj_idx}/"
-                                        f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                                        f"{args.num_traj_samples - 1}"
                                     )
                                     print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
                         else:
@@ -2564,7 +2601,7 @@ def main():
                                     )
                                 print(
                                     f"    Selected traj sample: {current_selected_traj_idx}/"
-                                    f"{cfg.NUM_TRAJ_SAMPLES - 1}"
+                                    f"{args.num_traj_samples - 1}"
                                 )
                                 print(f"    Traj[0:3]: {current_trajectory[:3, :2]}")
                                 _emit_sync_terminal(
