@@ -41,6 +41,7 @@ class PlanHandoffStatus(str, Enum):
     ACTIVATE_FRESH = "ACTIVATE_FRESH"
     ACTIVATE_RETENTION_DEADLINE = "ACTIVATE_RETENTION_DEADLINE"
     RETAIN_ACTIVE_STOPPING_RESERVE = "RETAIN_ACTIVE_STOPPING_RESERVE"
+    RETAIN_ACTIVE_SAFETY_TIER = "RETAIN_ACTIVE_SAFETY_TIER"
     RETAIN_ACTIVE_SAFETY_HEADROOM = "RETAIN_ACTIVE_SAFETY_HEADROOM"
     RETAIN_ACTIVE_MOTION_QUALITY = "RETAIN_ACTIVE_MOTION_QUALITY"
     NO_EXECUTABLE_PLAN = "NO_EXECUTABLE_PLAN"
@@ -228,6 +229,13 @@ def decide_plan_handoff(
             status=PlanHandoffStatus.RETAIN_ACTIVE_STOPPING_RESERVE,
             activate_candidate=False,
             reason="active_plan_has_guarded_stopping_reserve",
+            **common,
+        )
+    if candidate_safety > active_safety:
+        return PlanHandoffDecision(
+            status=PlanHandoffStatus.RETAIN_ACTIVE_SAFETY_TIER,
+            activate_candidate=False,
+            reason="candidate_safety_tier_worse_than_active",
             **common,
         )
     if (

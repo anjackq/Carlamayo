@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "fixture_id": "job_22863115_tick84_safety_tier_handoff",
+  "source_job_id": "22863115",
+  "source_loop_tick_id": 84,
+  "active": {
+    "plan_id": "proposal-6/candidate-0",
+    "admission_status": "ACCEPT_FULLY_SAFE",
+    "reserve_status": "UNBOUNDED",
+    "motion_class": "MOVING",
+    "remaining_horizon_s": 3.399999955296515,
+    "near_term_margin_m": 0.21106970186356233,
+    "distance_to_first_bad_m": null,
+    "time_to_first_bad_s": null
+  },
+  "candidate": {
+    "plan_id": "proposal-9/candidate-1",
+    "admission_status": "ACCEPT_SAFE_PREFIX",
+    "reserve_status": "ROBUST",
+    "motion_class": "MOVING",
+    "near_term_margin_m": 0.019864443360035455,
+    "distance_to_first_bad_m": 32.733846999712256,
+    "time_to_first_bad_s": 3.75,
+    "explicit_stop": false
+  },
+  "expected": {
+    "status": "RETAIN_ACTIVE_SAFETY_TIER",
+    "activate_candidate": false
+  }
+}

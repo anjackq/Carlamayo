@@ -1,6 +1,15 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from module.plan_handoff import PlanHandoffStatus, decide_plan_handoff
+
+HANDOFF_SAFETY_TIER_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "job_22863115_handoff_safety_tier.json"
+)
 
 
 def _decision(**overrides):
@@ -84,16 +93,34 @@ def test_missing_safe_prefix_headroom_boundedly_retains_active_plan():
     assert decision.reason == "safe_prefix_headroom_unavailable"
 
 
-def test_robust_safe_prefix_can_refresh_fully_safe_active_plan():
+def test_robust_safe_prefix_cannot_downgrade_fully_safe_active_plan():
+    replay = json.loads(
+        HANDOFF_SAFETY_TIER_FIXTURE.read_text(encoding="utf-8")
+    )
+    active = replay["active"]
+    candidate = replay["candidate"]
     decision = _decision(
-        candidate_admission_status="ACCEPT_SAFE_PREFIX",
-        active_admission_status="ACCEPT_FULLY_SAFE",
-        active_reserve_status="UNBOUNDED",
-        active_distance_to_first_bad_m=None,
-        active_time_to_first_bad_s=None,
+        candidate_plan_id=candidate["plan_id"],
+        candidate_admission_status=candidate["admission_status"],
+        candidate_motion_class=candidate["motion_class"],
+        candidate_reserve_status=candidate["reserve_status"],
+        candidate_distance_to_first_bad_m=(
+            candidate["distance_to_first_bad_m"]
+        ),
+        candidate_time_to_first_bad_s=candidate["time_to_first_bad_s"],
+        candidate_explicit_stop=candidate["explicit_stop"],
+        active_plan_id=active["plan_id"],
+        active_admission_status=active["admission_status"],
+        active_motion_class=active["motion_class"],
+        active_reserve_status=active["reserve_status"],
+        active_distance_to_first_bad_m=active["distance_to_first_bad_m"],
+        active_time_to_first_bad_s=active["time_to_first_bad_s"],
+        active_remaining_horizon_s=active["remaining_horizon_s"],
     )
 
-    assert decision.status is PlanHandoffStatus.ACTIVATE_FRESH
+    assert decision.status.value == replay["expected"]["status"]
+    assert decision.activate_candidate is replay["expected"]["activate_candidate"]
+    assert decision.reason == "candidate_safety_tier_worse_than_active"
 
 
 def test_empty_road_worse_motion_is_boundedly_retained():
@@ -115,6 +142,21 @@ def test_normal_traffic_does_not_apply_motion_retention():
     assert decision.status is PlanHandoffStatus.ACTIVATE_FRESH
 
 
+def test_normal_traffic_still_prevents_safety_tier_downgrade():
+    decision = _decision(
+        candidate_admission_status="ACCEPT_SAFE_PREFIX",
+        candidate_reserve_status="ROBUST",
+        active_admission_status="ACCEPT_FULLY_SAFE",
+        active_reserve_status="UNBOUNDED",
+        active_distance_to_first_bad_m=None,
+        active_time_to_first_bad_s=None,
+        verified_empty_road=False,
+    )
+
+    assert decision.status is PlanHandoffStatus.RETAIN_ACTIVE_SAFETY_TIER
+    assert decision.retain_active is True
+
+
 @pytest.mark.parametrize("remaining_horizon", [3.0, 2.9])
 def test_retention_deadline_forces_handoff(remaining_horizon):
     decision = _decision(
@@ -133,6 +175,21 @@ def test_retention_deadline_overrides_safety_headroom_regression():
         candidate_time_to_first_bad_s=2.0,
         active_distance_to_first_bad_m=20.0,
         active_time_to_first_bad_s=5.0,
+        active_remaining_horizon_s=3.0,
+    )
+
+    assert decision.status is PlanHandoffStatus.ACTIVATE_RETENTION_DEADLINE
+    assert decision.activate_candidate is True
+
+
+def test_retention_deadline_overrides_safety_tier_downgrade():
+    decision = _decision(
+        candidate_admission_status="ACCEPT_SAFE_PREFIX",
+        candidate_reserve_status="ROBUST",
+        active_admission_status="ACCEPT_FULLY_SAFE",
+        active_reserve_status="UNBOUNDED",
+        active_distance_to_first_bad_m=None,
+        active_time_to_first_bad_s=None,
         active_remaining_horizon_s=3.0,
     )
 
