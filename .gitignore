@@ -181,6 +181,8 @@ carlamayo_runtime*.jsonl
 *.camera-fixture.npz
 camera_profiles/
 camera_fixtures/
+camera-comparisons/
+camera_comparisons/
 *.safetensors
 *.ckpt
 *.pt

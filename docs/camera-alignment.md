@@ -87,6 +87,35 @@ only synthetic CARLA pixels, ego history, frame/timestamp identity, navigation
 text, scene metadata, and profile/fixture hashes. They do not contain gated
 PhysicalAI frames or calibration coefficients.
 
+## Build a private visual comparison
+
+The comparison generator reads authorized PhysicalAI camera frames and the
+three CARLA fixtures needed to separate pose from projection changes. The
+output contains gated images and exact mounting translations, so the script
+rejects output directories inside the repository and writes owner-only files:
+
+```bash
+python scripts/build_private_camera_comparison.py \
+  --clip-id 030c760c-ae38-49aa-9ad8-f5650a545d26 \
+  --camera-profile \
+    ~/.cache/carlamayo/camera-profiles/hyperion8-example.json \
+  --physical-t0-us 5100000 10100000 15100000 \
+  --fixture \
+    baseline=~/.cache/carlamayo/camera-fixtures/baseline-seed0.npz \
+  --fixture \
+    projection-only=~/.cache/carlamayo/camera-fixtures/projection-only-seed0.npz \
+  --fixture \
+    pose-projection=~/.cache/carlamayo/camera-fixtures/pose-projection-seed0.npz \
+  --output-dir ~/.cache/carlamayo/camera-comparisons/example
+```
+
+The output includes one high-resolution comparison for each camera ID, an
+all-position contact sheet, real and synthetic temporal sheets, a mounting
+position/heading diagram, and private comparison metadata. PhysicalAI and
+CARLA show different scenes, so these artifacts support qualitative checks of
+FOV, horizon, vehicle occlusion, camera overlap, and mounting geometry—not
+pixel-level correspondence or image-quality metrics.
+
 Capture each mode independently, then run:
 
 ```bash

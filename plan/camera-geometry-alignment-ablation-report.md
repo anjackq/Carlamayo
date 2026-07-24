@@ -6,8 +6,12 @@ Keep `--camera-alignment baseline` as the closed-loop default.
 
 The opt-in camera patch is technically valid and materially improves some
 trajectory metrics, but `pose-projection` does not pass the frozen-input or
-closed-loop promotion gates. No controller, safety, history, selector, prompt,
-or model-weight parameter was changed to conceal the failed gates.
+closed-loop promotion gates. A subsequent `projection-only` three-seed run
+passes the aggregate distance, road-quality, collision, and override gates,
+but still produces one terminal fallback lock and more positive actor
+hallucinations than baseline. It is therefore the preferred camera research
+mode, not the closed-loop default. No controller, safety, history, selector,
+prompt, or model-weight parameter was changed to conceal the failed gates.
 
 Implementation checkpoints:
 
@@ -60,6 +64,34 @@ The three closed-loop combined runs independently measured remap p50 between
 `8.56` and `8.69 ms`, with no missing or timestamp-mismatched bundles.
 Consequently, the native CARLA wide-angle fallback evaluation was not
 triggered.
+
+## Private image-space comparison
+
+The authorized example clip was sampled at three times across all four model
+camera IDs and compared with the frozen CARLA `baseline`, `projection-only`,
+and `pose-projection` inputs. Gated frames, exact mounting translations, and
+the generated contact sheets remain owner-readable under
+`~/.cache/carlamayo/camera-comparisons/` and are not committed.
+
+The qualitative comparison separates several effects:
+
+- `projection-only` preserves the CARLA scene composition while applying the
+  expected F-theta compression, so it is the cleanest projection ablation;
+- `pose-projection` lowers the front-wide view and introduces ego-hood
+  visibility closer to the real rig, but the Tesla hood shape and black
+  self-occlusion differ substantially from the PhysicalAI collection vehicle;
+- cross-left and cross-right show the largest pose/composition shift because
+  the aligned rig uses a wider, lower lateral mounting arrangement and
+  different optical headings than the original roof-level CARLA cameras;
+- front-tele changes least geometrically, although CARLA rendering,
+  photometry, traffic density, and scene realism remain far from the real
+  sample.
+
+The images therefore support treating lens projection and mounting pose as
+separate research variables. They do not support pixel correspondence or a
+quantitative image-similarity claim because the real and synthetic scenes are
+different. In particular, official pose alignment should not be promoted
+until vehicle-body occlusion and rig/vehicle compatibility are addressed.
 
 ## Frozen-input ablation
 
@@ -120,6 +152,51 @@ Failed closed-loop gates:
 The UI inspection confirmed that the F-theta trajectory overlay follows the
 warped front-wide image and clearly distinguishes `ALPAMAYO PROPOSAL`,
 `CONTROLLER EXECUTION`, and `SAFETY OVERRIDE`.
+
+## Projection-only closed-loop follow-up
+
+Jobs `22858757/22858758/22858759` repeated the same Town03, spawn 0,
+empty-road, 20-second, three-sample experiment with only the F-theta
+projection enabled:
+
+| Seed | Distance | Ego UNSAFE ticks | Fallback ticks | Direct overrides | Full-path UNSAFE | Longest WAITING / STOPPED |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 45.1 m | 0 | 3 | 3 | 8/15 (53.3%) | 3 / 37 |
+| 1 | 29.7 m | 0 | 65 | 0 | 10/17 (58.8%) | 62 / 0 |
+| 2 | 38.6 m | 0 | 3 | 3 | 10/16 (62.5%) | 3 / 20 |
+| median | 38.6 m | 0 | 3 | 3 | 58.8% | 3 / 20 |
+
+All three runs had zero collisions. Against the baseline medians,
+`projection-only`:
+
+- increased integrated distance from `13.9 m` to `38.6 m`;
+- reduced fallback ticks from `13` to `3`;
+- reduced direct road overrides from `4` to `3`;
+- reduced full-path UNSAFE rate by `28.6%` relative, from `82.4%` to
+  `58.8%`;
+- kept current-ego road UNSAFE ticks at zero.
+
+Remap performance also remained within the production gate across these runs:
+p50 `8.67 ms`, p95 `9.81 ms`, worst observed remap `24.69 ms`, and worst
+decode-plus-remap `93.85 ms`.
+
+It nevertheless fails reliability promotion:
+
+- seed 1 ended with 62 consecutive `WAITING_FOR_PLAN` ticks; the physical ego
+  surface remained SAFE, but the buffered clearance was `-0.182 m` and the
+  near-term candidate began outside the clearance envelope, so proposals
+  15–20 were all `REJECT_FALLBACK_STOP`;
+- seed 0 ended with 37 model-selected `STOPPED` ticks even though later plans
+  were fully road-safe, exposing the remaining CoC/trajectory stop-mode
+  mismatch;
+- selected CoCs made positive nonexistent-actor claims in seeds 0/1/2 at
+  `1/2/0`, while all three baseline runs had zero;
+- median selected stop plans increased from `2` in baseline to `4`.
+
+The projection correction is therefore beneficial and should be retained as
+the next research baseline. Default promotion should wait until candidate
+selection, CoC/trajectory consistency, and bounded recovery from marginal
+clearance violations are addressed and the same three-seed gate is repeated.
 
 ## Interpretation and follow-up
 
