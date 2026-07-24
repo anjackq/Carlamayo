@@ -146,7 +146,11 @@ TRAJECTORY_STOP_CLUSTER_RADIUS_M = 0.25
 
 # Conservative safety shield.  Plan points must lie on a CARLA driving lane and
 # nearby vehicles/pedestrians in the ego corridor trigger immediate braking.
-SAFETY_PATH_SAMPLE_SPACING_M = 0.5
+# Keep exact-map footprint queries dense enough to catch narrow OpenDRIVE
+# junction seams between model waypoints.  Job 22863131 contained a 0.517 m
+# segment whose unsafe interval (0.145--0.186 m) was skipped at 0.5 m spacing
+# and is deterministically sampled at one-third of the segment with 0.25 m.
+SAFETY_PATH_SAMPLE_SPACING_M = 0.25
 SAFETY_LATERAL_CLEARANCE_M = 0.25
 SAFETY_LONGITUDINAL_CLEARANCE_M = 0.25
 SAFETY_REACTION_TIME_S = 0.5

@@ -23,6 +23,11 @@ GEOMETRIC_STOPPING_FIXTURE = (
     / "fixtures"
     / "job_22862336_geometric_stopping.json"
 )
+NARROW_JUNCTION_GAP_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "job_22863131_narrow_junction_gap.json"
+)
 
 
 class FakeLocation:
@@ -193,14 +198,20 @@ def _ego_kinematics(*, half_length=0.4, half_width=0.3):
     )
 
 
-def _adapter(carla_map, *, actors=(), ego_bounding_box=None):
+def _adapter(
+    carla_map,
+    *,
+    actors=(),
+    ego_bounding_box=None,
+    policy=None,
+):
     ego = FakeActor(
         1,
         "vehicle.ego",
         bounding_box=ego_bounding_box or FakeBoundingBox(),
     )
     world = FakeWorld(carla_map, (ego, *actors))
-    return CarlaGroundTruthSafetyAdapter(world, ego), world, ego
+    return CarlaGroundTruthSafetyAdapter(world, ego, policy=policy), world, ego
 
 
 def _tick_context(
@@ -889,6 +900,85 @@ def test_near_term_window_does_not_expand_when_behind_schedule(
     assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
     assert envelope.time_to_first_bad_s == 0.0
     assert envelope.distance_to_first_bad_m == pytest.approx(2.5)
+
+
+def test_quarter_metre_sampling_catches_recorded_narrow_junction_gap(
+    driving_lane_type,
+):
+    replay = json.loads(
+        NARROW_JUNCTION_GAP_FIXTURE.read_text(encoding="utf-8")
+    )
+    segment_length = float(replay["first_segment_length_m"])
+    unsafe_start, unsafe_end = replay["unsafe_progress_interval_m"]
+    runtime_spacing = float(
+        carla_safety_adapter.cfg.SAFETY_PATH_SAMPLE_SPACING_M
+    )
+    assert runtime_spacing == pytest.approx(replay["required_spacing_m"])
+
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[1:, 0] = segment_length + 0.5 * np.arange(63)
+    plan = types.SimpleNamespace(
+        plan_id="narrow-junction-gap",
+        world_points=points,
+        waypoint_times_s=5.0
+        + np.arange(1, 65, dtype=np.float64) * 0.1,
+    )
+
+    def resolve(location):
+        if unsafe_start <= location.x <= unsafe_end:
+            return None
+        return FakeWaypoint(
+            location,
+            lane_width=20.0,
+            is_junction=True,
+        )
+
+    fine_adapter, _, fine_ego = _adapter(
+        RecordingMap(resolve),
+        ego_bounding_box=FakeBoundingBox(
+            half_length=0.001,
+            half_width=0.001,
+        ),
+        policy=SafetyPolicy(
+            path_sample_spacing_m=runtime_spacing
+        ),
+    )
+    coarse_adapter, _, coarse_ego = _adapter(
+        RecordingMap(resolve),
+        ego_bounding_box=FakeBoundingBox(
+            half_length=0.001,
+            half_width=0.001,
+        ),
+        policy=SafetyPolicy(
+            path_sample_spacing_m=replay["legacy_spacing_m"]
+        ),
+    )
+
+    fine = fine_adapter.assess_plan_road(
+        tick_context=_tick_context(
+            fine_ego,
+            simulation_time_s=5.0,
+        ),
+        plan=plan,
+    )
+    coarse = coarse_adapter.assess_plan_road(
+        tick_context=_tick_context(
+            coarse_ego,
+            simulation_time_s=5.0,
+        ),
+        plan=plan,
+    )
+
+    assert coarse.near_term_path_road.status is AssessmentStatus.SAFE
+    assert fine.near_term_path_road.status is AssessmentStatus.UNSAFE
+    assert fine.full_path_road.status is AssessmentStatus.UNSAFE
+    assert fine.first_bad_path_progress_m == pytest.approx(
+        replay["expected_fine_sample_progress_m"]
+    )
+    assert (
+        decide_plan_admission(fine)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
 
 
 def test_stopping_distance_uses_ego_geometric_progress_when_ahead_of_time(
