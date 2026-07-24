@@ -991,13 +991,17 @@ class CarlaGroundTruthSafetyAdapter:
             distance_to_bad,
             self.policy,
         )
-        nominal_target_speed_cap = min(
-            raw_physical_cap,
+        acceleration_guard_mps = (
+            float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
+            * float(cfg.CONTROL_DT)
+        )
+        target_speed_cap = min(
+            max(0.0, raw_physical_cap - acceleration_guard_mps),
             float(cfg.TRAJECTORY_MAX_SPEED_MPS),
         )
         if recovery_required:
-            nominal_target_speed_cap = min(
-                nominal_target_speed_cap,
+            target_speed_cap = min(
+                target_speed_cap,
                 float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS),
             )
         emergency_required = (
@@ -1022,18 +1026,9 @@ class CarlaGroundTruthSafetyAdapter:
         )
         if current_road.status is not AssessmentStatus.SAFE:
             reserve_status = StoppingReserveStatus.UNAVAILABLE
-        # The raw physical cap is the emergency boundary, not a suitable
-        # asymptotic PID setpoint once the one-step guarded reserve is already
-        # negative.  Pull only the controller target down by the same bounded
-        # acceleration used in v_guard; emergency semantics remain unchanged.
-        target_speed_cap = nominal_target_speed_cap
-        if reserve_status is StoppingReserveStatus.FRAGILE:
-            target_speed_cap = max(
-                0.0,
-                nominal_target_speed_cap
-                - float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
-                * float(cfg.CONTROL_DT),
-            )
+        # The raw physical cap remains the emergency boundary.  The controller
+        # receives a one-control-step lower setpoint so asymptotic PID tracking
+        # cannot consume the acceleration guard used by the reserve profile.
         return RoadExecutionEnvelope(
             current_ego_road=current_road,
             near_term_path_road=near_term,
