@@ -30,9 +30,11 @@ CARLA release gate below. The next milestone is:
 > deterministic CARLA route, then use the evidence to tune the baseline without
 > weakening its fail-closed behavior.
 
-Destination-aware routing, traffic-rule policy, multi-trajectory selection, the
-complete four-panel UI, fine-tuning, V2X, and world-model integration remain
-deferred until the basic-driving gate passes.
+Destination-aware routing, traffic-rule policy, the complete four-panel UI,
+fine-tuning, V2X, and world-model integration remain deferred until the
+basic-driving gate passes. Opt-in multi-trajectory selection now performs
+per-candidate validation and road admission, but still needs the deterministic
+closed-loop gate before becoming the default.
 
 ### Implementation progress
 
@@ -45,6 +47,11 @@ deferred until the basic-driving gate passes.
 - PR 5, fixed-world, stopping-capable controller: implemented.
 - Safe-baseline hardening, including the CARLA-ground-truth adapter, fail-closed
   stop-only shield, and full CoC proposal audit: implemented.
+- Opt-in multi-candidate selection, including per-sample validation, road
+  admission, route-direction scoring, empty-road stop suppression, and
+  selection telemetry: implemented and evaluated across three seeds; it remains
+  opt-in because the direct-override and selector-latency promotion gates did
+  not both pass. See `multi-candidate-road-selector-ablation-report.md`.
 - PR 6, traceable four-panel UI: partially implemented. The current view exposes
   persistent proposal/controller/override labels and requested versus applied
   control, but the four thumbnails, dedicated CoC panel, BEV, and full telemetry
@@ -222,15 +229,16 @@ source observation + ego history + camera IDs + prompt/respawn revisions
       |
       v
 Alpamayo 1.5
-CoC + ego-frame trajectory proposal (current K=1; multi-candidate K>1 deferred)
-      |
-      v
-TrajectoryPlan
-capture-pose anchoring + fixed world points + explicit waypoint times
+CoC + K ego-frame trajectory candidates (default K=1; research K=3)
       |
       v
 Plan validator/selector
-shape + finite values + age + remaining horizon + drift + revision checks
+per-candidate shape + finite values + capture-pose anchoring + age + drift
++ CARLA road envelope + navigation direction + continuity ranking
+      |
+      v
+TrajectoryPlan
+selected fixed world points + explicit waypoint times + authorized safe prefix
       |
       v
 World-trajectory controller
@@ -862,5 +870,5 @@ Stopping-capable world-trajectory controller
         +------> Deterministic CARLA evaluation
                          |
                          v
-Route, traffic, multi-candidate safety ranking, and research extensions
+Route generation, traffic rules, CoC verification, and research extensions
 ```

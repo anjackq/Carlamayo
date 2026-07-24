@@ -68,9 +68,12 @@ The current prototype implements a conservative, auditable closed-loop baseline:
 - With `--telemetry-jsonl PATH`, every proposal consumed by the control loop is
   auditable through an `alpamayo_proposal` event containing the full,
   untruncated CoC text, its SHA-256 digest, source identity, and candidate
-  trajectory. The same JSONL stream links that proposal ID to validation events
-  and to tick events containing the controller request, final applied control,
-  and safety-override reasons.
+  trajectories. With multiple samples, every candidate receives generic,
+  alignment, and CARLA road-envelope evaluation before a deterministic
+  `candidate_selection` event chooses one; continuity is only a ranking
+  tiebreaker after admission quality. The same JSONL stream links that proposal
+  ID to validation events and to tick events containing the controller request,
+  final applied control, and safety-override reasons.
 
 The runner defaults to synchronous inference; `--async` is opt-in. In normal and
 navigation modes, inference is scheduled no more often than once per 1.0 second
@@ -140,9 +143,10 @@ driving stack. In particular:
   generation;
 - traffic lights, stop signs, right-of-way, and other traffic rules are not
   handled as driving policy;
-- the default remains one trajectory sample. `--num-traj-samples 3` enables a
-  diagnostic that records all three CoCs and trajectories, but selection is
-  continuity-based and is not yet full multi-candidate safety ranking;
+- the default remains one trajectory sample. `--num-traj-samples 3` enables
+  road-aware multi-candidate ranking, but it does not yet have a
+  destination-aware route branch, traffic-rule model, or perception-based CoC
+  verification;
 - the safety shield is a privileged CARLA-ground-truth integration layer, not an
   onboard perception system or evidence that Alpamayo itself made a safe choice;
 - the current video/Pygame overlay labels `ALPAMAYO PROPOSAL`,

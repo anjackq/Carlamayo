@@ -1123,6 +1123,214 @@ def test_near_term_unsafe_candidate_does_not_replace_active_safe_plan(
                for record in ticks_after_rejection)
 
 
+def test_multi_candidate_selector_road_evaluates_all_samples_before_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    safe_road = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.4,
+    )
+    lower_margin_safe_road = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.2,
+    )
+    unsafe_road = RoadContainmentAssessment.unsafe(
+        ("road_not_contained",),
+        sample_count=5,
+        min_margin_m=-0.5,
+        first_bad_sample_index=0,
+    )
+    assessed_candidate_indices = []
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _MultiCandidateAdapter:
+        def __init__(self, *_args):
+            pass
+
+        def assess_ego_transform(self, _transform):
+            return safe_road
+
+        @staticmethod
+        def _envelope(plan):
+            index = int(plan.selected_candidate_index)
+            if index == 0:
+                return RoadExecutionEnvelope(
+                    current_ego_road=safe_road,
+                    near_term_path_road=unsafe_road,
+                    full_path_road=unsafe_road,
+                    last_safe_waypoint_index=5,
+                    time_to_first_bad_s=0.5,
+                    distance_to_first_bad_m=1.0,
+                    target_speed_cap_mps=0.0,
+                    emergency_required=False,
+                )
+            if index == 1:
+                return RoadExecutionEnvelope(
+                    current_ego_road=safe_road,
+                    near_term_path_road=safe_road,
+                    full_path_road=safe_road,
+                    last_safe_waypoint_index=63,
+                    time_to_first_bad_s=None,
+                    distance_to_first_bad_m=None,
+                    target_speed_cap_mps=None,
+                    emergency_required=False,
+                )
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                near_term_path_road=lower_margin_safe_road,
+                full_path_road=unsafe_road,
+                last_safe_waypoint_index=32,
+                time_to_first_bad_s=3.2,
+                distance_to_first_bad_m=8.0,
+                target_speed_cap_mps=2.0,
+                emergency_required=False,
+            )
+
+        def assess_plan_road(self, *, plan, **_kwargs):
+            assessed_candidate_indices.append(plan.selected_candidate_index)
+            return self._envelope(plan)
+
+        def assess(self, *, plan, **_kwargs):
+            envelope = self._envelope(plan)
+            return types.SimpleNamespace(
+                road=envelope.current_ego_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=envelope.current_ego_road,
+                proposed_path_road=envelope.full_path_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "multi-candidate.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--num-traj-samples",
+            "3",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "1.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: _TrackingFollower())
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _MultiCandidateAdapter,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (
+            object(),
+            {
+                "cot": closed_loop.np.array(
+                    [["unsafe sample", "fully safe sample", "safe prefix sample"]],
+                    dtype=object,
+                )
+            },
+        ),
+    )
+    candidates = closed_loop.np.zeros((3, 64, 3), dtype=closed_loop.np.float64)
+    candidates[:, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    extraction_count = 0
+
+    def extract_candidates(_prediction):
+        nonlocal extraction_count
+        extraction_count += 1
+        if extraction_count == 1:
+            return candidates.copy()
+        invalid_candidates = candidates.copy()
+        invalid_candidates[:, :, 1] = 100.0
+        return invalid_candidates
+
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        extract_candidates,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    assert assessed_candidate_indices[:3] == [0, 1, 2]
+    records = _read_jsonl(telemetry_path)
+    evaluations = [
+        record
+        for record in records
+        if record["event_type"] == "candidate_evaluation"
+        and record["proposal_id"].endswith(":1")
+    ]
+    assert len(evaluations) == 3
+    assert [record["candidate_index"] for record in evaluations] == [0, 1, 2]
+    assert [record["admission_status"] for record in evaluations] == [
+        "REJECT_FALLBACK_STOP",
+        "ACCEPT_FULLY_SAFE",
+        "ACCEPT_SAFE_PREFIX",
+    ]
+    assert [record["selected"] for record in evaluations] == [False, True, False]
+
+    selection = next(
+        record for record in records if record["event_type"] == "candidate_selection"
+    )
+    assert selection["preselected_candidate_index"] == 0
+    assert selection["selected_candidate_index"] == 1
+    assert selection["selected_admitted"] is True
+    assert selection["selection_reason"] == "best_admitted_candidate"
+
+    proposal = next(
+        record for record in records if record["event_type"] == "alpamayo_proposal"
+    )
+    assert proposal["preselected_candidate_index"] == 0
+    assert proposal["selected_candidate_index"] == 1
+    assert proposal["coc_text_full"] == "fully safe sample"
+
+    admission = next(
+        record for record in records if record["event_type"] == "plan_admission"
+    )
+    assert admission["selected_candidate_index"] == 1
+    assert admission["admission_status"] == "ACCEPT_FULLY_SAFE"
+    ticks_after_invalid_proposal = [
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] >= 11
+    ]
+    assert ticks_after_invalid_proposal
+    assert all(
+        record["active_plan_id"].endswith("/candidate-1")
+        for record in ticks_after_invalid_proposal
+    )
+    assert all(
+        record["plan_admission_status"] == "ACCEPT_FULLY_SAFE"
+        for record in ticks_after_invalid_proposal
+    )
+
+
 def test_obstacle_override_is_the_only_control_applied_for_a_nominal_throttle(
     monkeypatch,
     tmp_path,
