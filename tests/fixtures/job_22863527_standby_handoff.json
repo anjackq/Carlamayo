@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "fixture_id": "job_22863527_proposal11_standby_handoff",
+  "source_job_id": "22863527",
+  "run_id": "20260724T173240Z-2152437",
+  "scenario": {
+    "map": "Town03",
+    "spawn_index": 0,
+    "seed": 0,
+    "empty_road": true,
+    "camera_alignment": "projection-only",
+    "num_trajectory_samples": 3,
+    "diffusion_temperature": 1.0,
+    "control_dt_s": 0.1
+  },
+  "retention_event": {
+    "request_id": 11,
+    "source_loop_tick_id": 104,
+    "arrival_loop_tick_id": 104,
+    "source_carla_frame_id": 17105,
+    "arrival_carla_frame_id": 17105,
+    "source_simulation_time_s": 20.07915027020499,
+    "arrival_simulation_time_s": 20.07915027020499,
+    "source_elapsed_proxy_s": 10.4,
+    "inference_wall_latency_s": 4.7565703830332495,
+    "model_inference_latency_s": 4.309961907973047,
+    "candidate_count": 3,
+    "selected_candidate_index": 2,
+    "coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4"
+  },
+  "active": {
+    "plan_id": "20260724T173240Z-2152437:8/candidate-2",
+    "source_loop_tick_id": 74,
+    "source_simulation_time_s": 17.079150225501508,
+    "admission_status": "ACCEPT_FULLY_SAFE",
+    "reserve_status": "UNBOUNDED",
+    "motion_class": "MOVING",
+    "remaining_horizon_s_at_retention": 3.399999955296515,
+    "distance_to_first_bad_m": null,
+    "time_to_first_bad_s": null,
+    "near_term_road_status": "SAFE",
+    "full_path_road_status": "SAFE",
+    "emergency_required": false,
+    "executable": true
+  },
+  "retained_candidate": {
+    "plan_id": "20260724T173240Z-2152437:11/candidate-2",
+    "source_loop_tick_id": 104,
+    "source_simulation_time_s": 20.07915027020499,
+    "horizon_end_s": 26.47915027020499,
+    "point_count": 64,
+    "admission_status": "ACCEPT_SAFE_PREFIX",
+    "reserve_status": "ROBUST",
+    "motion_class": "MOVING",
+    "explicit_stop": false,
+    "remaining_horizon_s_at_retention": 6.399999999999999,
+    "initial_target_speed_mps": 7.1335382784276,
+    "near_term_mean_speed_mps": 7.438992734755224,
+    "near_term_peak_speed_mps": 7.9857111076289895,
+    "distance_to_first_bad_m": 23.277429635376347,
+    "time_to_first_bad_s": 3.1000000000000014,
+    "last_safe_waypoint_index": 29,
+    "raw_physical_stopping_cap_mps": 11.199221078647435,
+    "target_speed_cap_mps": 9.722222222222221,
+    "guard_speed_mps": 8.48571110762899,
+    "required_stopping_distance_m": 15.243767179081749,
+    "stopping_reserve_m": 8.033662456294598,
+    "current_ego_road_status": "SAFE",
+    "near_term_road_status": "SAFE",
+    "full_path_road_status": "UNSAFE",
+    "emergency_required": false
+  },
+  "observed_handoff": {
+    "inference_terminal_status": "retained_active_plan",
+    "status": "RETAIN_ACTIVE_SAFETY_TIER",
+    "reason": "candidate_safety_tier_worse_than_active",
+    "activate_candidate": false,
+    "retain_active": true
+  },
+  "retention_deadline": {
+    "loop_tick_id": 108,
+    "simulation_time_s": 20.479150276165456,
+    "threshold_s": 3.0,
+    "active_remaining_horizon_s": 2.9999999493360505,
+    "standby_source_age_s": 0.4000000059604645,
+    "standby_remaining_horizon_s": 5.999999994039534,
+    "expected_trigger": "RETENTION_DEADLINE"
+  },
+  "intervening_results": [
+    {
+      "request_id": 12,
+      "source_loop_tick_id": 114,
+      "selection_reason": "no_admissible_candidate_retain_active",
+      "inference_terminal_status": "rejected_plan",
+      "rejection_reason": "road_admission:REJECT_RETAIN_ACTIVE"
+    },
+    {
+      "request_id": 13,
+      "source_loop_tick_id": 124,
+      "selection_reason": "all_candidates_failed_validation",
+      "inference_terminal_status": "rejected_plan",
+      "rejection_reason": "excessive_lateral_displacement"
+    },
+    {
+      "request_id": 14,
+      "source_loop_tick_id": 134,
+      "selection_reason": "best_admitted_candidate",
+      "inference_terminal_status": "accepted_plan",
+      "rejection_reason": null
+    }
+  ],
+  "observed_without_standby": {
+    "last_executable_tick": 123,
+    "last_active_availability": "BRIDGED_FULL_SAFE",
+    "last_active_source_age_s": 4.90000007301569,
+    "last_active_remaining_horizon_s": 1.4999999269843087,
+    "first_fallback_tick": 124,
+    "first_fallback_availability": "BRIDGE_DENIED",
+    "first_fallback_reason": "plan_source_age_exceeded",
+    "first_fallback_speed_mps": 5.13018019041108,
+    "last_fallback_tick": 133,
+    "recovery_tick": 134,
+    "gap_fallback_tick_count": 10,
+    "gap_applied_control": {
+      "throttle": 0.0,
+      "brake": 1.0,
+      "steering": 0.0
+    },
+    "episode_fallback_ticks": [
+      1,
+      2,
+      3,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133
+    ],
+    "episode_integrated_distance_m": 72.70500872455878,
+    "collisions": 0,
+    "direct_safety_overrides": 0
+  },
+  "expected_with_standby": {
+    "store_lifecycle_status": "STORED",
+    "activation_requires_fresh_exact_validation": true,
+    "activation_loop_tick_id_if_revalidation_passes": 108,
+    "activation_handoff_status": "ACTIVATE_RETENTION_DEADLINE",
+    "activation_lifecycle_status": "ACTIVATED",
+    "availability_only_fallback_at_tick_124": false
+  }
+}
