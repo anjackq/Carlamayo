@@ -601,6 +601,25 @@ def parse_args(argv=None):
         action="store_true",
         help="Hold the ego stopped, save the requested fixture, and exit before inference.",
     )
+    parser.add_argument(
+        "--road-assessment-backend",
+        choices=("serial", "process"),
+        default="serial",
+        help=(
+            "Exact CARLA road-query backend. Default: serial; process remains "
+            "an opt-in research backend until its parity/performance gates pass."
+        ),
+    )
+    parser.add_argument(
+        "--road-assessment-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Worker count for --road-assessment-backend process. By default, "
+            "uses min(6, available CPUs - 2)."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.oom_free and args.quantization:
         parser.error("--oom-free and --quantization are mutually exclusive.")
@@ -623,6 +642,31 @@ def parse_args(argv=None):
         )
     if args.capture_only and not args.capture_inference_fixture:
         parser.error("--capture-only requires --capture-inference-fixture.")
+    if (
+        args.road_assessment_backend != "process"
+        and args.road_assessment_workers is not None
+    ):
+        parser.error(
+            "--road-assessment-workers requires "
+            "--road-assessment-backend process."
+        )
+    if (
+        args.road_assessment_workers is not None
+        and args.road_assessment_workers < 1
+    ):
+        parser.error("--road-assessment-workers must be at least 1.")
+    if args.road_assessment_backend == "process":
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available_cpus = int(os.cpu_count() or 1)
+        if available_cpus < 3:
+            parser.error(
+                "--road-assessment-backend process requires at least 3 "
+                "available CPUs."
+            )
+        if args.road_assessment_workers is None:
+            args.road_assessment_workers = min(6, available_cpus - 2)
     repository_root = Path(__file__).resolve().parent
     for option_name, path_value in (
         ("--camera-profile", args.camera_profile),
@@ -672,6 +716,15 @@ def main():
     print(f"Trajectory samples per inference: {args.num_traj_samples}")
     print(f"Diffusion temperature: {args.diffusion_temperature:.2f}")
     print(f"Camera alignment: {args.camera_alignment}")
+    print(
+        "Road assessment: "
+        f"{args.road_assessment_backend}"
+        + (
+            f" ({args.road_assessment_workers} workers)"
+            if args.road_assessment_backend == "process"
+            else ""
+        )
+    )
     print("Auto respawn: ON after collisions")
     print(f"Runtime telemetry: {args.telemetry_jsonl or 'OFF'}")
     if args.max_episode_seconds is not None:
@@ -866,12 +919,17 @@ def main():
                 carla_if.world,
                 carla_if.ego_vehicle,
                 safety_policy,
+                road_assessment_backend=args.road_assessment_backend,
+                road_assessment_workers=args.road_assessment_workers,
             )
         except Exception as exc:
             safety_adapter = None
-            if args.empty_road:
+            if (
+                args.empty_road
+                or args.road_assessment_backend == "process"
+            ):
                 raise RuntimeError(
-                    "empty-road footprint preflight is unavailable"
+                    "requested CARLA road-assessment backend is unavailable"
                 ) from exc
             print(
                 "Warning: CARLA ground-truth safety adapter unavailable; "
@@ -1757,6 +1815,11 @@ def main():
                 "profile_cache_hits": None,
                 "profile_cache_misses": None,
                 "error_count": int(batch_failed),
+                "shadow_parity_status": None,
+                "fallback_reason": None,
+                "serial_fallback_ms": None,
+                "worker_query_sum_ms": None,
+                "worker_restart_count": None,
                 "backend_status": (
                     "batch_error"
                     if batch_failed
@@ -3370,6 +3433,8 @@ def main():
             execution="async" if args.async_mode else "sync",
             num_traj_samples=args.num_traj_samples,
             diffusion_temperature=args.diffusion_temperature,
+            road_assessment_backend=args.road_assessment_backend,
+            road_assessment_workers=args.road_assessment_workers,
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
             camera_alignment=camera_alignment_metadata(),
@@ -3455,7 +3520,15 @@ def main():
                     pending_request_id = None
                     safety_shield.reset()
                     if safety_adapter is not None:
-                        safety_adapter.reset(carla_if.ego_vehicle)
+                        clear_plan_caches = getattr(
+                            safety_adapter,
+                            "clear_plan_caches",
+                            None,
+                        )
+                        if callable(clear_plan_caches):
+                            clear_plan_caches()
+                        else:
+                            safety_adapter.reset(carla_if.ego_vehicle)
                     emit_runtime_event(
                         "prompt_revision_changed",
                         loop_tick_id=int(frame_count),
@@ -4766,6 +4839,15 @@ def main():
             async_shutdown_error = f"{type(exc).__name__}:{exc}"
             print(f"Warning: async shutdown telemetry failed: {exc}")
 
+        safety_adapter_close_error = None
+        try:
+            close_safety_adapter = getattr(safety_adapter, "close", None)
+            if callable(close_safety_adapter):
+                close_safety_adapter()
+        except Exception as exc:
+            safety_adapter_close_error = f"{type(exc).__name__}:{exc}"
+            print(f"Warning: road-assessment backend cleanup failed: {exc}")
+
         cleanup_error = None
         try:
             carla_if.cleanup()
@@ -4799,6 +4881,7 @@ def main():
             telemetry_path=args.telemetry_jsonl,
             telemetry_write_failed=telemetry_write_failed,
             async_shutdown_error=async_shutdown_error,
+            safety_adapter_close_error=safety_adapter_close_error,
             cleanup_error=cleanup_error,
         )
         summary["exact_plan_age_available"] = bool(summary["source_age_s"]["count"] > 0)

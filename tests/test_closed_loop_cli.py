@@ -44,6 +44,83 @@ def test_sampling_diagnostic_arguments():
     assert args.diffusion_temperature == pytest.approx(0.6)
 
 
+def test_road_assessment_backend_defaults_remain_serial():
+    args = closed_loop.parse_args([])
+
+    assert args.road_assessment_backend == "serial"
+    assert args.road_assessment_workers is None
+
+
+def test_process_road_backend_resolves_default_workers_from_cpu_affinity(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        closed_loop.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(8)),
+    )
+
+    args = closed_loop.parse_args(
+        ["--road-assessment-backend", "process"]
+    )
+
+    assert args.road_assessment_backend == "process"
+    assert args.road_assessment_workers == 6
+
+
+def test_process_road_backend_preserves_explicit_worker_count(monkeypatch):
+    monkeypatch.setattr(
+        closed_loop.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(8)),
+    )
+
+    args = closed_loop.parse_args(
+        [
+            "--road-assessment-backend",
+            "process",
+            "--road-assessment-workers",
+            "3",
+        ]
+    )
+
+    assert args.road_assessment_workers == 3
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--road-assessment-workers", "2"],
+        [
+            "--road-assessment-backend",
+            "process",
+            "--road-assessment-workers",
+            "0",
+        ],
+    ],
+)
+def test_road_backend_worker_argument_validation(arguments):
+    with pytest.raises(SystemExit) as exc_info:
+        closed_loop.parse_args(arguments)
+
+    assert exc_info.value.code == 2
+
+
+def test_process_road_backend_requires_three_available_cpus(monkeypatch):
+    monkeypatch.setattr(
+        closed_loop.os,
+        "sched_getaffinity",
+        lambda _pid: {0, 1},
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        closed_loop.parse_args(
+            ["--road-assessment-backend", "process"]
+        )
+
+    assert exc_info.value.code == 2
+
+
 def test_camera_alignment_arguments_and_environment(monkeypatch):
     monkeypatch.setenv("CARLAMAYO_CAMERA_PROFILE", "/private/profile.json")
 

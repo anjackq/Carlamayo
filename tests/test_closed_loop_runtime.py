@@ -246,6 +246,70 @@ def test_episode_limit_stops_on_first_successful_tick_boundary(
     _assert_stream_summary_invariants(records)
 
 
+def test_process_adapter_receives_cli_settings_and_closes_before_carla_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "process-backend-lifecycle.jsonl"
+    monkeypatch.setattr(
+        closed_loop.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(8)),
+    )
+    args = closed_loop.parse_args(
+        [
+            "--road-assessment-backend",
+            "process",
+            "--road-assessment-workers",
+            "2",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    lifecycle = []
+    constructor_calls = []
+
+    class _ClosingAdapter:
+        def __init__(self, *args, **kwargs):
+            constructor_calls.append((args, dict(kwargs)))
+
+        def close(self):
+            lifecycle.append("adapter.close")
+
+    original_cleanup = carla_if.cleanup
+
+    def recording_cleanup():
+        lifecycle.append("carla.cleanup")
+        original_cleanup()
+
+    carla_if.cleanup = recording_cleanup
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _ClosingAdapter,
+    )
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 0
+    assert len(constructor_calls) == 1
+    positional, keyword = constructor_calls[0]
+    assert positional[:2] == (carla_if.world, carla_if.ego_vehicle)
+    assert keyword == {
+        "road_assessment_backend": "process",
+        "road_assessment_workers": 2,
+    }
+    assert lifecycle == ["adapter.close", "carla.cleanup"]
+    assert carla_if.cleanup_count == 1
+    summary = _read_jsonl(telemetry_path)[-1]
+    assert summary["safety_adapter_close_error"] is None
+    assert summary["cleanup_error"] is None
+
+
 def test_empty_road_setup_forces_fresh_map_fixed_spawn_and_zero_npcs(
     monkeypatch,
     tmp_path,
@@ -290,7 +354,7 @@ def test_empty_road_setup_forces_fresh_map_fixed_spawn_and_zero_npcs(
     monkeypatch.setattr(
         closed_loop,
         "CarlaGroundTruthSafetyAdapter",
-        lambda world, ego_vehicle, policy: safety_adapter,
+        lambda world, ego_vehicle, policy, **_kwargs: safety_adapter,
     )
 
     closed_loop.main()
@@ -356,7 +420,7 @@ def test_unsafe_empty_road_footprint_aborts_before_oom_free_model_load(
     monkeypatch.setattr(
         closed_loop,
         "CarlaGroundTruthSafetyAdapter",
-        lambda world, ego_vehicle, policy: types.SimpleNamespace(
+        lambda world, ego_vehicle, policy, **_kwargs: types.SimpleNamespace(
             assess_ego_transform=lambda transform: preflight
         ),
     )
@@ -575,7 +639,7 @@ def test_runtime_error_after_nominal_throttle_applies_final_brake_and_returns_on
             pass
 
     class _SafeAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def assess(self, **_kwargs):
@@ -885,7 +949,7 @@ def test_invalid_pid_output_fails_closed_without_runtime_error(monkeypatch, tmp_
             pass
 
     class _SafeAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def assess(self, **_kwargs):
@@ -1023,7 +1087,7 @@ def test_full_safe_active_plan_bridge_is_bounded(
             pass
 
     class _FullSafeAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         @staticmethod
@@ -1202,7 +1266,7 @@ def test_near_term_unsafe_candidate_does_not_replace_active_safe_plan(
             pass
 
     class _AdmissionAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         @staticmethod
@@ -1335,7 +1399,7 @@ def test_multi_candidate_selector_road_evaluates_all_samples_before_handoff(
             pass
 
     class _MultiCandidateAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def assess_ego_transform(self, _transform):
@@ -1527,7 +1591,7 @@ def test_obstacle_override_is_the_only_control_applied_for_a_nominal_throttle(
             pass
 
     class _UnsafeAdapter:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def assess(self, **_kwargs):

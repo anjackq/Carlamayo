@@ -81,7 +81,7 @@ class _RecordingBatchAdapter:
     batch_failure_mode = None
     instances = []
 
-    def __init__(self, *_args):
+    def __init__(self, *_args, **_kwargs):
         self.batch_calls = []
         self.legacy_candidate_calls = []
         self.last_road_batch_stats = _BatchStats()

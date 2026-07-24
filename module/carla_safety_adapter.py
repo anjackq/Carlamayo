@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -21,6 +22,16 @@ import numpy as np
 
 from . import config as cfg
 from .geometry import meaningful_path_tangent_xy
+from .road_assessment_backend import (
+    ExactRoadProcessBackend,
+    FootprintQuery,
+    FootprintQueryResult,
+    RoadProcessBackendCrashed,
+    RoadProcessBackendError,
+    RoadProcessBackendTimeout,
+    WaypointPrimitive,
+    validate_footprint_query_result,
+)
 from .safety_shield import (
     ActorObstacle,
     AssessmentStatus,
@@ -126,6 +137,10 @@ class RoadAssessmentBatchStats:
     profile_cache_hits: int = 0
     profile_cache_misses: int = 0
     error_count: int = 0
+    shadow_parity_status: str = "not_run"
+    fallback_reason: str | None = None
+    serial_fallback_ms: float = 0.0
+    worker_query_sum_ms: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +158,10 @@ class RoadAssessmentBatchStats:
             "profile_cache_hits": self.profile_cache_hits,
             "profile_cache_misses": self.profile_cache_misses,
             "error_count": self.error_count,
+            "shadow_parity_status": self.shadow_parity_status,
+            "fallback_reason": self.fallback_reason,
+            "serial_fallback_ms": self.serial_fallback_ms,
+            "worker_query_sum_ms": self.worker_query_sum_ms,
         }
 
 
@@ -290,6 +309,21 @@ class _TimedRoadProfile:
 
 
 @dataclass(frozen=True)
+class _PreparedTimedRoadProfile:
+    """Main-process geometry and numeric footprint queries for one cache miss."""
+
+    cache_key: str
+    points: np.ndarray
+    times_s: np.ndarray
+    cumulative_distance_m: np.ndarray
+    upper_waypoint_indices: np.ndarray
+    yaws_rad: tuple[float, ...]
+    half_length_m: float
+    half_width_m: float
+    queries: tuple[FootprintQuery, ...]
+
+
+@dataclass(frozen=True)
 class _PathProgressProjection:
     """Ego projection used as the physical road-execution cursor."""
 
@@ -312,6 +346,13 @@ class _RoadBatchAccumulator:
     profile_cache_hits: int = 0
     profile_cache_misses: int = 0
     error_count: int = 0
+    worker_count: int = 1
+    chunk_count: int = 0
+    worker_query_sum_s: float = 0.0
+    shadow_parity_status: str = "not_run"
+    fallback_reason: str | None = None
+    serial_fallback_s: float = 0.0
+    backend_status: str | None = None
 
 
 class _PlanIdGeometryMismatch(ValueError):
@@ -575,6 +616,189 @@ def _footprint_points(
     return tuple(points)
 
 
+def _footprint_query(
+    *,
+    query_id: int,
+    center_xyz: np.ndarray,
+    yaw_rad: float,
+    half_length_m: float,
+    half_width_m: float,
+) -> FootprintQuery:
+    """Build the numeric-only process/serial query for one footprint pose."""
+
+    return FootprintQuery(
+        query_id=int(query_id),
+        points_xyz=tuple(
+            tuple(float(value) for value in point)
+            for point in _footprint_points(
+                np.asarray(center_xyz, dtype=np.float64),
+                float(yaw_rad),
+                float(half_length_m),
+                float(half_width_m),
+            )
+        ),
+    )
+
+
+def _waypoint_primitive(waypoint: Any) -> WaypointPrimitive:
+    """Copy the exact CARLA waypoint fields consumed by containment semantics."""
+
+    if waypoint is None:
+        return WaypointPrimitive(found=False)
+    transform = waypoint.transform
+    return WaypointPrimitive(
+        found=True,
+        road_id=int(waypoint.road_id),
+        lane_id=int(waypoint.lane_id),
+        is_junction=bool(getattr(waypoint, "is_junction", False)),
+        lane_center_x=float(transform.location.x),
+        lane_center_y=float(transform.location.y),
+        lane_yaw_deg=float(transform.rotation.yaw),
+        lane_width=float(waypoint.lane_width),
+    )
+
+
+def _aggregate_footprint_query(
+    *,
+    query: FootprintQuery,
+    result: FootprintQueryResult,
+    yaw_rad: float,
+    half_length_m: float,
+    half_width_m: float,
+    sample_index_start: int,
+    lateral_clearance_m: float,
+) -> tuple[RoadContainmentSample, ...]:
+    """Apply the one shared exact containment reducer to serial/process data."""
+
+    center_xyz = np.asarray(query.points_xyz[0], dtype=np.float64)
+    validate_footprint_query_result(
+        result,
+        expected_query_id=query.query_id,
+    )
+    if result.error_type is not None:
+        return (
+            RoadContainmentSample(
+                sample_index=sample_index_start,
+                position_xyz=tuple(float(value) for value in center_xyz),
+                contained=None,
+                reason=f"carla_map_query_error:{result.error_type}",
+            ),
+        )
+    if len(result.waypoints) != 5:
+        raise ValueError("complete footprint query requires five waypoint results")
+
+    center_waypoint = result.waypoints[0]
+    if not center_waypoint.found:
+        return (
+            RoadContainmentSample(
+                sample_index=sample_index_start,
+                position_xyz=tuple(float(value) for value in center_xyz),
+                contained=False,
+                reason="center_off_driving_lane",
+            ),
+        )
+
+    is_junction = bool(center_waypoint.is_junction)
+    if is_junction:
+        margin_m = None
+        center_contained = True
+        center_reason = None
+    else:
+        lane_yaw_rad = math.radians(float(center_waypoint.lane_yaw_deg))
+        lane_right = np.array(
+            [-math.sin(lane_yaw_rad), math.cos(lane_yaw_rad)],
+            dtype=np.float64,
+        )
+        lane_center = np.array(
+            [
+                float(center_waypoint.lane_center_x),
+                float(center_waypoint.lane_center_y),
+            ],
+            dtype=np.float64,
+        )
+        lateral_offset = float(
+            np.dot(center_xyz[:2] - lane_center, lane_right)
+        )
+        path_forward = np.array(
+            [math.cos(yaw_rad), math.sin(yaw_rad)],
+            dtype=np.float64,
+        )
+        path_right = np.array(
+            [-math.sin(yaw_rad), math.cos(yaw_rad)],
+            dtype=np.float64,
+        )
+        lateral_support = (
+            abs(float(np.dot(path_forward, lane_right))) * half_length_m
+            + abs(float(np.dot(path_right, lane_right))) * half_width_m
+        )
+        margin_m = (
+            float(center_waypoint.lane_width) / 2.0
+            - abs(lateral_offset)
+            - lateral_support
+            - float(lateral_clearance_m)
+        )
+        heading_error = abs(
+            _wrapped_angle_degrees(
+                math.degrees(yaw_rad) - float(center_waypoint.lane_yaw_deg)
+            )
+        )
+        center_contained = margin_m >= 0.0 and heading_error <= 45.0
+        center_reason = None
+        if margin_m < 0.0:
+            center_reason = "ego_footprint_exceeds_lane"
+        elif heading_error > 45.0:
+            center_reason = "path_heading_opposes_lane"
+
+    samples = [
+        RoadContainmentSample(
+            sample_index=sample_index_start,
+            position_xyz=tuple(float(value) for value in center_xyz),
+            contained=center_contained,
+            margin_m=margin_m,
+            road_id=int(center_waypoint.road_id),
+            lane_id=int(center_waypoint.lane_id),
+            is_junction=is_junction,
+            reason=center_reason,
+        )
+    ]
+    for corner_offset, (point, waypoint) in enumerate(
+        zip(query.points_xyz[1:], result.waypoints[1:]),
+        start=1,
+    ):
+        corner_is_junction = (
+            bool(waypoint.is_junction) if waypoint.found else False
+        )
+        same_lane = (
+            waypoint.found
+            and (
+                is_junction
+                or corner_is_junction
+                or (
+                    int(waypoint.road_id) == int(center_waypoint.road_id)
+                    and int(waypoint.lane_id) == int(center_waypoint.lane_id)
+                )
+            )
+        )
+        samples.append(
+            RoadContainmentSample(
+                sample_index=sample_index_start + corner_offset,
+                position_xyz=tuple(float(value) for value in point),
+                contained=bool(same_lane),
+                road_id=int(waypoint.road_id) if waypoint.found else None,
+                lane_id=int(waypoint.lane_id) if waypoint.found else None,
+                is_junction=(
+                    corner_is_junction if waypoint.found else None
+                ),
+                reason=(
+                    None
+                    if same_lane
+                    else "footprint_corner_off_driving_lane"
+                ),
+            )
+        )
+    return tuple(samples)
+
+
 def _path_yaw(points: np.ndarray, index: int, fallback_yaw_rad: float) -> float:
     tangent = meaningful_path_tangent_xy(
         points,
@@ -600,14 +824,14 @@ def _sha256_text(label: str, value: str) -> str:
 
 
 def _map_content_digest(carla_map: Any) -> str:
-    """Hash OpenDRIVE when available, with a stable map-name fallback."""
+    """Hash exact OpenDRIVE once, with a stable map-name fallback."""
 
     to_opendrive = getattr(carla_map, "to_opendrive", None)
     if callable(to_opendrive):
         try:
             opendrive = to_opendrive()
             if isinstance(opendrive, str) and opendrive:
-                return _sha256_text("carla_opendrive", opendrive)
+                return _opendrive_snapshot_digest(opendrive)
         except Exception:
             pass
 
@@ -619,6 +843,14 @@ def _map_content_digest(carla_map: Any) -> str:
         f"{id(carla_map)}"
     )
     return _sha256_text("carla_map_object", fallback)
+
+
+def _opendrive_snapshot_digest(opendrive: str) -> str:
+    """Return the exact labeled snapshot identity used by profile caches."""
+
+    if not isinstance(opendrive, str) or not opendrive:
+        raise ValueError("OpenDRIVE snapshot must be nonempty")
+    return _sha256_text("carla_opendrive", opendrive)
 
 
 def _policy_content_digest(policy: SafetyPolicy) -> str:
@@ -971,28 +1203,157 @@ def _project_path_progress(
 class CarlaGroundTruthSafetyAdapter:
     """Translate exact CARLA snapshots into pure shield assessments."""
 
-    def __init__(self, world: Any, ego_vehicle: Any, policy: SafetyPolicy | None = None):
+    def __init__(
+        self,
+        world: Any,
+        ego_vehicle: Any,
+        policy: SafetyPolicy | None = None,
+        *,
+        road_assessment_backend: str = "serial",
+        road_assessment_workers: int | None = None,
+        process_backend_factory: Any = ExactRoadProcessBackend,
+    ):
         self.world = world
         self.ego_vehicle = ego_vehicle
         self.policy = policy or SafetyPolicy()
-        self._map = world.get_map()
-        self._map_digest = _map_content_digest(self._map)
+        backend = str(road_assessment_backend)
+        if backend not in {"serial", "process"}:
+            raise ValueError(
+                "road_assessment_backend must be 'serial' or 'process'"
+            )
+        self._road_assessment_backend = backend
+        self._process_backend_factory = process_backend_factory
+        self._process_worker_count = (
+            self._resolve_process_worker_count(road_assessment_workers)
+            if backend == "process"
+            else 1
+        )
+        self._process_backend = None
+        self._process_shadow_pending = backend == "process"
+        self._process_sticky_disabled_reason: str | None = None
+        self._process_generation_disabled_reason: str | None = None
+        self._map = None
+        self._map_digest = ""
+        self._process_opendrive_snapshot: str | None = None
+        self._refresh_map_snapshot()
         self._road_profile_cache: OrderedDict[str, _TimedRoadProfile] = OrderedDict()
         self._plan_geometry_by_id: dict[str, str] = {}
         self._road_tick_facts_cache_key: tuple[Any, ...] | None = None
         self._road_tick_facts_cache: RoadTickFacts | None = None
         self._last_road_batch_stats = RoadAssessmentBatchStats()
+        if backend == "process":
+            self._start_process_backend()
+
+    @staticmethod
+    def _resolve_process_worker_count(requested: int | None) -> int:
+        if requested is not None:
+            count = int(requested)
+            if count < 1:
+                raise ValueError("road_assessment_workers must be positive")
+            return count
+        try:
+            available = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available = int(os.cpu_count() or 1)
+        count = min(6, int(available) - 2)
+        if count < 1:
+            raise ValueError(
+                "process road assessment requires at least three available CPUs"
+            )
+        return count
+
+    def _refresh_map_snapshot(self) -> None:
+        """Refresh one map generation without duplicate OpenDRIVE exports."""
+
+        self._map = self.world.get_map()
+        self._process_opendrive_snapshot = None
+        if self._road_assessment_backend == "serial":
+            self._map_digest = _map_content_digest(self._map)
+            return
+
+        to_opendrive = getattr(self._map, "to_opendrive", None)
+        if not callable(to_opendrive):
+            raise RuntimeError(
+                "process road assessment requires CARLA OpenDRIVE export"
+            )
+        opendrive = to_opendrive()
+        if not isinstance(opendrive, str) or not opendrive:
+            raise RuntimeError(
+                "process road assessment received empty CARLA OpenDRIVE"
+            )
+        self._process_opendrive_snapshot = opendrive
+        self._map_digest = _opendrive_snapshot_digest(opendrive)
+
+    def _start_process_backend(self) -> None:
+        if self._road_assessment_backend != "process":
+            return
+        if (
+            self._process_sticky_disabled_reason is not None
+            or self._process_generation_disabled_reason is not None
+        ):
+            return
+        opendrive = self._process_opendrive_snapshot
+        if not isinstance(opendrive, str) or not opendrive:
+            raise RuntimeError(
+                "process road assessment snapshot is unavailable"
+            )
+        self._process_backend = self._process_backend_factory(
+            map_name=str(getattr(self._map, "name", "CARLA")),
+            opendrive=opendrive,
+            map_digest=self._map_digest,
+            worker_count=self._process_worker_count,
+            chunk_pose_count=int(
+                cfg.ROAD_ASSESSMENT_PROCESS_CHUNK_POSES
+            ),
+            startup_timeout_s=float(
+                cfg.ROAD_ASSESSMENT_PROCESS_STARTUP_TIMEOUT_S
+            ),
+            batch_timeout_s=float(
+                cfg.ROAD_ASSESSMENT_PROCESS_BATCH_TIMEOUT_S
+            ),
+        )
+
+    def _close_process_backend(self) -> None:
+        backend = self._process_backend
+        self._process_backend = None
+        if backend is not None:
+            backend.close()
+
+    def clear_plan_caches(self) -> None:
+        """Clear logical plan state without rebuilding immutable map workers."""
+
+        self._road_profile_cache.clear()
+        self._plan_geometry_by_id.clear()
+        self._last_road_batch_stats = RoadAssessmentBatchStats(
+            backend_status=self._road_assessment_backend,
+            worker_count=(
+                self._process_worker_count
+                if self._road_assessment_backend == "process"
+                else 1
+            ),
+        )
 
     def reset(self, ego_vehicle: Any | None = None) -> None:
+        self._close_process_backend()
         if ego_vehicle is not None:
             self.ego_vehicle = ego_vehicle
-        self._map = self.world.get_map()
-        self._map_digest = _map_content_digest(self._map)
+        self._refresh_map_snapshot()
         self._road_profile_cache.clear()
         self._plan_geometry_by_id.clear()
         self._road_tick_facts_cache_key = None
         self._road_tick_facts_cache = None
         self._last_road_batch_stats = RoadAssessmentBatchStats()
+        self._process_generation_disabled_reason = None
+        self._process_shadow_pending = (
+            self._road_assessment_backend == "process"
+            and self._process_sticky_disabled_reason is None
+        )
+        self._start_process_backend()
+
+    def close(self) -> None:
+        """Release process workers idempotently before CARLA world cleanup."""
+
+        self._close_process_backend()
 
     @property
     def last_road_batch_stats(self) -> RoadAssessmentBatchStats:
@@ -1010,157 +1371,56 @@ class CarlaGroundTruthSafetyAdapter:
         sample_index_start: int,
         batch_accumulator: _RoadBatchAccumulator | None = None,
     ) -> tuple[RoadContainmentSample, ...]:
-        try:
-            points = _footprint_points(
-                center_xyz,
-                yaw_rad,
-                half_length_m,
-                half_width_m,
-            )
-            waypoints = []
-            for point in points:
-                query_started_s = time.perf_counter()
-                if batch_accumulator is not None:
-                    batch_accumulator.map_query_count += 1
-                try:
-                    waypoint = self._map.get_waypoint(
-                        carla.Location(
-                            x=float(point[0]),
-                            y=float(point[1]),
-                            z=float(point[2]),
-                        ),
-                        project_to_road=False,
-                        lane_type=carla.LaneType.Driving,
-                    )
-                finally:
-                    if batch_accumulator is not None:
-                        batch_accumulator.map_query_s += (
-                            time.perf_counter() - query_started_s
-                        )
-                waypoints.append(waypoint)
-        except Exception as exc:
-            if batch_accumulator is not None:
-                batch_accumulator.error_count += 1
-            return (
-                RoadContainmentSample(
-                    sample_index=sample_index_start,
-                    position_xyz=tuple(float(value) for value in center_xyz),
-                    contained=None,
-                    reason=f"carla_map_query_error:{type(exc).__name__}",
-                ),
-            )
-
-        center_waypoint = waypoints[0]
-        if center_waypoint is None:
-            return (
-                RoadContainmentSample(
-                    sample_index=sample_index_start,
-                    position_xyz=tuple(float(value) for value in center_xyz),
-                    contained=False,
-                    reason="center_off_driving_lane",
-                ),
-            )
-
-        is_junction = bool(getattr(center_waypoint, "is_junction", False))
-        if is_junction:
-            # Junction lane IDs and nominal widths are not a stable footprint
-            # boundary: an exact Driving waypoint for every footprint point is
-            # the authoritative CARLA drivable-area check here.
-            margin_m = None
-            center_contained = True
-            center_reason = None
-        else:
-            lane_yaw_rad = math.radians(
-                float(center_waypoint.transform.rotation.yaw)
-            )
-            lane_right = np.array(
-                [-math.sin(lane_yaw_rad), math.cos(lane_yaw_rad)],
-                dtype=np.float64,
-            )
-            lane_center = np.array(
-                [
-                    float(center_waypoint.transform.location.x),
-                    float(center_waypoint.transform.location.y),
-                ],
-                dtype=np.float64,
-            )
-            lateral_offset = float(np.dot(center_xyz[:2] - lane_center, lane_right))
-            path_forward = np.array(
-                [math.cos(yaw_rad), math.sin(yaw_rad)],
-                dtype=np.float64,
-            )
-            path_right = np.array(
-                [-math.sin(yaw_rad), math.cos(yaw_rad)],
-                dtype=np.float64,
-            )
-            lateral_support = (
-                abs(float(np.dot(path_forward, lane_right))) * half_length_m
-                + abs(float(np.dot(path_right, lane_right))) * half_width_m
-            )
-            margin_m = (
-                float(center_waypoint.lane_width) / 2.0
-                - abs(lateral_offset)
-                - lateral_support
-                - float(self.policy.lateral_clearance_m)
-            )
-            heading_error = abs(
-                _wrapped_angle_degrees(
-                    math.degrees(yaw_rad) - math.degrees(lane_yaw_rad)
-                )
-            )
-            center_contained = margin_m >= 0.0 and heading_error <= 45.0
-            center_reason = None
-            if margin_m < 0.0:
-                center_reason = "ego_footprint_exceeds_lane"
-            elif heading_error > 45.0:
-                center_reason = "path_heading_opposes_lane"
-
-        samples = [
-            RoadContainmentSample(
-                sample_index=sample_index_start,
-                position_xyz=tuple(float(value) for value in center_xyz),
-                contained=center_contained,
-                margin_m=margin_m,
-                road_id=int(center_waypoint.road_id),
-                lane_id=int(center_waypoint.lane_id),
-                is_junction=is_junction,
-                reason=center_reason,
-            )
-        ]
-        for corner_offset, (point, waypoint) in enumerate(
-            zip(points[1:], waypoints[1:]),
-            start=1,
-        ):
-            corner_is_junction = (
-                bool(getattr(waypoint, "is_junction", False))
-                if waypoint is not None
-                else False
-            )
-            same_lane = (
-                waypoint is not None
-                and (
-                    is_junction
-                    or corner_is_junction
-                    or (
-                        int(waypoint.road_id) == int(center_waypoint.road_id)
-                        and int(waypoint.lane_id) == int(center_waypoint.lane_id)
-                    )
-                )
-            )
-            samples.append(
-                RoadContainmentSample(
-                    sample_index=sample_index_start + corner_offset,
-                    position_xyz=tuple(float(value) for value in point),
-                    contained=bool(same_lane),
-                    road_id=(int(waypoint.road_id) if waypoint is not None else None),
-                    lane_id=(int(waypoint.lane_id) if waypoint is not None else None),
-                    is_junction=(
-                        corner_is_junction if waypoint is not None else None
+        query = _footprint_query(
+            query_id=max(0, int(sample_index_start) // 5),
+            center_xyz=center_xyz,
+            yaw_rad=yaw_rad,
+            half_length_m=half_length_m,
+            half_width_m=half_width_m,
+        )
+        query_started_s = time.perf_counter()
+        query_count = 0
+        primitives = []
+        error_type = None
+        for point in query.points_xyz:
+            query_count += 1
+            try:
+                waypoint = self._map.get_waypoint(
+                    carla.Location(
+                        x=float(point[0]),
+                        y=float(point[1]),
+                        z=float(point[2]),
                     ),
-                    reason=None if same_lane else "footprint_corner_off_driving_lane",
+                    project_to_road=False,
+                    lane_type=carla.LaneType.Driving,
                 )
-            )
-        return tuple(samples)
+                primitives.append(_waypoint_primitive(waypoint))
+            except Exception as exc:
+                error_type = type(exc).__name__
+                break
+        query_time_s = time.perf_counter() - query_started_s
+        if batch_accumulator is not None:
+            batch_accumulator.map_query_count += query_count
+            batch_accumulator.map_query_s += query_time_s
+            if error_type is not None:
+                batch_accumulator.error_count += 1
+        result = FootprintQueryResult(
+            query_id=query.query_id,
+            waypoints=tuple(primitives),
+            error_type=error_type,
+            map_query_count=query_count,
+            worker_query_ms=query_time_s * 1000.0,
+            worker_pid=int(os.getpid()),
+        )
+        return _aggregate_footprint_query(
+            query=query,
+            result=result,
+            yaw_rad=yaw_rad,
+            half_length_m=half_length_m,
+            half_width_m=half_width_m,
+            sample_index_start=sample_index_start,
+            lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
 
     def _assess_path_road(
         self,
@@ -1197,14 +1457,17 @@ class CarlaGroundTruthSafetyAdapter:
             quality = "carla_ground_truth_drivable_only_at_junction"
         return assess_road_containment(samples, quality=quality)
 
-    def _build_timed_road_profile(
+    def _prepare_timed_road_profile(
         self,
         plan: Any,
         ego: EgoKinematics,
         *,
         cache_key: str,
+        query_id_start: int = 0,
         batch_accumulator: _RoadBatchAccumulator | None = None,
-    ) -> _TimedRoadProfile:
+    ) -> _PreparedTimedRoadProfile:
+        """Densify and orient one plan without making CARLA map queries."""
+
         densify_started_s = time.perf_counter()
         points, times, distances, upper_indices = _densify_timed_path(
             plan.world_points,
@@ -1216,7 +1479,8 @@ class CarlaGroundTruthSafetyAdapter:
                 time.perf_counter() - densify_started_s
             )
             batch_accumulator.pose_count += len(points)
-        samples_by_pose = []
+        yaws = []
+        queries = []
         for index, point in enumerate(points):
             heading_started_s = time.perf_counter()
             yaw = _path_yaw(points, index, ego.yaw_rad)
@@ -1224,27 +1488,67 @@ class CarlaGroundTruthSafetyAdapter:
                 batch_accumulator.densify_heading_s += (
                     time.perf_counter() - heading_started_s
                 )
-            samples_by_pose.append(
-                self._query_footprint(
+            yaws.append(float(yaw))
+            queries.append(
+                _footprint_query(
+                    query_id=int(query_id_start) + index,
                     center_xyz=point[:3],
                     yaw_rad=yaw,
                     half_length_m=ego.half_length_m,
                     half_width_m=ego.half_width_m,
-                    sample_index_start=index * 5,
-                    batch_accumulator=batch_accumulator,
                 )
             )
-        aggregate_started_s = time.perf_counter()
-        flattened = tuple(sample for pose in samples_by_pose for sample in pose)
-        quality = "carla_ground_truth_exact_lane_and_footprint"
-        if any(sample.is_junction for sample in flattened):
-            quality = "carla_ground_truth_drivable_only_at_junction"
-        profile = _TimedRoadProfile(
+        return _PreparedTimedRoadProfile(
             cache_key=cache_key,
             points=points,
             times_s=times,
             cumulative_distance_m=distances,
             upper_waypoint_indices=upper_indices,
+            yaws_rad=tuple(yaws),
+            half_length_m=float(ego.half_length_m),
+            half_width_m=float(ego.half_width_m),
+            queries=tuple(queries),
+        )
+
+    def _assemble_timed_road_profile(
+        self,
+        prepared: _PreparedTimedRoadProfile,
+        results: tuple[FootprintQueryResult, ...],
+        *,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> _TimedRoadProfile:
+        """Apply shared footprint semantics and build one immutable profile."""
+
+        if len(results) != len(prepared.queries):
+            raise ValueError("prepared profile query/result count mismatch")
+        aggregate_started_s = time.perf_counter()
+        samples_by_pose = []
+        for index, (query, result) in enumerate(
+            zip(prepared.queries, results)
+        ):
+            if result.error_type is not None and batch_accumulator is not None:
+                batch_accumulator.error_count += 1
+            samples_by_pose.append(
+                _aggregate_footprint_query(
+                    query=query,
+                    result=result,
+                    yaw_rad=prepared.yaws_rad[index],
+                    half_length_m=prepared.half_length_m,
+                    half_width_m=prepared.half_width_m,
+                    sample_index_start=index * 5,
+                    lateral_clearance_m=self.policy.lateral_clearance_m,
+                )
+            )
+        flattened = tuple(sample for pose in samples_by_pose for sample in pose)
+        quality = "carla_ground_truth_exact_lane_and_footprint"
+        if any(sample.is_junction for sample in flattened):
+            quality = "carla_ground_truth_drivable_only_at_junction"
+        profile = _TimedRoadProfile(
+            cache_key=prepared.cache_key,
+            points=prepared.points,
+            times_s=prepared.times_s,
+            cumulative_distance_m=prepared.cumulative_distance_m,
+            upper_waypoint_indices=prepared.upper_waypoint_indices,
             samples_by_pose=tuple(samples_by_pose),
             quality=quality,
         )
@@ -1254,14 +1558,86 @@ class CarlaGroundTruthSafetyAdapter:
             )
         return profile
 
-    def _profile_for_plan(
+    def _query_prepared_profile_serial(
+        self,
+        prepared: _PreparedTimedRoadProfile,
+        *,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> tuple[FootprintQueryResult, ...]:
+        """Execute prepared footprint queries on the parent CARLA map."""
+
+        results = []
+        for query in prepared.queries:
+            query_started_s = time.perf_counter()
+            query_count = 0
+            primitives = []
+            error_type = None
+            for point in query.points_xyz:
+                query_count += 1
+                try:
+                    waypoint = self._map.get_waypoint(
+                        carla.Location(
+                            x=float(point[0]),
+                            y=float(point[1]),
+                            z=float(point[2]),
+                        ),
+                        project_to_road=False,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                    primitives.append(_waypoint_primitive(waypoint))
+                except Exception as exc:
+                    error_type = type(exc).__name__
+                    break
+            query_time_s = time.perf_counter() - query_started_s
+            if batch_accumulator is not None:
+                batch_accumulator.map_query_count += query_count
+                batch_accumulator.map_query_s += query_time_s
+            results.append(
+                FootprintQueryResult(
+                    query_id=query.query_id,
+                    waypoints=tuple(primitives),
+                    error_type=error_type,
+                    map_query_count=query_count,
+                    worker_query_ms=query_time_s * 1000.0,
+                    worker_pid=int(os.getpid()),
+                )
+            )
+        return tuple(results)
+
+    def _build_timed_road_profile(
+        self,
+        plan: Any,
+        ego: EgoKinematics,
+        *,
+        cache_key: str,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> _TimedRoadProfile:
+        """Serial compatibility path composed from shared prepare/aggregate."""
+
+        prepared = self._prepare_timed_road_profile(
+            plan,
+            ego,
+            cache_key=cache_key,
+            batch_accumulator=batch_accumulator,
+        )
+        results = self._query_prepared_profile_serial(
+            prepared,
+            batch_accumulator=batch_accumulator,
+        )
+        return self._assemble_timed_road_profile(
+            prepared,
+            results,
+            batch_accumulator=batch_accumulator,
+        )
+
+    def _profile_cache_key_for_plan(
         self,
         plan: Any,
         ego: EgoKinematics,
         *,
         tick_facts: RoadTickFacts | None = None,
         batch_accumulator: _RoadBatchAccumulator | None = None,
-    ) -> _TimedRoadProfile:
+    ) -> str:
         validation_started_s = time.perf_counter()
         try:
             plan_id = str(plan.plan_id)
@@ -1314,7 +1690,34 @@ class CarlaGroundTruthSafetyAdapter:
                 batch_accumulator.validation_s += (
                     time.perf_counter() - validation_started_s
                 )
+        return cache_key
 
+    def _cache_timed_road_profile(
+        self,
+        profile: _TimedRoadProfile,
+    ) -> None:
+        if not _timed_road_profile_cacheable(profile):
+            return
+        self._road_profile_cache[profile.cache_key] = profile
+        while len(self._road_profile_cache) > int(
+            cfg.SAFETY_ROAD_PROFILE_CACHE_SIZE
+        ):
+            self._road_profile_cache.popitem(last=False)
+
+    def _profile_for_plan(
+        self,
+        plan: Any,
+        ego: EgoKinematics,
+        *,
+        tick_facts: RoadTickFacts | None = None,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> _TimedRoadProfile:
+        cache_key = self._profile_cache_key_for_plan(
+            plan,
+            ego,
+            tick_facts=tick_facts,
+            batch_accumulator=batch_accumulator,
+        )
         profile = self._road_profile_cache.get(cache_key)
         if profile is not None:
             self._road_profile_cache.move_to_end(cache_key)
@@ -1330,12 +1733,7 @@ class CarlaGroundTruthSafetyAdapter:
             cache_key=cache_key,
             batch_accumulator=batch_accumulator,
         )
-        if _timed_road_profile_cacheable(profile):
-            self._road_profile_cache[cache_key] = profile
-            while len(self._road_profile_cache) > int(
-                cfg.SAFETY_ROAD_PROFILE_CACHE_SIZE
-            ):
-                self._road_profile_cache.popitem(last=False)
+        self._cache_timed_road_profile(profile)
         return profile
 
     @staticmethod
@@ -2041,6 +2439,307 @@ class CarlaGroundTruthSafetyAdapter:
         self._road_tick_facts_cache = tick_facts
         return tick_facts
 
+    def _envelope_for_profile(
+        self,
+        *,
+        profile: _TimedRoadProfile,
+        plan: Any,
+        tick_facts: RoadTickFacts,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> RoadExecutionEnvelope:
+        aggregate_started_s = time.perf_counter()
+        envelope = self._road_execution_envelope(
+            profile=profile,
+            plan=plan,
+            ego=tick_facts.ego,
+            current_time_s=tick_facts.simulation_time_s,
+            current_road=tick_facts.current_ego_road,
+            current_clearance_road=tick_facts.current_ego_clearance_road,
+            current_junction_context=tick_facts.current_junction_context,
+        )
+        if batch_accumulator is not None:
+            batch_accumulator.aggregate_s += (
+                time.perf_counter() - aggregate_started_s
+            )
+        return envelope
+
+    @staticmethod
+    def _profiles_semantically_equal(
+        process_profile: _TimedRoadProfile,
+        serial_profile: _TimedRoadProfile,
+    ) -> bool:
+        return bool(
+            process_profile.cache_key == serial_profile.cache_key
+            and process_profile.quality == serial_profile.quality
+            and np.array_equal(process_profile.points, serial_profile.points)
+            and np.array_equal(process_profile.times_s, serial_profile.times_s)
+            and np.array_equal(
+                process_profile.cumulative_distance_m,
+                serial_profile.cumulative_distance_m,
+            )
+            and np.array_equal(
+                process_profile.upper_waypoint_indices,
+                serial_profile.upper_waypoint_indices,
+            )
+            and process_profile.samples_by_pose
+            == serial_profile.samples_by_pose
+        )
+
+    @staticmethod
+    def _envelopes_semantically_equal(
+        process_envelope: RoadExecutionEnvelope,
+        serial_envelope: RoadExecutionEnvelope,
+    ) -> bool:
+        process_payload = process_envelope.to_json_dict()
+        serial_payload = serial_envelope.to_json_dict()
+        process_payload.pop("stopping_reserve_compute_ms", None)
+        serial_payload.pop("stopping_reserve_compute_ms", None)
+        return process_payload == serial_payload
+
+    def _serial_profiles_from_prepared(
+        self,
+        prepared_by_index: dict[int, _PreparedTimedRoadProfile],
+        *,
+        batch_accumulator: _RoadBatchAccumulator,
+    ) -> dict[int, _TimedRoadProfile]:
+        profiles = {}
+        for plan_index, prepared in prepared_by_index.items():
+            results = self._query_prepared_profile_serial(
+                prepared,
+                batch_accumulator=batch_accumulator,
+            )
+            profiles[plan_index] = self._assemble_timed_road_profile(
+                prepared,
+                results,
+                batch_accumulator=batch_accumulator,
+            )
+        return profiles
+
+    def _process_profiles_for_plans(
+        self,
+        *,
+        ordered_plans: tuple[Any, ...],
+        tick_facts: RoadTickFacts,
+        batch_accumulator: _RoadBatchAccumulator,
+    ) -> tuple[list[_TimedRoadProfile | None], dict[int, str]]:
+        """Resolve profile cache misses through process query + exact fallback."""
+
+        profiles: list[_TimedRoadProfile | None] = [
+            None for _plan in ordered_plans
+        ]
+        errors: dict[int, str] = {}
+        prepared_by_index: dict[int, _PreparedTimedRoadProfile] = {}
+        next_query_id = 0
+        for plan_index, plan in enumerate(ordered_plans):
+            try:
+                cache_key = self._profile_cache_key_for_plan(
+                    plan,
+                    tick_facts.ego,
+                    tick_facts=tick_facts,
+                    batch_accumulator=batch_accumulator,
+                )
+                cached = self._road_profile_cache.get(cache_key)
+                if cached is not None:
+                    self._road_profile_cache.move_to_end(cache_key)
+                    batch_accumulator.profile_cache_hits += 1
+                    profiles[plan_index] = cached
+                    continue
+                batch_accumulator.profile_cache_misses += 1
+                prepared = self._prepare_timed_road_profile(
+                    plan,
+                    tick_facts.ego,
+                    cache_key=cache_key,
+                    query_id_start=next_query_id,
+                    batch_accumulator=batch_accumulator,
+                )
+                next_query_id += len(prepared.queries)
+                prepared_by_index[plan_index] = prepared
+            except _PlanIdGeometryMismatch:
+                errors[plan_index] = "plan_id_geometry_mismatch"
+            except Exception as exc:
+                errors[plan_index] = (
+                    f"invalid_world_path:{type(exc).__name__}"
+                )
+
+        if not prepared_by_index:
+            if self._process_sticky_disabled_reason is not None:
+                batch_accumulator.backend_status = (
+                    "process_disabled_shadow_mismatch"
+                )
+                batch_accumulator.shadow_parity_status = "fail"
+                batch_accumulator.fallback_reason = (
+                    self._process_sticky_disabled_reason
+                )
+            elif (
+                self._process_generation_disabled_reason is not None
+                or self._process_backend is None
+            ):
+                batch_accumulator.backend_status = (
+                    "process_degraded_cache_only"
+                )
+                batch_accumulator.fallback_reason = (
+                    self._process_generation_disabled_reason
+                    or "process_unavailable"
+                )
+            else:
+                batch_accumulator.backend_status = (
+                    "process_cache_only"
+                    if not errors
+                    else "process_not_run"
+                )
+            batch_accumulator.worker_count = self._process_worker_count
+            return profiles, errors
+
+        process_profiles: dict[int, _TimedRoadProfile] | None = None
+        backend = self._process_backend
+        process_attempted = backend is not None
+        if backend is not None:
+            ordered_queries = tuple(
+                query
+                for prepared in prepared_by_index.values()
+                for query in prepared.queries
+            )
+            try:
+                process_results, process_stats = backend.query(
+                    ordered_queries
+                )
+                results_by_id = {
+                    result.query_id: result for result in process_results
+                }
+                if len(results_by_id) != len(ordered_queries):
+                    raise RoadProcessBackendError(
+                        "process result query IDs are not unique"
+                    )
+                process_profiles = {}
+                for plan_index, prepared in prepared_by_index.items():
+                    results = tuple(
+                        results_by_id[query.query_id]
+                        for query in prepared.queries
+                    )
+                    process_profiles[plan_index] = (
+                        self._assemble_timed_road_profile(
+                            prepared,
+                            results,
+                            batch_accumulator=batch_accumulator,
+                        )
+                    )
+                batch_accumulator.map_query_s += (
+                    process_stats.map_query_wall_ms / 1000.0
+                )
+                batch_accumulator.worker_query_sum_s += (
+                    process_stats.worker_query_sum_ms / 1000.0
+                )
+                batch_accumulator.map_query_count += (
+                    process_stats.map_query_count
+                )
+                batch_accumulator.worker_count = process_stats.worker_count
+                batch_accumulator.chunk_count = process_stats.chunk_count
+            except RoadProcessBackendTimeout:
+                batch_accumulator.fallback_reason = "timeout"
+                self._process_generation_disabled_reason = "timeout"
+            except RoadProcessBackendCrashed:
+                batch_accumulator.fallback_reason = "crash"
+                self._process_generation_disabled_reason = "crash"
+            except RoadProcessBackendError:
+                batch_accumulator.fallback_reason = "backend_error"
+                self._process_generation_disabled_reason = "backend_error"
+            except Exception as exc:
+                batch_accumulator.fallback_reason = (
+                    f"protocol_error:{type(exc).__name__}"
+                )
+                self._process_generation_disabled_reason = (
+                    "protocol_error"
+                )
+            if process_profiles is None:
+                self._close_process_backend()
+
+        if process_profiles is None:
+            fallback_started_s = time.perf_counter()
+            serial_profiles = self._serial_profiles_from_prepared(
+                prepared_by_index,
+                batch_accumulator=batch_accumulator,
+            )
+            batch_accumulator.serial_fallback_s += (
+                time.perf_counter() - fallback_started_s
+            )
+            reason = (
+                batch_accumulator.fallback_reason
+                or self._process_generation_disabled_reason
+                or self._process_sticky_disabled_reason
+                or "process_unavailable"
+            )
+            batch_accumulator.fallback_reason = reason
+            if process_attempted:
+                batch_accumulator.backend_status = (
+                    f"process_serial_fallback_{reason}"
+                )
+            elif self._process_sticky_disabled_reason is not None:
+                batch_accumulator.backend_status = (
+                    "process_disabled_shadow_mismatch"
+                )
+                batch_accumulator.shadow_parity_status = "fail"
+            else:
+                batch_accumulator.backend_status = "process_degraded"
+            chosen_profiles = serial_profiles
+        elif self._process_shadow_pending:
+            shadow_accumulator = _RoadBatchAccumulator()
+            shadow_started_s = time.perf_counter()
+            serial_profiles = self._serial_profiles_from_prepared(
+                prepared_by_index,
+                batch_accumulator=shadow_accumulator,
+            )
+            shadow_duration_s = time.perf_counter() - shadow_started_s
+            parity_ok = all(
+                self._profiles_semantically_equal(
+                    process_profiles[plan_index],
+                    serial_profiles[plan_index],
+                )
+                and self._envelopes_semantically_equal(
+                    self._envelope_for_profile(
+                        profile=process_profiles[plan_index],
+                        plan=ordered_plans[plan_index],
+                        tick_facts=tick_facts,
+                    ),
+                    self._envelope_for_profile(
+                        profile=serial_profiles[plan_index],
+                        plan=ordered_plans[plan_index],
+                        tick_facts=tick_facts,
+                    ),
+                )
+                for plan_index in prepared_by_index
+            )
+            self._process_shadow_pending = False
+            if parity_ok:
+                batch_accumulator.shadow_parity_status = "pass"
+                batch_accumulator.backend_status = "process_shadow_pass"
+                chosen_profiles = process_profiles
+            else:
+                batch_accumulator.shadow_parity_status = "fail"
+                batch_accumulator.fallback_reason = (
+                    "shadow_parity_mismatch"
+                )
+                batch_accumulator.serial_fallback_s += shadow_duration_s
+                batch_accumulator.backend_status = (
+                    "process_disabled_shadow_mismatch"
+                )
+                self._process_sticky_disabled_reason = (
+                    "shadow_parity_mismatch"
+                )
+                self._close_process_backend()
+                chosen_profiles = serial_profiles
+        else:
+            batch_accumulator.backend_status = (
+                "process_degraded"
+                if batch_accumulator.error_count
+                else "process"
+            )
+            chosen_profiles = process_profiles
+
+        for plan_index, profile in chosen_profiles.items():
+            profiles[plan_index] = profile
+            self._cache_timed_road_profile(profile)
+        return profiles, errors
+
     def _finish_road_batch_stats(
         self,
         *,
@@ -2048,12 +2747,22 @@ class CarlaGroundTruthSafetyAdapter:
         batch_started_s: float,
         plan_count: int,
     ) -> None:
-        self._last_road_batch_stats = RoadAssessmentBatchStats(
-            backend_status=(
+        backend_status = batch_accumulator.backend_status
+        if backend_status is None:
+            backend_status = (
                 "serial_degraded"
                 if batch_accumulator.error_count
                 else "serial"
-            ),
+            )
+        chunk_count = batch_accumulator.chunk_count
+        if (
+            chunk_count == 0
+            and plan_count
+            and backend_status.startswith("serial")
+        ):
+            chunk_count = 1
+        self._last_road_batch_stats = RoadAssessmentBatchStats(
+            backend_status=backend_status,
             road_batch_wall_ms=(
                 (time.perf_counter() - batch_started_s) * 1000.0
             ),
@@ -2066,11 +2775,19 @@ class CarlaGroundTruthSafetyAdapter:
             plan_count=int(plan_count),
             pose_count=int(batch_accumulator.pose_count),
             map_query_count=int(batch_accumulator.map_query_count),
-            worker_count=1,
-            chunk_count=1 if plan_count else 0,
+            worker_count=int(batch_accumulator.worker_count),
+            chunk_count=int(chunk_count),
             profile_cache_hits=int(batch_accumulator.profile_cache_hits),
             profile_cache_misses=int(batch_accumulator.profile_cache_misses),
             error_count=int(batch_accumulator.error_count),
+            shadow_parity_status=batch_accumulator.shadow_parity_status,
+            fallback_reason=batch_accumulator.fallback_reason,
+            serial_fallback_ms=(
+                batch_accumulator.serial_fallback_s * 1000.0
+            ),
+            worker_query_sum_ms=(
+                batch_accumulator.worker_query_sum_s * 1000.0
+            ),
         )
 
     def assess_plans_road(
@@ -2083,6 +2800,8 @@ class CarlaGroundTruthSafetyAdapter:
 
         batch_started_s = time.perf_counter()
         batch_accumulator = _RoadBatchAccumulator()
+        if self._road_assessment_backend == "process":
+            batch_accumulator.worker_count = self._process_worker_count
         ordered_plans = tuple(plans)
         if not ordered_plans:
             self._finish_road_batch_stats(
@@ -2113,44 +2832,66 @@ class CarlaGroundTruthSafetyAdapter:
             return envelopes
 
         envelopes = []
-        for plan in ordered_plans:
-            try:
-                profile = self._profile_for_plan(
-                    plan,
-                    tick_facts.ego,
-                    tick_facts=tick_facts,
-                    batch_accumulator=batch_accumulator,
-                )
-                aggregate_started_s = time.perf_counter()
-                envelope = self._road_execution_envelope(
-                    profile=profile,
-                    plan=plan,
-                    ego=tick_facts.ego,
-                    current_time_s=tick_facts.simulation_time_s,
-                    current_road=tick_facts.current_ego_road,
-                    current_clearance_road=(
-                        tick_facts.current_ego_clearance_road
-                    ),
-                    current_junction_context=(
-                        tick_facts.current_junction_context
-                    ),
-                )
-                batch_accumulator.aggregate_s += (
-                    time.perf_counter() - aggregate_started_s
-                )
-            except _PlanIdGeometryMismatch:
-                batch_accumulator.error_count += 1
-                envelope = self._unknown_envelope(
-                    "plan_id_geometry_mismatch",
-                    current_road=tick_facts.current_ego_road,
-                )
-            except Exception as exc:
-                batch_accumulator.error_count += 1
-                envelope = self._unknown_envelope(
-                    f"invalid_world_path:{type(exc).__name__}",
-                    current_road=tick_facts.current_ego_road,
-                )
-            envelopes.append(envelope)
+        if self._road_assessment_backend == "process":
+            profiles, profile_errors = self._process_profiles_for_plans(
+                ordered_plans=ordered_plans,
+                tick_facts=tick_facts,
+                batch_accumulator=batch_accumulator,
+            )
+            for plan_index, plan in enumerate(ordered_plans):
+                profile = profiles[plan_index]
+                if profile is None:
+                    batch_accumulator.error_count += 1
+                    envelope = self._unknown_envelope(
+                        profile_errors.get(
+                            plan_index,
+                            "process_profile_unavailable",
+                        ),
+                        current_road=tick_facts.current_ego_road,
+                    )
+                else:
+                    try:
+                        envelope = self._envelope_for_profile(
+                            profile=profile,
+                            plan=plan,
+                            tick_facts=tick_facts,
+                            batch_accumulator=batch_accumulator,
+                        )
+                    except Exception as exc:
+                        batch_accumulator.error_count += 1
+                        envelope = self._unknown_envelope(
+                            f"invalid_world_path:{type(exc).__name__}",
+                            current_road=tick_facts.current_ego_road,
+                        )
+                envelopes.append(envelope)
+        else:
+            for plan in ordered_plans:
+                try:
+                    profile = self._profile_for_plan(
+                        plan,
+                        tick_facts.ego,
+                        tick_facts=tick_facts,
+                        batch_accumulator=batch_accumulator,
+                    )
+                    envelope = self._envelope_for_profile(
+                        profile=profile,
+                        plan=plan,
+                        tick_facts=tick_facts,
+                        batch_accumulator=batch_accumulator,
+                    )
+                except _PlanIdGeometryMismatch:
+                    batch_accumulator.error_count += 1
+                    envelope = self._unknown_envelope(
+                        "plan_id_geometry_mismatch",
+                        current_road=tick_facts.current_ego_road,
+                    )
+                except Exception as exc:
+                    batch_accumulator.error_count += 1
+                    envelope = self._unknown_envelope(
+                        f"invalid_world_path:{type(exc).__name__}",
+                        current_road=tick_facts.current_ego_road,
+                    )
+                envelopes.append(envelope)
 
         self._finish_road_batch_stats(
             batch_accumulator=batch_accumulator,

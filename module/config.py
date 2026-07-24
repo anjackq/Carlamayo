@@ -204,6 +204,12 @@ PLAN_HANDOFF_HEADROOM_TIME_REGRESSION_S = SAFETY_REACTION_TIME_S
 # so candidate admission can reuse the same exact CARLA map queries at control
 # time without growing for the whole episode.
 SAFETY_ROAD_PROFILE_CACHE_SIZE = 8
+# Exact CARLA map queries may run in an opt-in spawn-process backend.  A
+# footprint's five queries always stay together; chunks are counted in
+# densified trajectory poses, not individual map lookups.
+ROAD_ASSESSMENT_PROCESS_CHUNK_POSES = 16
+ROAD_ASSESSMENT_PROCESS_STARTUP_TIMEOUT_S = 10.0
+ROAD_ASSESSMENT_PROCESS_BATCH_TIMEOUT_S = 0.15
 
 # Auto-respawn after collision.
 RESPAWN_COLLISION_COOLDOWN_FRAMES = 10

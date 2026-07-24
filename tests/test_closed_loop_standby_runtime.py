@@ -390,7 +390,7 @@ def _run_standby_scenario(
     monkeypatch.setattr(
         closed_loop,
         "CarlaGroundTruthSafetyAdapter",
-        lambda *_args: adapter,
+        lambda *_args, **_kwargs: adapter,
     )
     monkeypatch.setattr(
         closed_loop,
