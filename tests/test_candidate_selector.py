@@ -17,6 +17,11 @@ def _candidate(
     margin=0.5,
     continuity=1.0,
     rejection=None,
+    motion=None,
+    initial_speed=None,
+    reserve_status=None,
+    reserve=None,
+    time_to_bad=None,
 ):
     return CandidateEvaluation(
         candidate_index=index,
@@ -28,6 +33,11 @@ def _candidate(
         representative_lateral_m=lateral,
         full_path_margin_m=margin,
         continuity_m=continuity,
+        motion_class=motion,
+        initial_target_speed_mps=initial_speed,
+        stopping_reserve_status=reserve_status,
+        stopping_reserve_m=reserve,
+        time_to_first_bad_s=time_to_bad,
     )
 
 
@@ -120,6 +130,102 @@ def test_full_safe_candidate_beats_safe_prefix_before_continuity():
         ],
         navigation_text=None,
         prefer_moving=False,
+    )
+
+    assert selection.selected_index == 1
+
+
+def test_robust_stopping_reserve_beats_fragile_continuity_candidate():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                admission="ACCEPT_SAFE_PREFIX",
+                reserve_status="FRAGILE",
+                reserve=-0.4,
+                time_to_bad=2.0,
+                continuity=0.01,
+            ),
+            _candidate(
+                2,
+                admission="ACCEPT_SAFE_PREFIX",
+                reserve_status="ROBUST",
+                reserve=5.0,
+                time_to_bad=4.0,
+                continuity=4.0,
+            ),
+        ],
+        navigation_text=None,
+        prefer_moving=False,
+    )
+
+    assert selection.selected_index == 2
+    assert selection.selected.reserve_fragility_rank == 0
+
+
+def test_empty_road_motion_class_precedes_admission_quality():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                admission="ACCEPT_FULLY_SAFE",
+                motion="CREEP_OR_STALL",
+                reserve_status="UNBOUNDED",
+            ),
+            _candidate(
+                1,
+                admission="ACCEPT_SAFE_PREFIX",
+                motion="MOVING",
+                reserve_status="UNBOUNDED",
+            ),
+        ],
+        navigation_text=None,
+        prefer_moving=True,
+        current_speed_mps=0.0,
+    )
+
+    assert selection.selected_index == 1
+    assert selection.selected.motion_quality_rank == 0
+
+
+def test_normal_traffic_neutralizes_motion_and_speed_continuity():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                motion="EXPLICIT_STOP",
+                initial_speed=0.0,
+                continuity=0.1,
+            ),
+            _candidate(
+                1,
+                motion="MOVING",
+                initial_speed=5.0,
+                continuity=2.0,
+            ),
+        ],
+        navigation_text=None,
+        prefer_moving=False,
+        current_speed_mps=5.0,
+    )
+
+    assert selection.selected_index == 0
+    assert all(item.motion_quality_rank == 0 for item in selection.ranked_candidates)
+    assert all(
+        item.speed_continuity_rank_mps == 0.0
+        for item in selection.ranked_candidates
+    )
+
+
+def test_empty_road_speed_continuity_breaks_otherwise_equal_candidates():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(0, motion="MOVING", initial_speed=1.0),
+            _candidate(1, motion="MOVING", initial_speed=4.5),
+        ],
+        navigation_text=None,
+        prefer_moving=True,
+        current_speed_mps=4.0,
     )
 
     assert selection.selected_index == 1

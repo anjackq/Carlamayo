@@ -26,6 +26,19 @@ _ADMISSION_QUALITY = {
     "ACCEPT_SAFE_PREFIX": 1,
     "ACCEPT_RECOVERY_PREFIX": 2,
 }
+_RESERVE_QUALITY = {
+    "UNBOUNDED": 0,
+    "ROBUST": 0,
+    "RECOVERY": 1,
+    "FRAGILE": 2,
+    "UNAVAILABLE": 3,
+}
+_MOTION_QUALITY = {
+    "MOVING": 0,
+    "DELAYED_START": 1,
+    "CREEP_OR_STALL": 2,
+    "EXPLICIT_STOP": 3,
+}
 _RIGHT_RE = re.compile(r"\bright\b", re.IGNORECASE)
 _LEFT_RE = re.compile(r"\bleft\b", re.IGNORECASE)
 ROUTE_LATERAL_DEADBAND_M = 0.75
@@ -56,6 +69,11 @@ class CandidateEvaluation:
     representative_lateral_m: float
     full_path_margin_m: float | None
     continuity_m: float | None
+    motion_class: str | None = None
+    initial_target_speed_mps: float | None = None
+    stopping_reserve_status: str | None = None
+    stopping_reserve_m: float | None = None
+    time_to_first_bad_s: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.candidate_index, bool) or int(self.candidate_index) < 0:
@@ -98,6 +116,38 @@ class CandidateEvaluation:
             "continuity_m",
             _finite_or_none(self.continuity_m, "continuity_m"),
         )
+        motion_class = (
+            None if self.motion_class is None else str(self.motion_class).strip() or None
+        )
+        if motion_class is not None and motion_class not in _MOTION_QUALITY:
+            raise ValueError(f"unknown motion_class: {motion_class}")
+        object.__setattr__(self, "motion_class", motion_class)
+        reserve_status = (
+            None
+            if self.stopping_reserve_status is None
+            else str(self.stopping_reserve_status).strip() or None
+        )
+        if reserve_status is not None and reserve_status not in _RESERVE_QUALITY:
+            raise ValueError(f"unknown stopping_reserve_status: {reserve_status}")
+        object.__setattr__(self, "stopping_reserve_status", reserve_status)
+        object.__setattr__(
+            self,
+            "initial_target_speed_mps",
+            _finite_or_none(
+                self.initial_target_speed_mps,
+                "initial_target_speed_mps",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "stopping_reserve_m",
+            _finite_or_none(self.stopping_reserve_m, "stopping_reserve_m"),
+        )
+        object.__setattr__(
+            self,
+            "time_to_first_bad_s",
+            _finite_or_none(self.time_to_first_bad_s, "time_to_first_bad_s"),
+        )
 
     @property
     def admitted(self) -> bool:
@@ -110,10 +160,15 @@ class RankedCandidate:
 
     evaluation: CandidateEvaluation
     category_rank: int
+    reserve_fragility_rank: int
+    motion_quality_rank: int
     stop_penalty: int
     admission_quality_rank: int
+    negative_stopping_reserve_m: float
+    negative_time_to_first_bad_s: float
     route_mismatch_rank: float
     negative_full_path_margin: float
+    speed_continuity_rank_mps: float
     continuity_rank_m: float
     negative_forward_progress_m: float
 
@@ -121,10 +176,14 @@ class RankedCandidate:
     def ranking_key(self) -> tuple[float, ...]:
         return (
             float(self.category_rank),
-            float(self.stop_penalty),
+            float(self.reserve_fragility_rank),
+            float(self.motion_quality_rank),
             float(self.admission_quality_rank),
+            float(self.negative_stopping_reserve_m),
+            float(self.negative_time_to_first_bad_s),
             float(self.route_mismatch_rank),
             float(self.negative_full_path_margin),
+            float(self.speed_continuity_rank_mps),
             float(self.continuity_rank_m),
             float(self.negative_forward_progress_m),
             float(self.evaluation.candidate_index),
@@ -143,9 +202,17 @@ class RankedCandidate:
             "representative_lateral_m": evaluation.representative_lateral_m,
             "full_path_margin_m": evaluation.full_path_margin_m,
             "continuity_m": evaluation.continuity_m,
+            "motion_class": evaluation.motion_class,
+            "initial_target_speed_mps": evaluation.initial_target_speed_mps,
+            "stopping_reserve_status": evaluation.stopping_reserve_status,
+            "stopping_reserve_m": evaluation.stopping_reserve_m,
+            "time_to_first_bad_s": evaluation.time_to_first_bad_s,
             "category_rank": self.category_rank,
+            "reserve_fragility_rank": self.reserve_fragility_rank,
+            "motion_quality_rank": self.motion_quality_rank,
             "stop_penalty": self.stop_penalty,
             "admission_quality_rank": self.admission_quality_rank,
+            "speed_continuity_rank_mps": self.speed_continuity_rank_mps,
             "route_mismatch_rank": self.route_mismatch_rank,
             "ranking_key": [
                 value if math.isfinite(value) else None
@@ -223,6 +290,7 @@ def rank_candidate_evaluations(
     *,
     navigation_text: str | None,
     prefer_moving: bool,
+    current_speed_mps: float | None = None,
 ) -> CandidateSelection:
     """Rank all evaluated candidates with safety eligibility first.
 
@@ -239,13 +307,34 @@ def rank_candidate_evaluations(
         raise ValueError("candidate indices must be unique")
 
     desired_turn = navigation_turn_direction(navigation_text)
+    current_speed = _finite_or_none(current_speed_mps, "current_speed_mps")
     ranked = []
     for candidate in candidates:
         category = _category_rank(candidate.admission_status)
         admission_quality = _ADMISSION_QUALITY.get(candidate.admission_status, 99)
-        stop_penalty = int(
-            category == 0 and bool(prefer_moving) and candidate.stop_requested
+        reserve_status = candidate.stopping_reserve_status or "UNAVAILABLE"
+        reserve_fragility = _RESERVE_QUALITY[reserve_status]
+        effective_motion_class = candidate.motion_class or (
+            "EXPLICIT_STOP" if candidate.stop_requested else "MOVING"
         )
+        motion_quality = (
+            _MOTION_QUALITY[effective_motion_class] if prefer_moving else 0
+        )
+        stop_penalty = int(prefer_moving and effective_motion_class == "EXPLICIT_STOP")
+        if reserve_status == "UNBOUNDED":
+            reserve_rank = float("-inf")
+            time_rank = float("-inf")
+        else:
+            reserve_rank = (
+                -candidate.stopping_reserve_m
+                if candidate.stopping_reserve_m is not None
+                else float("inf")
+            )
+            time_rank = (
+                -candidate.time_to_first_bad_s
+                if candidate.time_to_first_bad_s is not None
+                else float("inf")
+            )
         margin_rank = (
             -candidate.full_path_margin_m
             if candidate.full_path_margin_m is not None
@@ -256,17 +345,33 @@ def rank_candidate_evaluations(
             if candidate.continuity_m is not None
             else float("inf")
         )
+        speed_continuity_rank = 0.0
+        if prefer_moving:
+            if (
+                current_speed is None
+                or candidate.initial_target_speed_mps is None
+            ):
+                speed_continuity_rank = float("inf")
+            else:
+                speed_continuity_rank = abs(
+                    candidate.initial_target_speed_mps - current_speed
+                )
         ranked.append(
             RankedCandidate(
                 evaluation=candidate,
                 category_rank=category,
+                reserve_fragility_rank=reserve_fragility,
+                motion_quality_rank=motion_quality,
                 stop_penalty=stop_penalty,
                 admission_quality_rank=admission_quality,
+                negative_stopping_reserve_m=reserve_rank,
+                negative_time_to_first_bad_s=time_rank,
                 route_mismatch_rank=_route_mismatch_rank(
                     candidate.representative_lateral_m,
                     desired_turn,
                 ),
                 negative_full_path_margin=margin_rank,
+                speed_continuity_rank_mps=speed_continuity_rank,
                 continuity_rank_m=continuity_rank,
                 negative_forward_progress_m=-candidate.forward_progress_m,
             )
