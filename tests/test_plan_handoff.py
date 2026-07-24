@@ -84,7 +84,7 @@ def test_missing_safe_prefix_headroom_boundedly_retains_active_plan():
     assert decision.reason == "safe_prefix_headroom_unavailable"
 
 
-def test_worse_admission_tier_cannot_replace_fully_safe_active_plan():
+def test_robust_safe_prefix_can_refresh_fully_safe_active_plan():
     decision = _decision(
         candidate_admission_status="ACCEPT_SAFE_PREFIX",
         active_admission_status="ACCEPT_FULLY_SAFE",
@@ -93,7 +93,7 @@ def test_worse_admission_tier_cannot_replace_fully_safe_active_plan():
         active_time_to_first_bad_s=None,
     )
 
-    assert decision.status is PlanHandoffStatus.RETAIN_ACTIVE_STOPPING_RESERVE
+    assert decision.status is PlanHandoffStatus.ACTIVATE_FRESH
 
 
 def test_empty_road_worse_motion_is_boundedly_retained():

@@ -220,13 +220,6 @@ def decide_plan_handoff(
             reason="active_plan_retention_deadline_reached",
             **common,
         )
-    if candidate_safety > active_safety:
-        return PlanHandoffDecision(
-            status=PlanHandoffStatus.RETAIN_ACTIVE_STOPPING_RESERVE,
-            activate_candidate=False,
-            reason="candidate_safety_tier_worse_than_active",
-            **common,
-        )
     if (
         candidate_reserve == "FRAGILE"
         and active_reserve in {"ROBUST", "UNBOUNDED"}
