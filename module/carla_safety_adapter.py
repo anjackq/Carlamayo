@@ -8,6 +8,7 @@ snapshot associated with the current control tick.
 from __future__ import annotations
 
 import math
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -104,6 +105,7 @@ class RoadExecutionEnvelope:
     junction_context: bool = False
     recovery_required: bool = False
     stopping_reserve_profile: StoppingReserveProfile | None = None
+    stopping_reserve_compute_ms: float | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         reserve = self.stopping_reserve_profile
@@ -153,6 +155,7 @@ class RoadExecutionEnvelope:
             "stopping_reserve_profile": (
                 reserve.to_json_dict() if reserve is not None else None
             ),
+            "stopping_reserve_compute_ms": self.stopping_reserve_compute_ms,
         }
 
 
@@ -891,6 +894,13 @@ class CarlaGroundTruthSafetyAdapter:
                 ),
             )
 
+        first_bad = self._first_bad_profile_index(
+            profile,
+            remaining_indices,
+            physical_surface=recovery_required,
+            lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
+        reserve_compute_started_s = time.perf_counter()
         current_speed = float(math.hypot(*ego.velocity_xy))
         near_term_peak_speed = _near_term_plan_peak_speed_mps(
             plan,
@@ -909,12 +919,6 @@ class CarlaGroundTruthSafetyAdapter:
             * float(cfg.CONTROL_DT)
         )
 
-        first_bad = self._first_bad_profile_index(
-            profile,
-            remaining_indices,
-            physical_surface=recovery_required,
-            lateral_clearance_m=self.policy.lateral_clearance_m,
-        )
         if first_bad is None:
             target_speed_cap = (
                 float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS)
@@ -950,6 +954,9 @@ class CarlaGroundTruthSafetyAdapter:
                     stopping_reserve_m=None,
                     status=reserve_status,
                 ),
+                stopping_reserve_compute_ms=(
+                    (time.perf_counter() - reserve_compute_started_s) * 1000.0
+                ),
             )
 
         first_remaining = int(remaining_indices[0])
@@ -984,13 +991,13 @@ class CarlaGroundTruthSafetyAdapter:
             distance_to_bad,
             self.policy,
         )
-        target_speed_cap = min(
+        nominal_target_speed_cap = min(
             raw_physical_cap,
             float(cfg.TRAJECTORY_MAX_SPEED_MPS),
         )
         if recovery_required:
-            target_speed_cap = min(
-                target_speed_cap,
+            nominal_target_speed_cap = min(
+                nominal_target_speed_cap,
                 float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS),
             )
         emergency_required = (
@@ -1015,6 +1022,18 @@ class CarlaGroundTruthSafetyAdapter:
         )
         if current_road.status is not AssessmentStatus.SAFE:
             reserve_status = StoppingReserveStatus.UNAVAILABLE
+        # The raw physical cap is the emergency boundary, not a suitable
+        # asymptotic PID setpoint once the one-step guarded reserve is already
+        # negative.  Pull only the controller target down by the same bounded
+        # acceleration used in v_guard; emergency semantics remain unchanged.
+        target_speed_cap = nominal_target_speed_cap
+        if reserve_status is StoppingReserveStatus.FRAGILE:
+            target_speed_cap = max(
+                0.0,
+                nominal_target_speed_cap
+                - float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
+                * float(cfg.CONTROL_DT),
+            )
         return RoadExecutionEnvelope(
             current_ego_road=current_road,
             near_term_path_road=near_term,
@@ -1036,6 +1055,9 @@ class CarlaGroundTruthSafetyAdapter:
                 required_stopping_distance_m=required_stopping_distance,
                 stopping_reserve_m=stopping_reserve,
                 status=reserve_status,
+            ),
+            stopping_reserve_compute_ms=(
+                (time.perf_counter() - reserve_compute_started_s) * 1000.0
             ),
         )
 

@@ -1338,6 +1338,7 @@ def main():
                 admission_error = None
                 rejection_reason = None
                 motion_profile = None
+                motion_profile_compute_ms = None
                 try:
                     plan, _validity = _build_and_validate_fixed_plan(
                         result,
@@ -1350,6 +1351,7 @@ def main():
                         f"candidate_validation_error:{type(exc).__name__}"
                     )
                 else:
+                    motion_profile_started_s = time.perf_counter()
                     try:
                         motion_profile = compute_trajectory_motion_profile(
                             plan,
@@ -1357,6 +1359,10 @@ def main():
                         )
                     except TrajectoryValidationError as exc:
                         rejection_reason = exc.reason
+                    finally:
+                        motion_profile_compute_ms = (
+                            time.perf_counter() - motion_profile_started_s
+                        ) * 1000.0
                     try:
                         if rejection_reason is None:
                             envelope = _assess_plan_road_envelope(plan)
@@ -1442,6 +1448,7 @@ def main():
                         "admission_error": admission_error,
                         "evaluation": evaluation,
                         "motion_profile": motion_profile,
+                        "motion_profile_compute_ms": motion_profile_compute_ms,
                     }
                 )
 
@@ -1480,6 +1487,23 @@ def main():
                     trajectory_motion_profile=(
                         record["motion_profile"].to_json_dict()
                         if record["motion_profile"] is not None
+                        else None
+                    ),
+                    motion_profile_compute_ms=record[
+                        "motion_profile_compute_ms"
+                    ],
+                    stopping_reserve_compute_ms=(
+                        record["envelope"].stopping_reserve_compute_ms
+                        if record["envelope"] is not None
+                        else None
+                    ),
+                    motion_reserve_compute_ms=(
+                        record["motion_profile_compute_ms"]
+                        + record["envelope"].stopping_reserve_compute_ms
+                        if record["motion_profile_compute_ms"] is not None
+                        and record["envelope"] is not None
+                        and record["envelope"].stopping_reserve_compute_ms
+                        is not None
                         else None
                     ),
                     verified_empty_road=prefer_moving,

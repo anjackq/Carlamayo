@@ -648,7 +648,13 @@ def test_guarded_stopping_reserve_can_be_fragile_without_emergency(
     assert reserve.required_stopping_distance_m > envelope.distance_to_first_bad_m
     assert reserve.stopping_reserve_m < 0.0
     assert reserve.status is StoppingReserveStatus.FRAGILE
+    assert envelope.target_speed_cap_mps == pytest.approx(
+        reserve.raw_physical_stopping_cap_mps
+        - carla_safety_adapter.cfg.SAFETY_GUARDED_ACCELERATION_MPS2
+        * carla_safety_adapter.cfg.CONTROL_DT
+    )
     assert envelope.emergency_required is False
+    assert envelope.stopping_reserve_compute_ms >= 0.0
 
 
 def test_genuine_insufficient_physical_stopping_distance_remains_fail_closed(
