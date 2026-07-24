@@ -126,6 +126,12 @@ TRAJECTORY_MAX_SPEED_MPS = 35.0 / 3.6
 TRAJECTORY_TIME_EPSILON_S = 1e-6
 TRAJECTORY_MAX_TRACKING_ERROR_M = 2.5
 TRAJECTORY_MAX_HEADING_ERROR_DEG = 45.0
+# Multiple nearby, heading-compatible path branches must not let geometric
+# projection jump over an unexecuted portion of a folded trajectory.  Adjacent
+# densified segments can legitimately offer several local projections, so only
+# candidates separated by more than the local progress span are ambiguous.
+TRAJECTORY_PROJECTION_AMBIGUITY_DISTANCE_M = 0.25
+TRAJECTORY_PROJECTION_LOCAL_PROGRESS_SPAN_M = 1.0
 # Estimate path heading over a meaningful spatial baseline.  Alpamayo can emit
 # micrometre-scale reversals while starting or stopping; those numerical
 # oscillations must not be interpreted as a 180-degree driving direction.

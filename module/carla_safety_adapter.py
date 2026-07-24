@@ -106,6 +106,12 @@ class RoadExecutionEnvelope:
     recovery_required: bool = False
     stopping_reserve_profile: StoppingReserveProfile | None = None
     stopping_reserve_compute_ms: float | None = None
+    execution_cursor_index: int | None = None
+    ego_path_progress_m: float | None = None
+    ego_path_cross_track_m: float | None = None
+    ego_path_heading_error_deg: float | None = None
+    first_bad_path_progress_m: float | None = None
+    effective_stopping_boundary_progress_m: float | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         reserve = self.stopping_reserve_profile
@@ -156,6 +162,24 @@ class RoadExecutionEnvelope:
                 reserve.to_json_dict() if reserve is not None else None
             ),
             "stopping_reserve_compute_ms": self.stopping_reserve_compute_ms,
+            "execution_cursor": (
+                "ego_geometric_progress"
+                if self.execution_cursor_index is not None
+                else None
+            ),
+            "execution_cursor_index": self.execution_cursor_index,
+            "ego_path_progress_m": self.ego_path_progress_m,
+            "ego_path_cross_track_m": self.ego_path_cross_track_m,
+            "ego_path_heading_error_deg": self.ego_path_heading_error_deg,
+            "first_bad_path_progress_m": self.first_bad_path_progress_m,
+            "effective_stopping_boundary_progress_m": (
+                self.effective_stopping_boundary_progress_m
+            ),
+            "time_to_first_bad_quality": (
+                "scheduled_model_time"
+                if self.time_to_first_bad_s is not None
+                else None
+            ),
         }
 
 
@@ -170,6 +194,16 @@ class _TimedRoadProfile:
     upper_waypoint_indices: np.ndarray
     samples_by_pose: tuple[tuple[RoadContainmentSample, ...], ...]
     quality: str
+
+
+@dataclass(frozen=True)
+class _PathProgressProjection:
+    """Ego projection used as the physical road-execution cursor."""
+
+    progress_m: float
+    first_path_index: int
+    cross_track_m: float
+    heading_error_deg: float
 
 
 def decide_plan_admission(
@@ -482,6 +516,166 @@ def _densify_timed_path(
         np.asarray(dense_times, dtype=np.float64),
         np.asarray(dense_distances, dtype=np.float64),
         np.asarray(upper_indices, dtype=np.int64),
+    )
+
+
+def _project_path_progress(
+    *,
+    points: np.ndarray,
+    cumulative_distance_m: np.ndarray,
+    ego_xy: tuple[float, float],
+    ego_yaw_rad: float,
+) -> _PathProgressProjection:
+    """Project ego onto a path without granting ambiguous longitudinal progress.
+
+    Model timestamps remain the source for freshness and scheduled-time
+    telemetry.  Physical stopping distance instead starts at the ego's measured
+    path progress, so longitudinal prediction error cannot add fictitious road
+    headroom.  A self-intersection with multiple separated progress solutions
+    is fail-closed rather than guessed.
+    """
+
+    path = np.asarray(points, dtype=np.float64)
+    cumulative = np.asarray(cumulative_distance_m, dtype=np.float64)
+    position = np.asarray(ego_xy, dtype=np.float64)
+    yaw = float(ego_yaw_rad)
+    if (
+        path.ndim != 2
+        or path.shape[1] < 2
+        or len(path) == 0
+        or cumulative.shape != (len(path),)
+        or position.shape != (2,)
+        or not np.isfinite(path[:, :2]).all()
+        or not np.isfinite(cumulative).all()
+        or not np.isfinite(position).all()
+        or not math.isfinite(yaw)
+        or np.any(np.diff(cumulative) < -1e-9)
+    ):
+        raise ValueError("invalid path progress projection input")
+
+    if len(path) == 1:
+        cross_track = float(np.linalg.norm(position - path[0, :2]))
+        if cross_track > float(cfg.TRAJECTORY_MAX_TRACKING_ERROR_M):
+            raise ValueError("path progress projection exceeds tracking corridor")
+        return _PathProgressProjection(
+            progress_m=0.0,
+            first_path_index=0,
+            cross_track_m=cross_track,
+            heading_error_deg=0.0,
+        )
+
+    deltas = np.diff(path[:, :2], axis=0)
+    length_sq = np.einsum("ij,ij->i", deltas, deltas)
+    moving_indices = np.flatnonzero(length_sq > 1e-12)
+    if len(moving_indices) == 0:
+        cross_track = float(np.linalg.norm(position - path[0, :2]))
+        if cross_track > float(cfg.TRAJECTORY_MAX_TRACKING_ERROR_M):
+            raise ValueError("path progress projection exceeds tracking corridor")
+        return _PathProgressProjection(
+            progress_m=0.0,
+            first_path_index=0,
+            cross_track_m=cross_track,
+            heading_error_deg=0.0,
+        )
+
+    starts = path[moving_indices, :2]
+    moving_deltas = deltas[moving_indices]
+    moving_length_sq = length_sq[moving_indices]
+    fractions = np.clip(
+        np.einsum("ij,ij->i", position - starts, moving_deltas)
+        / moving_length_sq,
+        0.0,
+        1.0,
+    )
+    projections = starts + fractions[:, None] * moving_deltas
+    errors = np.linalg.norm(projections - position, axis=1)
+    progress = (
+        cumulative[moving_indices]
+        + fractions
+        * (cumulative[moving_indices + 1] - cumulative[moving_indices])
+    )
+    best_error = float(np.min(errors))
+    if best_error > float(cfg.TRAJECTORY_MAX_TRACKING_ERROR_M):
+        raise ValueError("path progress projection exceeds tracking corridor")
+
+    nearby = np.flatnonzero(
+        (
+            errors
+            <= best_error
+            + float(cfg.TRAJECTORY_PROJECTION_AMBIGUITY_DISTANCE_M)
+        )
+        & (errors <= float(cfg.TRAJECTORY_MAX_TRACKING_ERROR_M))
+    )
+    ego_forward = np.array(
+        [math.cos(yaw), math.sin(yaw)],
+        dtype=np.float64,
+    )
+    heading_errors: dict[int, float] = {}
+    compatible: list[int] = []
+    for candidate in nearby:
+        candidate_index = int(candidate)
+        segment_index = int(moving_indices[candidate_index])
+        heading_path = np.insert(
+            path[:, :2],
+            segment_index + 1,
+            projections[candidate_index],
+            axis=0,
+        )
+        tangent = meaningful_path_tangent_xy(
+            heading_path,
+            segment_index + 1,
+            lookahead_m=float(cfg.TRAJECTORY_HEADING_LOOKAHEAD_M),
+            minimum_displacement_m=float(
+                cfg.TRAJECTORY_HEADING_MIN_DISPLACEMENT_M
+            ),
+        )
+        heading_error = 0.0
+        if tangent is not None:
+            heading_error = math.degrees(
+                math.acos(
+                    float(
+                        np.clip(
+                            np.dot(ego_forward, tangent),
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                )
+            )
+        heading_errors[candidate_index] = heading_error
+        if heading_error <= float(cfg.TRAJECTORY_MAX_HEADING_ERROR_DEG):
+            compatible.append(candidate_index)
+
+    if not compatible:
+        raise ValueError("path progress projection heading mismatch")
+
+    compatible_progress = progress[compatible]
+    if (
+        len(compatible_progress) > 1
+        and float(
+            np.max(compatible_progress) - np.min(compatible_progress)
+        )
+        > float(cfg.TRAJECTORY_PROJECTION_LOCAL_PROGRESS_SPAN_M)
+    ):
+        raise ValueError("ambiguous path progress projection")
+
+    best = min(compatible, key=lambda index: (float(errors[index]), index))
+    selected_error = float(errors[best])
+    if selected_error > float(cfg.TRAJECTORY_MAX_TRACKING_ERROR_M):
+        raise ValueError("path progress projection exceeds tracking corridor")
+    best_progress = float(progress[best])
+    heading_error = float(heading_errors[best])
+    first_path_index = int(
+        min(
+            np.searchsorted(cumulative, best_progress, side="left"),
+            len(path) - 1,
+        )
+    )
+    return _PathProgressProjection(
+        progress_m=best_progress,
+        first_path_index=first_path_index,
+        cross_track_m=selected_error,
+        heading_error_deg=heading_error,
     )
 
 
@@ -830,12 +1024,79 @@ class CarlaGroundTruthSafetyAdapter:
         current_clearance_road: RoadContainmentAssessment,
         current_junction_context: bool,
     ) -> RoadExecutionEnvelope:
-        remaining_indices = np.flatnonzero(
+        scheduled_remaining_indices = np.flatnonzero(
             profile.times_s > float(current_time_s) + float(cfg.TRAJECTORY_TIME_EPSILON_S)
+        )
+        if len(scheduled_remaining_indices) == 0:
+            exhausted = RoadContainmentAssessment.unknown(
+                ("safety_path_exhausted",),
+                quality=profile.quality,
+            )
+            return RoadExecutionEnvelope(
+                current_ego_road=current_road,
+                near_term_path_road=exhausted,
+                full_path_road=exhausted,
+                last_safe_waypoint_index=None,
+                time_to_first_bad_s=None,
+                distance_to_first_bad_m=None,
+                target_speed_cap_mps=0.0,
+                emergency_required=True,
+                current_ego_clearance_road=current_clearance_road,
+                near_term_path_surface=exhausted,
+                full_path_surface=exhausted,
+                junction_context=current_junction_context,
+                stopping_reserve_profile=_unavailable_stopping_reserve(
+                    target_speed_cap_mps=0.0
+                ),
+            )
+
+        terminal_profile_index: int | None = None
+        terminal_stop_index = getattr(plan, "terminal_stop_index", None)
+        projection_points = profile.points
+        projection_cumulative_distance_m = profile.cumulative_distance_m
+        if terminal_stop_index is not None:
+            terminal_stop_index = int(terminal_stop_index)
+            if (
+                terminal_stop_index < 0
+                or terminal_stop_index >= len(plan.world_points)
+            ):
+                raise ValueError("invalid terminal stop index")
+            terminal_profile_indices = np.flatnonzero(
+                profile.upper_waypoint_indices <= terminal_stop_index
+            )
+            if len(terminal_profile_indices) == 0:
+                raise ValueError("terminal stop is absent from road profile")
+            terminal_profile_index = int(terminal_profile_indices[-1])
+            projection_points = profile.points[
+                : terminal_profile_index + 1
+            ]
+            projection_cumulative_distance_m = (
+                profile.cumulative_distance_m[
+                    : terminal_profile_index + 1
+                ]
+            )
+
+        projection = _project_path_progress(
+            points=projection_points,
+            cumulative_distance_m=projection_cumulative_distance_m,
+            ego_xy=ego.center_xy,
+            ego_yaw_rad=ego.yaw_rad,
+        )
+        remaining_indices = np.arange(
+            projection.first_path_index,
+            len(profile.points),
+            dtype=np.int64,
+        )
+        # Rebase the fixed execution horizon at the ego's geometric cursor.
+        # Wall time remains useful for freshness and scheduled-time telemetry,
+        # but using it here would make an ego behind schedule assess several
+        # seconds of physically future path as "near term".
+        near_term_origin_s = float(
+            profile.times_s[projection.first_path_index]
         )
         near_term_indices = remaining_indices[
             profile.times_s[remaining_indices]
-            <= float(current_time_s) + float(cfg.SAFETY_EXECUTION_HORIZON_S)
+            <= near_term_origin_s + float(cfg.SAFETY_EXECUTION_HORIZON_S)
         ]
         full_path = self._assess_profile_indices(
             profile,
@@ -874,26 +1135,6 @@ class CarlaGroundTruthSafetyAdapter:
                 or near_term.status is AssessmentStatus.UNSAFE
             )
         )
-        if len(remaining_indices) == 0:
-            return RoadExecutionEnvelope(
-                current_ego_road=current_road,
-                near_term_path_road=near_term,
-                full_path_road=full_path,
-                last_safe_waypoint_index=None,
-                time_to_first_bad_s=None,
-                distance_to_first_bad_m=None,
-                target_speed_cap_mps=0.0,
-                emergency_required=True,
-                current_ego_clearance_road=current_clearance_road,
-                near_term_path_surface=near_surface,
-                full_path_surface=full_surface,
-                junction_context=junction_context,
-                recovery_required=recovery_required,
-                stopping_reserve_profile=_unavailable_stopping_reserve(
-                    target_speed_cap_mps=0.0
-                ),
-            )
-
         first_bad = self._first_bad_profile_index(
             profile,
             remaining_indices,
@@ -957,19 +1198,29 @@ class CarlaGroundTruthSafetyAdapter:
                 stopping_reserve_compute_ms=(
                     (time.perf_counter() - reserve_compute_started_s) * 1000.0
                 ),
+                execution_cursor_index=projection.first_path_index,
+                ego_path_progress_m=projection.progress_m,
+                ego_path_cross_track_m=projection.cross_track_m,
+                ego_path_heading_error_deg=projection.heading_error_deg,
             )
 
-        first_remaining = int(remaining_indices[0])
-        distance_to_path = float(
-            np.linalg.norm(profile.points[first_remaining, :2] - np.asarray(ego.center_xy))
+        first_bad_path_progress = float(
+            profile.cumulative_distance_m[first_bad]
         )
+        effective_stopping_boundary_progress = first_bad_path_progress
+        if terminal_profile_index is not None:
+            # A validated terminal stop tail is a stationary cluster.  Its
+            # numerical back-and-forth jitter is still road-assessed point by
+            # point, but cannot manufacture longitudinal stopping headroom.
+            effective_stopping_boundary_progress = min(
+                effective_stopping_boundary_progress,
+                float(
+                    profile.cumulative_distance_m[terminal_profile_index]
+                ),
+            )
         distance_to_bad = max(
             0.0,
-            distance_to_path
-            + float(
-                profile.cumulative_distance_m[first_bad]
-                - profile.cumulative_distance_m[first_remaining]
-            ),
+            effective_stopping_boundary_progress - projection.progress_m,
         )
         time_to_bad = max(
             0.0,
@@ -977,14 +1228,10 @@ class CarlaGroundTruthSafetyAdapter:
         )
         first_bad_upper_index = int(profile.upper_waypoint_indices[first_bad])
         last_safe_index = first_bad_upper_index - 1
-        first_future_waypoint = int(
-            np.searchsorted(
-                np.asarray(plan.waypoint_times_s, dtype=np.float64),
-                float(current_time_s),
-                side="right",
-            )
+        first_execution_waypoint = int(
+            profile.upper_waypoint_indices[projection.first_path_index]
         )
-        if last_safe_index < first_future_waypoint:
+        if last_safe_index < first_execution_waypoint:
             last_safe_index = None
 
         raw_physical_cap = raw_physical_stopping_speed_cap_mps(
@@ -1053,6 +1300,14 @@ class CarlaGroundTruthSafetyAdapter:
             ),
             stopping_reserve_compute_ms=(
                 (time.perf_counter() - reserve_compute_started_s) * 1000.0
+            ),
+            execution_cursor_index=projection.first_path_index,
+            ego_path_progress_m=projection.progress_m,
+            ego_path_cross_track_m=projection.cross_track_m,
+            ego_path_heading_error_deg=projection.heading_error_deg,
+            first_bad_path_progress_m=first_bad_path_progress,
+            effective_stopping_boundary_progress_m=(
+                effective_stopping_boundary_progress
             ),
         )
 

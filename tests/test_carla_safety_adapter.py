@@ -1,5 +1,7 @@
+import json
 import math
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -14,6 +16,13 @@ from module.carla_safety_adapter import (
     road_stopping_speed_cap_mps,
 )
 from module.safety_shield import AssessmentStatus, EgoKinematics, SafetyPolicy
+from module.trajectory_runtime import detect_terminal_stop_index
+
+GEOMETRIC_STOPPING_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "job_22862336_geometric_stopping.json"
+)
 
 
 class FakeLocation:
@@ -802,7 +811,7 @@ def test_nonjunction_clearance_violation_does_not_receive_recovery_grace(
     )
 
 
-def test_timed_profile_cache_reuses_map_queries_and_slices_elapsed_prefix(
+def test_timed_profile_cache_reuses_queries_and_tracks_geometric_progress(
     driving_lane_type,
 ):
     carla_map = RecordingMap()
@@ -814,10 +823,477 @@ def test_timed_profile_cache_reuses_map_queries_and_slices_elapsed_prefix(
         plan=plan,
     )
     calls_after_first = len(carla_map.calls)
-    second = adapter.assess_plan_road(
+    time_only = adapter.assess_plan_road(
         tick_context=_tick_context(ego, simulation_time_s=6.0),
         plan=plan,
     )
+    calls_after_time_only = len(carla_map.calls)
+    advanced = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=6.0,
+            ego_x=1.0,
+        ),
+        plan=plan,
+    )
 
-    assert len(carla_map.calls) == calls_after_first + 5
-    assert second.full_path_road.sample_count < first.full_path_road.sample_count
+    assert calls_after_time_only == calls_after_first + 5
+    assert time_only.full_path_road.sample_count == first.full_path_road.sample_count
+    assert len(carla_map.calls) == calls_after_time_only + 5
+    assert advanced.full_path_road.sample_count < first.full_path_road.sample_count
+    assert advanced.ego_path_progress_m > first.ego_path_progress_m
+
+
+def test_near_term_window_starts_at_geometric_cursor_when_ahead_of_schedule(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=20.0))
+    )
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_x=4.0,
+        ),
+        plan=_long_plan(step_m=0.1),
+    )
+
+    assert envelope.execution_cursor_index is not None
+    assert envelope.execution_cursor_index >= 39
+    assert envelope.near_term_path_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.sample_count > 0
+    assert envelope.full_path_road.status is AssessmentStatus.SAFE
+
+
+def test_near_term_window_does_not_expand_when_behind_schedule(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 3.0:
+            return None
+        return FakeWaypoint(location, lane_width=20.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=9.0,
+            ego_x=0.0,
+        ),
+        plan=_long_plan(step_m=0.1),
+    )
+
+    assert envelope.execution_cursor_index == 0
+    assert envelope.near_term_path_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.time_to_first_bad_s == 0.0
+    assert envelope.distance_to_first_bad_m == pytest.approx(2.5)
+
+
+def test_stopping_distance_uses_ego_geometric_progress_when_ahead_of_time(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 12.0:
+            return None
+        return FakeWaypoint(location, lane_width=20.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.5,
+            ego_x=10.0,
+        ),
+        plan=_long_plan(step_m=0.5),
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.ego_path_progress_m == pytest.approx(9.5)
+    assert envelope.ego_path_cross_track_m == pytest.approx(0.0)
+    assert envelope.first_bad_path_progress_m == pytest.approx(11.5)
+    assert envelope.distance_to_first_bad_m == pytest.approx(2.0)
+    assert envelope.stopping_reserve_profile.raw_physical_stopping_cap_mps == 0.0
+    assert envelope.target_speed_cap_mps == 0.0
+
+
+def test_elapsed_bad_pose_ahead_of_ego_remains_in_execution_envelope(
+    driving_lane_type,
+):
+    def resolve(location):
+        if 1.9 <= location.x <= 2.6:
+            return None
+        return FakeWaypoint(location, lane_width=20.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=6.0,
+            ego_x=0.5,
+        ),
+        plan=_long_plan(step_m=0.5),
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.time_to_first_bad_s == 0.0
+    assert envelope.distance_to_first_bad_m == pytest.approx(1.0)
+    assert envelope.last_safe_waypoint_index == 1
+
+
+def test_bad_pose_behind_geometric_progress_is_not_reexecuted(
+    driving_lane_type,
+):
+    def resolve(location):
+        if 1.9 <= location.x <= 2.6:
+            return None
+        return FakeWaypoint(location, lane_width=20.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.1,
+            ego_x=4.0,
+        ),
+        plan=_long_plan(step_m=0.5),
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.SAFE
+    assert envelope.distance_to_first_bad_m is None
+    assert (
+        envelope.stopping_reserve_profile.status
+        is StoppingReserveStatus.UNBOUNDED
+    )
+
+
+def test_ambiguous_self_intersection_projection_fails_closed(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=20.0))
+    )
+    plan = types.SimpleNamespace(
+        plan_id="self-intersection",
+        world_points=np.array(
+            [
+                [-2.0, -2.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [-2.0, 2.0, 0.0],
+                [2.0, -2.0, 0.0],
+                [3.0, -2.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        waypoint_times_s=5.0 + np.arange(1, 6, dtype=np.float64) * 0.1,
+    )
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(ego, simulation_time_s=5.0),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.status is AssessmentStatus.UNKNOWN
+    assert envelope.target_speed_cap_mps == 0.0
+    assert envelope.emergency_required is True
+
+
+def test_near_overlap_with_separated_progress_fails_closed():
+    vertices = np.array(
+        [
+            [0.1, 0.0],
+            [2.0, 0.0],
+            [8.0, 0.0],
+            [8.0, 5.0],
+            [4.0, 8.0],
+            [0.0, 5.0],
+            [0.0, 0.01],
+            [4.0, 0.01],
+            [10.0, 0.01],
+        ],
+        dtype=np.float64,
+    )
+    vertex_distance = np.concatenate(
+        [
+            [0.0],
+            np.cumsum(np.linalg.norm(np.diff(vertices, axis=0), axis=1)),
+        ]
+    )
+    sampled_distance = np.linspace(0.0, vertex_distance[-1], 64)
+    points = np.column_stack(
+        [
+            np.interp(sampled_distance, vertex_distance, vertices[:, 0]),
+            np.interp(sampled_distance, vertex_distance, vertices[:, 1]),
+        ]
+    )
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    )
+
+    assert np.max(np.linalg.norm(np.diff(points, axis=0), axis=1)) < 1.0
+    with pytest.raises(ValueError, match="ambiguous path progress"):
+        carla_safety_adapter._project_path_progress(
+            points=points,
+            cumulative_distance_m=cumulative,
+            ego_xy=(2.0, 0.009),
+            ego_yaw_rad=0.0,
+        )
+
+
+def test_heading_filter_cannot_select_segment_outside_tracking_corridor():
+    points = np.array(
+        [
+            [1.0, 2.49],
+            [-1.0, 2.49],
+            [-1.0, 10.0],
+            [-2.0, 10.0],
+            [-2.0, 2.7],
+            [-1.0, 2.7],
+            [1.0, 2.7],
+        ],
+        dtype=np.float64,
+    )
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    )
+
+    with pytest.raises(ValueError, match="path progress projection"):
+        carla_safety_adapter._project_path_progress(
+            points=points,
+            cumulative_distance_m=cumulative,
+            ego_xy=(0.0, 0.0),
+            ego_yaw_rad=0.0,
+        )
+
+
+def test_stationary_stop_jitter_remains_road_admissible(driving_lane_type):
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = (np.arange(64) % 2) * 0.02
+    terminal_stop_index = detect_terminal_stop_index(points)
+    assert terminal_stop_index == 0
+
+    plan = types.SimpleNamespace(
+        plan_id="stationary-stop-jitter",
+        world_points=points,
+        waypoint_times_s=5.0
+        + np.arange(1, 65, dtype=np.float64) * 0.1,
+        terminal_stop_index=terminal_stop_index,
+    )
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=20.0))
+    )
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(ego, simulation_time_s=5.0),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.SAFE
+    assert envelope.execution_cursor_index == 0
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.ACCEPT_FULLY_SAFE
+    )
+
+
+def test_moving_plan_terminal_jitter_remains_road_admissible(
+    driving_lane_type,
+):
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:10, 0] = np.linspace(0.5, 5.0, 10)
+    points[10:, 0] = 5.0 + (np.arange(54) % 2) * 0.02
+    terminal_stop_index = detect_terminal_stop_index(points)
+    assert terminal_stop_index == 9
+
+    plan = types.SimpleNamespace(
+        plan_id="moving-terminal-stop-jitter",
+        world_points=points,
+        waypoint_times_s=5.0
+        + np.arange(1, 65, dtype=np.float64) * 0.1,
+        terminal_stop_index=terminal_stop_index,
+    )
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=20.0))
+    )
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_x=5.02,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.near_term_path_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.SAFE
+    assert envelope.execution_cursor_index is not None
+    assert envelope.execution_cursor_index <= terminal_stop_index
+    assert envelope.ego_path_cross_track_m == pytest.approx(0.02)
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.ACCEPT_FULLY_SAFE
+    )
+
+
+def test_terminal_jitter_does_not_add_stopping_headroom(driving_lane_type):
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:10, 0] = np.linspace(0.5, 5.0, 10)
+    points[10:, 0] = 5.0 + (np.arange(54) % 2) * 0.02
+    terminal_stop_index = detect_terminal_stop_index(points)
+    assert terminal_stop_index == 9
+
+    def resolve(location):
+        if location.x >= 5.015:
+            return None
+        return FakeWaypoint(location, lane_width=20.0)
+
+    plan = types.SimpleNamespace(
+        plan_id="terminal-jitter-bad-point",
+        world_points=points,
+        waypoint_times_s=5.0
+        + np.arange(1, 65, dtype=np.float64) * 0.1,
+        terminal_stop_index=terminal_stop_index,
+    )
+    adapter, _, ego = _adapter(
+        RecordingMap(resolve),
+        ego_bounding_box=FakeBoundingBox(
+            half_length=0.001,
+            half_width=0.001,
+        ),
+    )
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_x=4.8,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.first_bad_path_progress_m == pytest.approx(4.52)
+    assert (
+        envelope.effective_stopping_boundary_progress_m
+        == pytest.approx(4.5)
+    )
+    assert envelope.ego_path_progress_m == pytest.approx(4.3)
+    assert envelope.distance_to_first_bad_m == pytest.approx(0.2)
+
+
+def test_path_progress_heading_ignores_subcentimetre_reverse_jitter():
+    points = np.array(
+        [
+            [0.0, 0.0],
+            [-0.0001, 0.0],
+            [1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    )
+
+    projection = carla_safety_adapter._project_path_progress(
+        points=points,
+        cumulative_distance_m=cumulative,
+        ego_xy=(0.0, 0.0),
+        ego_yaw_rad=0.0,
+    )
+
+    assert projection.progress_m == pytest.approx(0.0)
+    assert projection.cross_track_m == pytest.approx(0.0)
+    assert projection.heading_error_deg == pytest.approx(0.0)
+
+
+def test_path_progress_heading_uses_future_tangent_at_shared_turn_vertex():
+    points = np.array(
+        [
+            [-1.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    )
+
+    projection = carla_safety_adapter._project_path_progress(
+        points=points,
+        cumulative_distance_m=cumulative,
+        ego_xy=(0.0, 0.0),
+        ego_yaw_rad=math.pi / 2.0,
+    )
+
+    assert projection.progress_m == pytest.approx(1.0)
+    assert projection.first_path_index == 1
+    assert projection.cross_track_m == pytest.approx(0.0)
+    assert projection.heading_error_deg == pytest.approx(0.0)
+
+
+def test_job_22862336_geometric_stopping_distance_replay():
+    replay = json.loads(
+        GEOMETRIC_STOPPING_FIXTURE.read_text(encoding="utf-8")
+    )
+    points = np.asarray(
+        replay["world_points_xy_through_first_bad"],
+        dtype=np.float64,
+    )
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    first_bad_progress = float(replay["first_bad_path_progress_m"])
+    bbox_offset = float(replay["ego_bbox_center_offset_x_m"])
+    policy = SafetyPolicy()
+
+    assert cumulative[-1] == pytest.approx(first_bad_progress, abs=1e-5)
+    for tick in replay["ticks"]:
+        yaw_rad = math.radians(tick["ego_yaw_deg"])
+        ego_center_xy = (
+            tick["ego_xy"][0] + bbox_offset * math.cos(yaw_rad),
+            tick["ego_xy"][1] + bbox_offset * math.sin(yaw_rad),
+        )
+        projection = carla_safety_adapter._project_path_progress(
+            points=points,
+            cumulative_distance_m=cumulative,
+            ego_xy=ego_center_xy,
+            ego_yaw_rad=yaw_rad,
+        )
+        distance = max(0.0, first_bad_progress - projection.progress_m)
+        raw_cap = raw_physical_stopping_speed_cap_mps(distance, policy)
+        target_cap = min(
+            max(
+                0.0,
+                raw_cap
+                - carla_safety_adapter.cfg.SAFETY_GUARDED_ACCELERATION_MPS2
+                * carla_safety_adapter.cfg.CONTROL_DT,
+            ),
+            carla_safety_adapter.cfg.TRAJECTORY_MAX_SPEED_MPS,
+        )
+        emergency = (
+            tick["speed_mps"]
+            > raw_cap
+            + carla_safety_adapter.cfg.SAFETY_SPEED_CAP_EPSILON_MPS
+        )
+
+        assert distance == pytest.approx(
+            tick["expected_distance_to_bad_m"],
+            abs=0.01,
+        )
+        assert distance < tick["legacy_distance_to_bad_m"] - 3.0
+        assert raw_cap == pytest.approx(
+            tick["expected_raw_cap_mps"],
+            abs=0.01,
+        )
+        assert target_cap == pytest.approx(
+            tick["expected_target_cap_mps"],
+            abs=0.01,
+        )
+        assert emergency is tick["expected_emergency"]
