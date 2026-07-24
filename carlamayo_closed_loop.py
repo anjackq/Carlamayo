@@ -14,6 +14,10 @@ import numpy as np
 import torch
 
 from module import config as cfg
+from module.active_plan_availability import (
+    ActivePlanAvailabilityStatus,
+    decide_active_plan_availability,
+)
 from module.carla_safety_adapter import (
     CarlaGroundTruthSafetyAdapter,
     PlanAdmissionStatus,
@@ -809,6 +813,19 @@ def main():
         current_plan_admission_status = None
         latest_candidate_admission_status = None
         latest_handoff_status = None
+        active_plan_availability = decide_active_plan_availability(
+            active_plan_present=False,
+            standard_validity=None,
+            bridge_validity=None,
+            alignment_validity=None,
+            road_envelope=None,
+            bridge_deadline_age_s=float(
+                cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+            ),
+            bridge_min_remaining_horizon_s=float(
+                cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+            ),
+        )
         current_road_envelope = None
         latest_proposal_plan_id = None
         current_carla_frame_id = None
@@ -1186,6 +1203,7 @@ def main():
             nonlocal current_plan_source_elapsed_proxy_s
             nonlocal current_road_envelope
             nonlocal current_plan_admission_status
+            nonlocal active_plan_availability
 
             current_plan = None
             current_trajectory = None
@@ -1194,6 +1212,19 @@ def main():
             current_plan_source_elapsed_proxy_s = None
             current_road_envelope = None
             current_plan_admission_status = None
+            active_plan_availability = decide_active_plan_availability(
+                active_plan_present=False,
+                standard_validity=None,
+                bridge_validity=None,
+                alignment_validity=None,
+                road_envelope=None,
+                bridge_deadline_age_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                ),
+                bridge_min_remaining_horizon_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                ),
+            )
             pid_follower.reset_plan_progress()
 
         def _assess_plan_road_envelope(plan):
@@ -1223,6 +1254,34 @@ def main():
                 emergency_required=legacy.road.status is not AssessmentStatus.SAFE,
             )
 
+        def _active_plan_validity_window(plan):
+            standard = validate_plan_for_execution(
+                plan,
+                float(current_simulation_time_s),
+                current_prompt_revision=nav_state.revision,
+                current_respawn_revision=respawn_revision,
+            )
+            alignment = validate_plan_alignment(
+                plan,
+                float(current_simulation_time_s),
+                current_observation_entry["capture_pose_world"],
+            )
+            bridge = None
+            if not standard.valid:
+                bridge = validate_plan_for_execution(
+                    plan,
+                    float(current_simulation_time_s),
+                    current_prompt_revision=nav_state.revision,
+                    current_respawn_revision=respawn_revision,
+                    maximum_plan_age_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                    ),
+                    minimum_remaining_horizon_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                    ),
+                )
+            return standard, bridge, alignment
+
         def _active_plan_road_envelope():
             if (
                 current_plan is None
@@ -1230,23 +1289,29 @@ def main():
                 or tick_context is None
             ):
                 return None
-            active_validity = validate_plan_for_execution(
-                current_plan,
-                float(current_simulation_time_s),
-                current_prompt_revision=nav_state.revision,
-                current_respawn_revision=respawn_revision,
+            standard, bridge, active_alignment = _active_plan_validity_window(
+                current_plan
             )
-            active_alignment = validate_plan_alignment(
-                current_plan,
-                float(current_simulation_time_s),
-                current_observation_entry["capture_pose_world"],
-            )
-            if not (active_validity.valid and active_alignment.valid):
+            if not active_alignment.valid:
                 return None
             try:
-                return _assess_plan_road_envelope(current_plan)
+                envelope = _assess_plan_road_envelope(current_plan)
             except Exception:
                 return None
+            availability = decide_active_plan_availability(
+                active_plan_present=True,
+                standard_validity=standard,
+                bridge_validity=bridge,
+                alignment_validity=active_alignment,
+                road_envelope=envelope,
+                bridge_deadline_age_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                ),
+                bridge_min_remaining_horizon_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                ),
+            )
+            return envelope if availability.execution_allowed else None
 
         def _emit_selected_plan_admission(
             candidate_plan,
@@ -1881,6 +1946,31 @@ def main():
                     if isinstance(latest_handoff_status, PlanHandoffStatus)
                     else latest_handoff_status
                 ),
+                active_plan_availability_status=(
+                    active_plan_availability.status.value
+                    if active_plan_availability is not None
+                    else ActivePlanAvailabilityStatus.NO_ACTIVE_PLAN.value
+                ),
+                active_plan_availability=(
+                    active_plan_availability.to_json_dict()
+                    if active_plan_availability is not None
+                    else None
+                ),
+                availability_bridge_active=bool(
+                    active_plan_availability is not None
+                    and active_plan_availability.bridge_active
+                ),
+                availability_bridge_original_rejection_reason=(
+                    active_plan_availability.original_rejection_reason
+                    if active_plan_availability is not None
+                    else None
+                ),
+                availability_bridge_deadline_age_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                ),
+                availability_bridge_min_remaining_horizon_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                ),
                 road_execution_envelope=(
                     current_road_envelope.to_json_dict()
                     if current_road_envelope is not None
@@ -2149,6 +2239,7 @@ def main():
             nonlocal latest_proposal_plan_id, latest_candidate_admission_status
             nonlocal latest_handoff_status
             nonlocal last_applied_control_echo
+            nonlocal active_plan_availability
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
             carla_if.respawn_ego_vehicle(
@@ -2176,6 +2267,19 @@ def main():
             latest_proposal_plan_id = None
             latest_candidate_admission_status = None
             latest_handoff_status = None
+            active_plan_availability = decide_active_plan_availability(
+                active_plan_present=False,
+                standard_validity=None,
+                bridge_validity=None,
+                alignment_validity=None,
+                road_envelope=None,
+                bridge_deadline_age_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                ),
+                bridge_min_remaining_horizon_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                ),
+            )
             last_applied_control_echo = None
             prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
             prev_nominal_control = {
@@ -2571,6 +2675,19 @@ def main():
                     latest_proposal_plan_id = None
                     latest_candidate_admission_status = None
                     latest_handoff_status = None
+                    active_plan_availability = decide_active_plan_availability(
+                        active_plan_present=False,
+                        standard_validity=None,
+                        bridge_validity=None,
+                        alignment_validity=None,
+                        road_envelope=None,
+                        bridge_deadline_age_s=float(
+                            cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                        ),
+                        bridge_min_remaining_horizon_s=float(
+                            cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                        ),
+                    )
                     pending_inference = False
                     pending_request_id = None
                     safety_shield.reset()
@@ -3316,17 +3433,60 @@ def main():
                                 )
 
             expired_plan_reason = None
-            if current_plan is not None:
-                execution_validity = validate_plan_for_execution(
-                    current_plan,
-                    float(current_simulation_time_s),
-                    current_prompt_revision=nav_state.revision,
-                    current_respawn_revision=respawn_revision,
+            bridge_adapter_assessment = None
+            if current_plan is None:
+                active_plan_availability = decide_active_plan_availability(
+                    active_plan_present=False,
+                    standard_validity=None,
+                    bridge_validity=None,
+                    alignment_validity=None,
+                    road_envelope=None,
+                    bridge_deadline_age_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                    ),
+                    bridge_min_remaining_horizon_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                    ),
                 )
-                alignment_validity = validate_plan_alignment(
-                    current_plan,
-                    float(current_simulation_time_s),
-                    current_observation_entry["capture_pose_world"],
+            if current_plan is not None:
+                (
+                    execution_validity,
+                    bridge_validity,
+                    alignment_validity,
+                ) = _active_plan_validity_window(current_plan)
+                bridge_road_envelope = None
+                if (
+                    not execution_validity.valid
+                    and bridge_validity is not None
+                    and bridge_validity.valid
+                    and alignment_validity.valid
+                    and safety_adapter is not None
+                ):
+                    try:
+                        bridge_adapter_assessment = safety_adapter.assess(
+                            tick_context=tick_context,
+                            plan=current_plan,
+                        )
+                        bridge_road_envelope = getattr(
+                            bridge_adapter_assessment,
+                            "road_envelope",
+                            None,
+                        )
+                    except Exception:
+                        bridge_adapter_assessment = None
+                        bridge_road_envelope = None
+                active_plan_availability = decide_active_plan_availability(
+                    active_plan_present=True,
+                    standard_validity=execution_validity,
+                    bridge_validity=bridge_validity,
+                    alignment_validity=alignment_validity,
+                    road_envelope=bridge_road_envelope,
+                    bridge_deadline_age_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                    ),
+                    bridge_min_remaining_horizon_s=float(
+                        cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                    ),
                 )
                 if not execution_validity.valid or not alignment_validity.valid:
                     expired_plan_reason = (
@@ -3334,6 +3494,7 @@ def main():
                     )
                     emit_runtime_event(
                         "plan_validation",
+                        aggregate_rejection=not active_plan_availability.bridge_active,
                         layer="CONTROLLER_EXECUTION",
                         proposal_id=current_plan.plan_id,
                         source_carla_frame_id=current_plan.source_frame_id,
@@ -3346,21 +3507,62 @@ def main():
                         remaining_horizon_s=execution_validity.remaining_horizon_s,
                         tracking_error_m=alignment_validity.tracking_error_m,
                         heading_error_deg=alignment_validity.heading_error_deg,
+                        execution_allowed_by_bridge=bool(
+                            active_plan_availability.bridge_active
+                        ),
+                        active_plan_availability=(
+                            active_plan_availability.to_json_dict()
+                        ),
                     )
-                    current_plan = None
-                    current_trajectory = None
-                    current_plan_id = None
-                    current_plan_source_loop_tick_id = None
-                    current_plan_source_elapsed_proxy_s = None
-                    current_plan_admission_status = None
-                    current_road_envelope = None
-                    pid_follower.reset_plan_progress()
+                if (
+                    active_plan_availability.status
+                    is not ActivePlanAvailabilityStatus.STANDARD_EXECUTION
+                ):
+                    emit_runtime_event(
+                        "active_plan_availability",
+                        aggregate_age=False,
+                        aggregate_rejection=False,
+                        layer="CONTROLLER_EXECUTION",
+                        active_plan_id=current_plan.plan_id,
+                        alignment_valid=bool(alignment_validity.valid),
+                        tracking_error_m=alignment_validity.tracking_error_m,
+                        heading_error_deg=alignment_validity.heading_error_deg,
+                        road_envelope=(
+                            bridge_road_envelope.to_json_dict()
+                            if bridge_road_envelope is not None
+                            else None
+                        ),
+                        **active_plan_availability.to_json_dict(),
+                    )
+                if not active_plan_availability.execution_allowed:
+                    denied_availability = active_plan_availability
+                    expired_plan_reason = (
+                        expired_plan_reason
+                        or denied_availability.original_rejection_reason
+                        or denied_availability.denial_reason
+                        or "active_plan_execution_denied"
+                    )
+                    _clear_active_plan_state()
+                    active_plan_availability = denied_availability
 
             if current_plan is not None:
-                adapter_assessment = None
+                adapter_assessment = bridge_adapter_assessment
                 road_speed_cap_mps = None
                 maximum_authorized_waypoint_index = None
-                if safety_adapter is not None:
+                if adapter_assessment is not None:
+                    current_road_envelope = getattr(
+                        adapter_assessment,
+                        "road_envelope",
+                        None,
+                    )
+                    if current_road_envelope is not None:
+                        road_speed_cap_mps = (
+                            current_road_envelope.target_speed_cap_mps
+                        )
+                        maximum_authorized_waypoint_index = (
+                            current_road_envelope.last_safe_waypoint_index
+                        )
+                elif safety_adapter is not None:
                     try:
                         adapter_assessment = safety_adapter.assess(
                             tick_context=tick_context,

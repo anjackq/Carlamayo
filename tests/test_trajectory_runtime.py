@@ -3,6 +3,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from module import config as cfg
 from module.geometry import pose_matrix_from_components
 from module.trajectory_runtime import (
     TrajectoryMotionClass,
@@ -260,6 +261,44 @@ def test_execution_validation_rejects_future_stale_and_short_horizon_plans():
     assert stale.rejection_reason == "plan_source_age_exceeded"
     assert short_horizon.rejection_reason == "insufficient_remaining_horizon"
     assert all(result.first_future_index is None for result in (future, stale, short_horizon))
+
+
+def test_active_bridge_thresholds_do_not_relax_generic_candidate_validation():
+    plan = _build_plan(source_time=10.0)
+
+    generic = validate_plan_for_execution(plan, 14.5)
+    active_bridge = validate_plan_for_execution(
+        plan,
+        14.5,
+        maximum_plan_age_s=cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S,
+        minimum_remaining_horizon_s=(
+            cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+        ),
+    )
+    bridge_boundary = validate_plan_for_execution(
+        plan,
+        14.9,
+        maximum_plan_age_s=cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S,
+        minimum_remaining_horizon_s=(
+            cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+        ),
+    )
+    after_bridge = validate_plan_for_execution(
+        plan,
+        15.0,
+        maximum_plan_age_s=cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S,
+        minimum_remaining_horizon_s=(
+            cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+        ),
+    )
+
+    assert generic.rejection_reason == "plan_source_age_exceeded"
+    assert active_bridge.valid
+    assert active_bridge.remaining_horizon_s == pytest.approx(1.9)
+    assert bridge_boundary.valid
+    assert bridge_boundary.remaining_horizon_s == pytest.approx(1.5)
+    assert not after_bridge.valid
+    assert after_bridge.rejection_reason == "plan_source_age_exceeded"
 
 
 def test_execution_validation_rejects_prompt_and_respawn_revisions():

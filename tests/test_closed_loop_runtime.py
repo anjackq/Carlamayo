@@ -8,7 +8,11 @@ from collections import Counter
 
 import pytest
 
-from module.carla_safety_adapter import RoadExecutionEnvelope
+from module.carla_safety_adapter import (
+    RoadExecutionEnvelope,
+    StoppingReserveProfile,
+    StoppingReserveStatus,
+)
 from module.safety_shield import ObstacleAssessment, RoadContainmentAssessment
 
 
@@ -997,6 +1001,182 @@ def test_sync_normal_inference_uses_one_second_simulation_time_cadence(
     )
     assert not [record for record in records if record["event_type"] == "runtime_error"]
     assert records[-1]["stop_reason"] == "max_episode_seconds"
+
+
+@pytest.mark.parametrize("replacement_arrives", [True, False])
+def test_full_safe_active_plan_bridge_is_bounded(
+    monkeypatch,
+    tmp_path,
+    replacement_arrives,
+):
+    safe_road = RoadContainmentAssessment.safe(sample_count=5, min_margin_m=0.5)
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _FullSafeAdapter:
+        def __init__(self, *_args):
+            pass
+
+        @staticmethod
+        def _envelope():
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                current_ego_clearance_road=safe_road,
+                near_term_path_road=safe_road,
+                full_path_road=safe_road,
+                last_safe_waypoint_index=63,
+                time_to_first_bad_s=None,
+                distance_to_first_bad_m=None,
+                target_speed_cap_mps=None,
+                emergency_required=False,
+                stopping_reserve_profile=StoppingReserveProfile(
+                    raw_physical_stopping_cap_mps=None,
+                    target_speed_cap_mps=None,
+                    guard_speed_mps=2.5,
+                    required_stopping_distance_m=None,
+                    stopping_reserve_m=None,
+                    status=StoppingReserveStatus.UNBOUNDED,
+                ),
+            )
+
+        def assess_plan_road(self, **_kwargs):
+            return self._envelope()
+
+        def assess(self, **_kwargs):
+            envelope = self._envelope()
+            return types.SimpleNamespace(
+                road=safe_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=safe_road,
+                proposed_path_road=safe_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "active-availability-bridge.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "5.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(
+        closed_loop,
+        "OfficialPIDFollower",
+        lambda *_args: _TrackingFollower(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _FullSafeAdapter,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    valid = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    valid[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    extraction_count = 0
+
+    def extract_with_four_invalid_updates(_prediction):
+        nonlocal extraction_count
+        extraction_count += 1
+        if extraction_count in {2, 3, 4, 5} or (
+            extraction_count >= 6 and not replacement_arrives
+        ):
+            invalid = valid.copy()
+            invalid[:, :, 1] = 100.0
+            return invalid
+        return valid.copy()
+
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        extract_with_four_invalid_updates,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    bridge_ticks = [
+        record
+        for record in records
+        if record["event_type"] == "tick"
+        and record["availability_bridge_active"]
+    ]
+    assert [record["source_age_s"] for record in bridge_ticks] == pytest.approx(
+        [4.5, 4.6, 4.7, 4.8, 4.9]
+    )
+    assert all(
+        record["active_plan_availability_status"] == "BRIDGED_FULL_SAFE"
+        for record in bridge_ticks
+    )
+    assert all(record["fallback_state"] == "NONE" for record in bridge_ticks)
+    assert all(
+        record["applied_control_source"] == "CONTROLLER_EXECUTION"
+        for record in bridge_ticks
+    )
+    assert len({record["active_plan_id"] for record in bridge_ticks}) == 1
+    post_bridge_tick = next(
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] == 51
+    )
+    assert post_bridge_tick["availability_bridge_active"] is False
+    if replacement_arrives:
+        assert post_bridge_tick["active_plan_id"] != bridge_ticks[-1]["active_plan_id"]
+        assert not [
+            record
+            for record in records
+            if record["event_type"] == "tick"
+            and record["fallback_state"] == "WAITING_FOR_PLAN"
+        ]
+    else:
+        assert post_bridge_tick["active_plan_id"] is None
+        assert post_bridge_tick["fallback_state"] == "WAITING_FOR_PLAN"
+        assert post_bridge_tick["fallback_reason"] == "plan_source_age_exceeded"
+        assert (
+            post_bridge_tick["active_plan_availability_status"]
+            == "BRIDGE_DENIED"
+        )
+        assert (
+            post_bridge_tick["active_plan_availability"]["denial_reason"]
+            == "plan_source_age_exceeded"
+        )
+    bridged_validation = [
+        record
+        for record in records
+        if record["event_type"] == "plan_validation"
+        and record.get("execution_allowed_by_bridge")
+    ]
+    assert len(bridged_validation) == 5
+    assert all(record["valid"] is False for record in bridged_validation)
 
 
 def test_near_term_unsafe_candidate_does_not_replace_active_safe_plan(

@@ -158,6 +158,17 @@ SAFETY_CLEAR_TICKS_TO_RELEASE = 3
 # constrain controller speed/target selection instead of immediately latching
 # the stop-only emergency shield.
 SAFETY_EXECUTION_HORIZON_S = 1.5
+# An already-admitted, aligned active plan may bridge only the gap between the
+# normal freshness window and the exact road-safety execution horizon above.
+# Candidate validation continues to use the stricter trajectory values.
+TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S = (
+    SAFETY_EXECUTION_HORIZON_S
+)
+TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S = (
+    TRAJECTORY_MAX_PLAN_AGE_S
+    + TRAJECTORY_MIN_REMAINING_HORIZON_S
+    - TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+)
 # Avoid turning tiny floating-point differences at the stopping-envelope
 # boundary into an emergency brake.
 SAFETY_SPEED_CAP_EPSILON_MPS = 0.1
