@@ -1,4 +1,6 @@
+import json
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -6,6 +8,13 @@ import pytest
 from module import config as cfg
 from module import pid_controller
 from module.trajectory_runtime import detect_terminal_stop_index
+
+
+PID_TIME_GEOMETRY_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "job_22862294_pid_time_geometry.json"
+)
 
 
 class FakeLocation:
@@ -194,6 +203,138 @@ def test_controller_target_never_exceeds_last_safe_waypoint(follower):
 
     assert debug["target_idx"] <= 4
     assert debug["maximum_authorized_waypoint_index"] == 4
+
+
+def test_delayed_plan_steering_uses_geometric_progress_not_elapsed_time(
+    follower,
+):
+    points = _straight_path(0.5)
+    follower.vehicle.transform.location.x = 5.0
+
+    *_, first_debug = follower.compute_world_control(
+        plan_id="delayed-plan",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=3.6,
+        speed_mps=2.0,
+    )
+    *_, later_debug = follower.compute_world_control(
+        plan_id="delayed-plan",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=4.0,
+        speed_mps=2.0,
+    )
+
+    assert first_debug["first_future_index"] == 36
+    assert later_debug["first_future_index"] == 40
+    assert first_debug["steering_reference"] == "geometric_progress"
+    assert later_debug["steering_target_index"] == first_debug["target_idx"]
+    assert later_debug["target_idx"] == first_debug["target_idx"]
+    assert later_debug["target_distance_m"] == pytest.approx(
+        first_debug["target_distance_m"]
+    )
+    assert later_debug["time_geometry_gap_m"] > first_debug[
+        "time_geometry_gap_m"
+    ]
+    assert first_debug["steering_target_path_distance_m"] <= (
+        first_debug["lookahead_m"] + 0.5
+    )
+
+
+def test_geometric_progress_ahead_of_time_still_drives_local_lookahead(
+    follower,
+):
+    points = _straight_path(0.5)
+    follower.vehicle.transform.location.x = 10.0
+
+    *_, debug = follower.compute_world_control(
+        plan_id="geometry-ahead",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=2.0,
+    )
+
+    assert debug["first_future_index"] == 0
+    assert debug["progress_index"] == 19
+    assert debug["steering_reference_index"] == 19
+    assert debug["time_geometry_gap_m"] < 0.0
+    assert debug["target_distance_m"] == pytest.approx(5.0)
+
+
+def test_geometric_progress_past_authorized_prefix_fails_closed(follower):
+    points = _straight_path(0.5)
+    follower.vehicle.transform.location.x = 10.0
+
+    steer, throttle, brake, debug = follower.compute_world_control(
+        plan_id="geometry-past-prefix",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=2.0,
+        maximum_authorized_waypoint_index=4,
+    )
+
+    assert (steer, throttle, brake) == pytest.approx((0.0, 0.0, 1.0))
+    assert debug["mode"] == "road_safe_prefix_exhausted"
+    assert debug["controller_state"] == "ROAD_CONSTRAINED_DECELERATING"
+    assert debug["target_idx"] == 4
+
+
+def test_geometric_progress_past_terminal_stop_remains_fail_closed(follower):
+    points = _straight_path(0.5)
+    follower.vehicle.transform.location.x = 10.0
+
+    steer, throttle, brake, debug = follower.compute_world_control(
+        plan_id="geometry-past-stop",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=2.0,
+        terminal_stop_index=4,
+    )
+
+    assert (steer, throttle, brake) == pytest.approx((0.0, 0.0, 1.0))
+    assert debug["mode"] == "terminal_stop"
+    assert debug["controller_state"] == "DECELERATING"
+    assert debug["target_idx"] == 4
+
+
+def test_job_22862294_steering_target_replay_uses_local_curve(follower):
+    replay = json.loads(PID_TIME_GEOMETRY_FIXTURE.read_text(encoding="utf-8"))
+    points_xy = np.asarray(replay["world_points_xy"], dtype=np.float64)
+    points = np.column_stack((points_xy, np.zeros(len(points_xy))))
+    source_time = float(replay["source_simulation_time_s"])
+    waypoint_dt = float(replay["waypoint_dt_s"])
+    times = source_time + waypoint_dt * np.arange(1, len(points) + 1)
+    tick = replay["ticks"][0]
+    follower.vehicle.transform.location.x = tick["ego_xy"][0]
+    follower.vehicle.transform.location.y = tick["ego_xy"][1]
+
+    *_, debug = follower.compute_world_control(
+        plan_id=replay["source_plan_id"],
+        wp_world=points,
+        waypoint_times_s=times,
+        current_simulation_time_s=tick["simulation_time_s"],
+        speed_mps=tick["speed_mps"],
+        maximum_authorized_waypoint_index=len(points) - 1,
+    )
+
+    assert debug["progress_index"] == tick[
+        "expected_geometric_progress_index"
+    ]
+    assert debug["target_idx"] == tick["expected_geometric_target_index"]
+    assert debug["target_idx"] < tick["legacy_target_index"]
+    assert debug["target_distance_m"] == pytest.approx(
+        tick["expected_geometric_target_distance_m"],
+        abs=0.02,
+    )
+    assert debug["target_distance_m"] < tick["legacy_target_distance_m"] - 5.0
+    assert debug["time_geometry_gap_m"] == pytest.approx(
+        tick["expected_time_geometry_gap_m"],
+        abs=0.02,
+    )
 
 
 def test_exhausted_safe_prefix_commands_controller_brake(follower):

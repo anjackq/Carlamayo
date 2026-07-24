@@ -238,13 +238,19 @@ class OfficialPIDFollower:
     def _pick_fixed_world_target(
         self,
         wp_world,
-        first_future_idx,
         speed_mps,
         *,
         terminal_stop_index=None,
         maximum_authorized_waypoint_index=None,
     ):
-        """Project progress monotonically and choose a fixed-world lookahead."""
+        """Choose lateral target from measured geometric path progress.
+
+        Waypoint timestamps describe the plan's longitudinal speed profile; they
+        do not prove that the physical ego has reached the matching waypoint.
+        Steering therefore advances only from the ego's monotonic projection
+        onto the fixed-world path.  This prevents longitudinal lag from being
+        added to the configured lateral lookahead on curves.
+        """
 
         points = np.asarray(wp_world, dtype=np.float64)
         lookahead_m = float(
@@ -261,8 +267,6 @@ class OfficialPIDFollower:
         ego_xy = np.array([ego_loc.x, ego_loc.y], dtype=np.float64)
         cumulative = self._cumulative_distance(points)
         progress_s = self._project_monotonic_progress(points, cumulative)
-        first_future_idx = min(max(0, int(first_future_idx)), len(points) - 1)
-        reference_s = max(progress_s, float(cumulative[first_future_idx]))
         maximum_target_index = len(points) - 1
         if terminal_stop_index is not None:
             maximum_target_index = min(
@@ -274,12 +278,22 @@ class OfficialPIDFollower:
                 maximum_target_index,
                 max(0, int(maximum_authorized_waypoint_index)),
             )
-        if maximum_target_index < first_future_idx:
-            return None, first_future_idx, lookahead_m, float("inf"), progress_s, cumulative
         maximum_target_s = float(cumulative[maximum_target_index])
-        target_s = min(reference_s + lookahead_m, maximum_target_s)
+        if progress_s > maximum_target_s + 1e-6:
+            return (
+                None,
+                maximum_target_index,
+                lookahead_m,
+                float("inf"),
+                progress_s,
+                cumulative,
+            )
+        target_s = min(progress_s + lookahead_m, maximum_target_s)
         target_idx = int(np.searchsorted(cumulative, target_s, side="left"))
-        target_idx = min(max(first_future_idx, target_idx), maximum_target_index)
+        target_idx = min(
+            max(self._progress_index, target_idx),
+            maximum_target_index,
+        )
 
         target = points[target_idx]
         target_distance = float(np.linalg.norm(target[:2] - ego_xy))
@@ -482,15 +496,50 @@ class OfficialPIDFollower:
             cumulative,
         ) = self._pick_fixed_world_target(
             points,
-            first_future_idx,
             current_speed,
             terminal_stop_index=terminal_stop_index,
             maximum_authorized_waypoint_index=maximum_authorized_waypoint_index,
         )
         if target_wp is None:
+            if (
+                terminal_stop_index is not None
+                and progress_s
+                > float(cumulative[int(terminal_stop_index)]) + 1e-6
+            ):
+                return self._full_brake(
+                    "terminal_stop",
+                    controller_state=(
+                        "STOPPED"
+                        if current_speed
+                        <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS)
+                        else "DECELERATING"
+                    ),
+                    target_idx=int(terminal_stop_index),
+                    progress_s_m=progress_s,
+                )
+            if (
+                maximum_authorized_waypoint_index is not None
+                and progress_s
+                > float(
+                    cumulative[int(maximum_authorized_waypoint_index)]
+                )
+                + 1e-6
+            ):
+                return self._full_brake(
+                    "road_safe_prefix_exhausted",
+                    controller_state="ROAD_CONSTRAINED_DECELERATING",
+                    target_idx=int(maximum_authorized_waypoint_index),
+                    progress_s_m=progress_s,
+                )
             return self._full_brake("invalid_trajectory", rejection_reason="no_target")
 
         profile_index = max(first_future_idx, self._progress_index)
+        temporal_progress_s = float(cumulative[first_future_idx])
+        time_geometry_gap_m = temporal_progress_s - progress_s
+        steering_target_path_distance_m = max(
+            0.0,
+            float(cumulative[target_idx]) - progress_s,
+        )
         control_limit_index = terminal_stop_index
         if maximum_authorized_waypoint_index is not None:
             control_limit_index = (
@@ -568,7 +617,11 @@ class OfficialPIDFollower:
             "target_speed_mps": target_speed_mps,
             "lookahead_m": lookahead_m,
             "target_idx": int(target_idx),
+            "steering_target_index": int(target_idx),
             "target_distance_m": target_distance,
+            "steering_target_path_distance_m": (
+                steering_target_path_distance_m
+            ),
             "target_wp_xyz": [
                 float(target_wp.transform.location.x),
                 float(target_wp.transform.location.y),
@@ -576,6 +629,13 @@ class OfficialPIDFollower:
             ],
             "progress_index": int(self._progress_index),
             "progress_s_m": progress_s,
+            "steering_reference": "geometric_progress",
+            "steering_reference_index": int(self._progress_index),
+            "steering_reference_s_m": progress_s,
+            "first_future_index": first_future_idx,
+            "speed_profile_index": int(profile_index),
+            "temporal_progress_s_m": temporal_progress_s,
+            "time_geometry_gap_m": time_geometry_gap_m,
             "terminal_stop_index": terminal_stop_index,
             "distance_to_stop_m": distance_to_stop,
             "launch_floor_mps": launch_floor_mps,
