@@ -161,6 +161,11 @@ SAFETY_EXECUTION_HORIZON_S = 1.5
 # Avoid turning tiny floating-point differences at the stopping-envelope
 # boundary into an emergency brake.
 SAFETY_SPEED_CAP_EPSILON_MPS = 0.1
+# Guard candidate ranking against the speed the plan may command during the
+# next control interval, rather than considering only the ego's current speed.
+# This conservative acceleration bound is above the measured K=3 p99
+# acceleration (~4.4 m/s²) and does not change the emergency threshold.
+SAFETY_GUARDED_ACCELERATION_MPS2 = 5.0
 # When the physical ego footprint is still on CARLA's Driving surface but the
 # buffered 0.25 m planning clearance is temporarily unavailable at a junction
 # transition, admit only a low-speed physically-contained recovery prefix.

@@ -8,9 +8,12 @@ from module import carla_safety_adapter
 from module.carla_safety_adapter import (
     CarlaGroundTruthSafetyAdapter,
     PlanAdmissionStatus,
+    StoppingReserveStatus,
     decide_plan_admission,
+    raw_physical_stopping_speed_cap_mps,
+    road_stopping_speed_cap_mps,
 )
-from module.safety_shield import AssessmentStatus, EgoKinematics
+from module.safety_shield import AssessmentStatus, EgoKinematics, SafetyPolicy
 
 
 class FakeLocation:
@@ -581,6 +584,109 @@ def test_stopping_envelope_escalates_only_when_current_speed_exceeds_cap(
     assert fast.road_envelope.emergency_required is True
     assert fast.road.status is AssessmentStatus.UNSAFE
     assert "road_stopping_envelope_exhausted" in fast.road.reason_codes
+
+
+def test_raw_physical_cap_is_not_clipped_by_controller_speed_limit():
+    policy = SafetyPolicy()
+    distance_to_bad = 30.0
+
+    raw_cap = raw_physical_stopping_speed_cap_mps(distance_to_bad, policy)
+    controller_cap = road_stopping_speed_cap_mps(distance_to_bad, policy)
+
+    assert raw_cap > carla_safety_adapter.cfg.TRAJECTORY_MAX_SPEED_MPS
+    assert controller_cap == pytest.approx(
+        carla_safety_adapter.cfg.TRAJECTORY_MAX_SPEED_MPS
+    )
+
+
+def test_controller_cap_saturation_does_not_create_a_false_emergency(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 30.0:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            speed_x=10.0,
+        ),
+        plan=_long_plan(step_m=0.5),
+    )
+    reserve = envelope.stopping_reserve_profile
+
+    assert reserve.raw_physical_stopping_cap_mps > 10.0
+    assert envelope.target_speed_cap_mps == pytest.approx(
+        carla_safety_adapter.cfg.TRAJECTORY_MAX_SPEED_MPS
+    )
+    assert envelope.emergency_required is False
+
+
+def test_guarded_stopping_reserve_can_be_fragile_without_emergency(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 4.5:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            speed_x=0.0,
+        ),
+        plan=_long_plan(step_m=0.5),
+    )
+    reserve = envelope.stopping_reserve_profile
+
+    assert reserve.guard_speed_mps == pytest.approx(5.5)
+    assert reserve.required_stopping_distance_m > envelope.distance_to_first_bad_m
+    assert reserve.stopping_reserve_m < 0.0
+    assert reserve.status is StoppingReserveStatus.FRAGILE
+    assert envelope.emergency_required is False
+
+
+def test_genuine_insufficient_physical_stopping_distance_remains_fail_closed(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 4.5:
+            return None
+        return FakeWaypoint(location, lane_width=4.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    assessment = adapter.assess(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            speed_x=5.0,
+        ),
+        plan=_long_plan(step_m=0.1),
+    )
+
+    assert assessment.road_envelope.emergency_required is True
+    assert assessment.road.status is AssessmentStatus.UNSAFE
+
+
+def test_full_safe_path_has_unbounded_stopping_reserve_and_additive_json(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(RecordingMap())
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(ego, simulation_time_s=5.0),
+        plan=_long_plan(),
+    )
+    payload = envelope.to_json_dict()
+
+    assert envelope.stopping_reserve_profile.status is StoppingReserveStatus.UNBOUNDED
+    assert payload["stopping_reserve_status"] == "UNBOUNDED"
+    assert payload["raw_physical_stopping_cap_mps"] is None
+    assert payload["stopping_reserve_profile"]["status"] == "UNBOUNDED"
 
 
 def test_current_ego_off_lane_remains_an_immediate_fail_closed_trigger(

@@ -54,6 +54,38 @@ class PlanAdmissionStatus(str, Enum):
     REJECT_FALLBACK_STOP = "REJECT_FALLBACK_STOP"
 
 
+class StoppingReserveStatus(str, Enum):
+    """Guarded distance reserve before the first non-executable road pose."""
+
+    UNBOUNDED = "UNBOUNDED"
+    ROBUST = "ROBUST"
+    FRAGILE = "FRAGILE"
+    RECOVERY = "RECOVERY"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class StoppingReserveProfile:
+    """Physical cap and one-control-step guarded stopping-distance facts."""
+
+    raw_physical_stopping_cap_mps: float | None
+    target_speed_cap_mps: float | None
+    guard_speed_mps: float | None
+    required_stopping_distance_m: float | None
+    stopping_reserve_m: float | None
+    status: StoppingReserveStatus
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "raw_physical_stopping_cap_mps": self.raw_physical_stopping_cap_mps,
+            "target_speed_cap_mps": self.target_speed_cap_mps,
+            "guard_speed_mps": self.guard_speed_mps,
+            "required_stopping_distance_m": self.required_stopping_distance_m,
+            "stopping_reserve_m": self.stopping_reserve_m,
+            "status": self.status.value,
+        }
+
+
 @dataclass(frozen=True)
 class RoadExecutionEnvelope:
     """Timed road facts used separately for admission, control, and shielding."""
@@ -71,8 +103,10 @@ class RoadExecutionEnvelope:
     full_path_surface: RoadContainmentAssessment | None = None
     junction_context: bool = False
     recovery_required: bool = False
+    stopping_reserve_profile: StoppingReserveProfile | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
+        reserve = self.stopping_reserve_profile
         return {
             "current_ego_road": self.current_ego_road.to_json_dict(),
             "current_ego_clearance_road": (
@@ -99,6 +133,26 @@ class RoadExecutionEnvelope:
             "emergency_required": bool(self.emergency_required),
             "junction_context": bool(self.junction_context),
             "recovery_required": bool(self.recovery_required),
+            "raw_physical_stopping_cap_mps": (
+                reserve.raw_physical_stopping_cap_mps if reserve is not None else None
+            ),
+            "guard_speed_mps": (
+                reserve.guard_speed_mps if reserve is not None else None
+            ),
+            "required_stopping_distance_m": (
+                reserve.required_stopping_distance_m if reserve is not None else None
+            ),
+            "stopping_reserve_m": (
+                reserve.stopping_reserve_m if reserve is not None else None
+            ),
+            "stopping_reserve_status": (
+                reserve.status.value
+                if reserve is not None
+                else StoppingReserveStatus.UNAVAILABLE.value
+            ),
+            "stopping_reserve_profile": (
+                reserve.to_json_dict() if reserve is not None else None
+            ),
         }
 
 
@@ -172,7 +226,19 @@ def road_stopping_speed_cap_mps(
     distance_to_bad_m: float,
     policy: SafetyPolicy,
 ) -> float:
-    """Maximum speed that preserves reaction and braking distance before a bad point."""
+    """Controller cap preserving reaction and braking distance before a bad point."""
+
+    return min(
+        raw_physical_stopping_speed_cap_mps(distance_to_bad_m, policy),
+        float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+    )
+
+
+def raw_physical_stopping_speed_cap_mps(
+    distance_to_bad_m: float,
+    policy: SafetyPolicy,
+) -> float:
+    """Unclipped physical cap used only to decide stopping-envelope exhaustion."""
 
     distance = max(0.0, float(distance_to_bad_m))
     deceleration = float(policy.assumed_deceleration_mps2)
@@ -186,7 +252,97 @@ def road_stopping_speed_cap_mps(
             + 2.0 * deceleration * available_distance
         ),
     )
-    return min(speed_cap, float(cfg.TRAJECTORY_MAX_SPEED_MPS))
+    return speed_cap
+
+
+def _near_term_plan_peak_speed_mps(
+    plan: Any,
+    current_time_s: float,
+    *,
+    execution_horizon_s: float,
+) -> float:
+    """Peak timestamped segment speed after interpolating the elapsed prefix."""
+
+    points = np.asarray(plan.world_points, dtype=np.float64)
+    times = np.asarray(plan.waypoint_times_s, dtype=np.float64)
+    current_time = float(current_time_s)
+    horizon = float(execution_horizon_s)
+    if (
+        points.ndim != 2
+        or points.shape[1] < 2
+        or times.shape != (len(points),)
+        or len(points) == 0
+        or not np.isfinite(points[:, :2]).all()
+        or not np.isfinite(times).all()
+        or np.any(np.diff(times) <= 0.0)
+        or not math.isfinite(current_time)
+        or not math.isfinite(horizon)
+        or horizon <= 0.0
+    ):
+        raise ValueError("invalid timed trajectory for stopping reserve")
+
+    source_time = float(getattr(plan, "source_simulation_time_s", times[0]))
+    capture_pose = getattr(plan, "capture_pose_world", None)
+    if capture_pose is not None:
+        pose = np.asarray(capture_pose, dtype=np.float64)
+        if pose.shape != (4, 4) or not np.isfinite(pose).all():
+            raise ValueError("invalid capture pose for stopping reserve")
+        if source_time < float(times[0]):
+            points = np.vstack([pose[:3, 3], points])
+            times = np.concatenate([[source_time], times])
+
+    if current_time >= float(times[-1]):
+        return 0.0
+    if current_time <= float(times[0]):
+        start_index = 0
+        clipped_points = points
+        clipped_times = times
+    else:
+        upper = int(np.searchsorted(times, current_time, side="right"))
+        lower = upper - 1
+        fraction = (current_time - float(times[lower])) / float(
+            times[upper] - times[lower]
+        )
+        current_point = points[lower] + fraction * (points[upper] - points[lower])
+        clipped_points = np.vstack([current_point, points[upper:]])
+        clipped_times = np.concatenate([[current_time], times[upper:]])
+        start_index = 0
+
+    execution_end = current_time + horizon
+    peak = 0.0
+    for index in range(start_index, len(clipped_points) - 1):
+        segment_start = float(clipped_times[index])
+        segment_end = float(clipped_times[index + 1])
+        if segment_start >= execution_end:
+            break
+        if segment_end <= current_time:
+            continue
+        segment_dt = segment_end - segment_start
+        if segment_dt <= 1e-9:
+            continue
+        segment_distance = float(
+            np.linalg.norm(
+                clipped_points[index + 1, :2] - clipped_points[index, :2]
+            )
+        )
+        peak = max(peak, segment_distance / segment_dt)
+        if segment_end >= execution_end:
+            break
+    return peak
+
+
+def _unavailable_stopping_reserve(
+    *,
+    target_speed_cap_mps: float | None,
+) -> StoppingReserveProfile:
+    return StoppingReserveProfile(
+        raw_physical_stopping_cap_mps=None,
+        target_speed_cap_mps=target_speed_cap_mps,
+        guard_speed_mps=None,
+        required_stopping_distance_m=None,
+        stopping_reserve_m=None,
+        status=StoppingReserveStatus.UNAVAILABLE,
+    )
 
 
 def _remove_lateral_clearance(
@@ -655,6 +811,9 @@ class CarlaGroundTruthSafetyAdapter:
             current_ego_clearance_road=current_road or unknown,
             near_term_path_surface=unknown,
             full_path_surface=unknown,
+            stopping_reserve_profile=_unavailable_stopping_reserve(
+                target_speed_cap_mps=0.0
+            ),
         )
 
     def _road_execution_envelope(
@@ -727,7 +886,28 @@ class CarlaGroundTruthSafetyAdapter:
                 full_path_surface=full_surface,
                 junction_context=junction_context,
                 recovery_required=recovery_required,
+                stopping_reserve_profile=_unavailable_stopping_reserve(
+                    target_speed_cap_mps=0.0
+                ),
             )
+
+        current_speed = float(math.hypot(*ego.velocity_xy))
+        near_term_peak_speed = _near_term_plan_peak_speed_mps(
+            plan,
+            current_time_s,
+            execution_horizon_s=float(cfg.SAFETY_EXECUTION_HORIZON_S),
+        )
+        guard_speed = (
+            max(
+                current_speed,
+                min(
+                    near_term_peak_speed,
+                    float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+                ),
+            )
+            + float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
+            * float(cfg.CONTROL_DT)
+        )
 
         first_bad = self._first_bad_profile_index(
             profile,
@@ -736,6 +916,18 @@ class CarlaGroundTruthSafetyAdapter:
             lateral_clearance_m=self.policy.lateral_clearance_m,
         )
         if first_bad is None:
+            target_speed_cap = (
+                float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS)
+                if recovery_required
+                else None
+            )
+            reserve_status = (
+                StoppingReserveStatus.RECOVERY
+                if recovery_required
+                else StoppingReserveStatus.UNBOUNDED
+            )
+            if current_road.status is not AssessmentStatus.SAFE:
+                reserve_status = StoppingReserveStatus.UNAVAILABLE
             return RoadExecutionEnvelope(
                 current_ego_road=current_road,
                 near_term_path_road=near_term,
@@ -743,17 +935,21 @@ class CarlaGroundTruthSafetyAdapter:
                 last_safe_waypoint_index=int(len(plan.world_points) - 1),
                 time_to_first_bad_s=None,
                 distance_to_first_bad_m=None,
-                target_speed_cap_mps=(
-                    float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS)
-                    if recovery_required
-                    else None
-                ),
+                target_speed_cap_mps=target_speed_cap,
                 emergency_required=False,
                 current_ego_clearance_road=current_clearance_road,
                 near_term_path_surface=near_surface,
                 full_path_surface=full_surface,
                 junction_context=junction_context,
                 recovery_required=recovery_required,
+                stopping_reserve_profile=StoppingReserveProfile(
+                    raw_physical_stopping_cap_mps=None,
+                    target_speed_cap_mps=target_speed_cap,
+                    guard_speed_mps=guard_speed,
+                    required_stopping_distance_m=None,
+                    stopping_reserve_m=None,
+                    status=reserve_status,
+                ),
             )
 
         first_remaining = int(remaining_indices[0])
@@ -784,18 +980,41 @@ class CarlaGroundTruthSafetyAdapter:
         if last_safe_index < first_future_waypoint:
             last_safe_index = None
 
-        stopping_speed_cap = road_stopping_speed_cap_mps(distance_to_bad, self.policy)
-        target_speed_cap = stopping_speed_cap
+        raw_physical_cap = raw_physical_stopping_speed_cap_mps(
+            distance_to_bad,
+            self.policy,
+        )
+        target_speed_cap = min(
+            raw_physical_cap,
+            float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+        )
         if recovery_required:
             target_speed_cap = min(
                 target_speed_cap,
                 float(cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS),
             )
-        current_speed = float(math.hypot(*ego.velocity_xy))
         emergency_required = (
             current_speed
-            > stopping_speed_cap + float(cfg.SAFETY_SPEED_CAP_EPSILON_MPS)
+            > raw_physical_cap + float(cfg.SAFETY_SPEED_CAP_EPSILON_MPS)
         )
+        required_stopping_distance = (
+            float(self.policy.stop_buffer_m)
+            + guard_speed * float(self.policy.reaction_time_s)
+            + guard_speed * guard_speed
+            / (2.0 * float(self.policy.assumed_deceleration_mps2))
+        )
+        stopping_reserve = distance_to_bad - required_stopping_distance
+        reserve_status = (
+            StoppingReserveStatus.RECOVERY
+            if recovery_required
+            else (
+                StoppingReserveStatus.ROBUST
+                if stopping_reserve >= 0.0
+                else StoppingReserveStatus.FRAGILE
+            )
+        )
+        if current_road.status is not AssessmentStatus.SAFE:
+            reserve_status = StoppingReserveStatus.UNAVAILABLE
         return RoadExecutionEnvelope(
             current_ego_road=current_road,
             near_term_path_road=near_term,
@@ -810,6 +1029,14 @@ class CarlaGroundTruthSafetyAdapter:
             full_path_surface=full_surface,
             junction_context=junction_context,
             recovery_required=recovery_required,
+            stopping_reserve_profile=StoppingReserveProfile(
+                raw_physical_stopping_cap_mps=raw_physical_cap,
+                target_speed_cap_mps=target_speed_cap,
+                guard_speed_mps=guard_speed,
+                required_stopping_distance_m=required_stopping_distance,
+                stopping_reserve_m=stopping_reserve,
+                status=reserve_status,
+            ),
         )
 
     def assess_ego_transform(self, transform: Any) -> RoadContainmentAssessment:
@@ -1066,6 +1293,9 @@ __all__ = [
     "CarlaSafetyAssessment",
     "PlanAdmissionStatus",
     "RoadExecutionEnvelope",
+    "StoppingReserveProfile",
+    "StoppingReserveStatus",
     "decide_plan_admission",
+    "raw_physical_stopping_speed_cap_mps",
     "road_stopping_speed_cap_mps",
 ]
