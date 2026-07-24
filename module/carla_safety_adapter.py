@@ -65,6 +65,14 @@ class StoppingReserveStatus(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class RoadRecoveryMode(str, Enum):
+    """Why buffered lane clearance may be regained under a physical-surface cap."""
+
+    NONE = "NONE"
+    JUNCTION_CLEARANCE = "JUNCTION_CLEARANCE"
+    BOUNDARY_CLEARANCE = "BOUNDARY_CLEARANCE"
+
+
 @dataclass(frozen=True)
 class StoppingReserveProfile:
     """Physical cap and one-control-step guarded stopping-distance facts."""
@@ -104,6 +112,10 @@ class RoadExecutionEnvelope:
     full_path_surface: RoadContainmentAssessment | None = None
     junction_context: bool = False
     recovery_required: bool = False
+    recovery_mode: RoadRecoveryMode = RoadRecoveryMode.NONE
+    near_term_end_clearance_road: RoadContainmentAssessment | None = None
+    recovery_path_length_m: float | None = None
+    recovery_displacement_m: float | None = None
     stopping_reserve_profile: StoppingReserveProfile | None = None
     stopping_reserve_compute_ms: float | None = None
     execution_cursor_index: int | None = None
@@ -141,6 +153,14 @@ class RoadExecutionEnvelope:
             "emergency_required": bool(self.emergency_required),
             "junction_context": bool(self.junction_context),
             "recovery_required": bool(self.recovery_required),
+            "recovery_mode": self.recovery_mode.value,
+            "near_term_end_clearance_road": (
+                self.near_term_end_clearance_road.to_json_dict()
+                if self.near_term_end_clearance_road is not None
+                else None
+            ),
+            "recovery_path_length_m": self.recovery_path_length_m,
+            "recovery_displacement_m": self.recovery_displacement_m,
             "raw_physical_stopping_cap_mps": (
                 reserve.raw_physical_stopping_cap_mps if reserve is not None else None
             ),
@@ -231,7 +251,6 @@ def decide_plan_admission(
     recovery_admissible = (
         candidate.current_ego_road.status is AssessmentStatus.SAFE
         and current_clearance.status is AssessmentStatus.UNSAFE
-        and candidate.junction_context
         and near_surface is not None
         and near_surface.status is AssessmentStatus.SAFE
         and candidate.last_safe_waypoint_index is not None
@@ -1122,11 +1141,27 @@ class CarlaGroundTruthSafetyAdapter:
             physical_surface=True,
             lateral_clearance_m=self.policy.lateral_clearance_m,
         )
+        near_term_end = self._assess_profile_indices(
+            profile,
+            near_term_indices[-1:],
+            empty_reason="near_term_end_path_exhausted",
+        )
         junction_context = bool(
             current_junction_context
             or self._indices_have_junction(profile, near_term_indices)
         )
-        recovery_required = bool(
+        recovery_path_length_m = max(
+            0.0,
+            float(profile.cumulative_distance_m[int(near_term_indices[-1])])
+            - projection.progress_m,
+        )
+        recovery_displacement_m = float(
+            np.linalg.norm(
+                profile.points[int(near_term_indices[-1]), :2]
+                - np.asarray(ego.center_xy, dtype=np.float64)
+            )
+        )
+        junction_recovery_required = bool(
             current_road.status is AssessmentStatus.SAFE
             and junction_context
             and near_surface.status is AssessmentStatus.SAFE
@@ -1135,11 +1170,46 @@ class CarlaGroundTruthSafetyAdapter:
                 or near_term.status is AssessmentStatus.UNSAFE
             )
         )
+        boundary_recovery_required = bool(
+            current_road.status is AssessmentStatus.SAFE
+            and not junction_context
+            and current_clearance_road.status is AssessmentStatus.UNSAFE
+            and near_surface.status is AssessmentStatus.SAFE
+            and near_term_end.status is AssessmentStatus.SAFE
+            and terminal_stop_index is None
+            and recovery_displacement_m
+            >= float(cfg.SAFETY_BOUNDARY_RECOVERY_MIN_DISPLACEMENT_M)
+        )
+        recovery_required = bool(
+            junction_recovery_required or boundary_recovery_required
+        )
+        recovery_mode = (
+            RoadRecoveryMode.JUNCTION_CLEARANCE
+            if junction_recovery_required
+            else (
+                RoadRecoveryMode.BOUNDARY_CLEARANCE
+                if boundary_recovery_required
+                else RoadRecoveryMode.NONE
+            )
+        )
         first_bad = self._first_bad_profile_index(
             profile,
             remaining_indices,
+            # Buffered clearance is already unavailable during recovery, so
+            # only a genuine physical-surface violation is an emergency
+            # boundary.  Non-junction recovery authority is bounded
+            # independently to the near-term endpoint below.
             physical_surface=recovery_required,
             lateral_clearance_m=self.policy.lateral_clearance_m,
+        )
+        boundary_recovery_authorized_waypoint_index = (
+            int(
+                profile.upper_waypoint_indices[
+                    int(near_term_indices[-1])
+                ]
+            )
+            if boundary_recovery_required
+            else None
         )
         reserve_compute_started_s = time.perf_counter()
         current_speed = float(math.hypot(*ego.velocity_xy))
@@ -1177,7 +1247,11 @@ class CarlaGroundTruthSafetyAdapter:
                 current_ego_road=current_road,
                 near_term_path_road=near_term,
                 full_path_road=full_path,
-                last_safe_waypoint_index=int(len(plan.world_points) - 1),
+                last_safe_waypoint_index=(
+                    boundary_recovery_authorized_waypoint_index
+                    if boundary_recovery_authorized_waypoint_index is not None
+                    else int(len(plan.world_points) - 1)
+                ),
                 time_to_first_bad_s=None,
                 distance_to_first_bad_m=None,
                 target_speed_cap_mps=target_speed_cap,
@@ -1187,6 +1261,10 @@ class CarlaGroundTruthSafetyAdapter:
                 full_path_surface=full_surface,
                 junction_context=junction_context,
                 recovery_required=recovery_required,
+                recovery_mode=recovery_mode,
+                near_term_end_clearance_road=near_term_end,
+                recovery_path_length_m=recovery_path_length_m,
+                recovery_displacement_m=recovery_displacement_m,
                 stopping_reserve_profile=StoppingReserveProfile(
                     raw_physical_stopping_cap_mps=None,
                     target_speed_cap_mps=target_speed_cap,
@@ -1233,6 +1311,14 @@ class CarlaGroundTruthSafetyAdapter:
         )
         if last_safe_index < first_execution_waypoint:
             last_safe_index = None
+        if (
+            last_safe_index is not None
+            and boundary_recovery_authorized_waypoint_index is not None
+        ):
+            last_safe_index = min(
+                last_safe_index,
+                boundary_recovery_authorized_waypoint_index,
+            )
 
         raw_physical_cap = raw_physical_stopping_speed_cap_mps(
             distance_to_bad,
@@ -1242,10 +1328,21 @@ class CarlaGroundTruthSafetyAdapter:
             float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
             * float(cfg.CONTROL_DT)
         )
-        target_speed_cap = min(
-            max(0.0, raw_physical_cap - acceleration_guard_mps),
-            float(cfg.TRAJECTORY_MAX_SPEED_MPS),
-        )
+        if boundary_recovery_required:
+            # The recovery prefix is physically contained and controller
+            # authority ends at its near-term endpoint.  Applying the normal
+            # one-tick acceleration subtraction here can collapse a low-speed
+            # recovery cap to zero even while the current speed remains below
+            # the physical stopping boundary.
+            target_speed_cap = min(
+                raw_physical_cap,
+                float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+            )
+        else:
+            target_speed_cap = min(
+                max(0.0, raw_physical_cap - acceleration_guard_mps),
+                float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+            )
         if recovery_required:
             target_speed_cap = min(
                 target_speed_cap,
@@ -1290,6 +1387,10 @@ class CarlaGroundTruthSafetyAdapter:
             full_path_surface=full_surface,
             junction_context=junction_context,
             recovery_required=recovery_required,
+            recovery_mode=recovery_mode,
+            near_term_end_clearance_road=near_term_end,
+            recovery_path_length_m=recovery_path_length_m,
+            recovery_displacement_m=recovery_displacement_m,
             stopping_reserve_profile=StoppingReserveProfile(
                 raw_physical_stopping_cap_mps=raw_physical_cap,
                 target_speed_cap_mps=target_speed_cap,
@@ -1564,6 +1665,7 @@ __all__ = [
     "CarlaGroundTruthSafetyAdapter",
     "CarlaSafetyAssessment",
     "PlanAdmissionStatus",
+    "RoadRecoveryMode",
     "RoadExecutionEnvelope",
     "StoppingReserveProfile",
     "StoppingReserveStatus",

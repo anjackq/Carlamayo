@@ -188,9 +188,12 @@ SAFETY_SPEED_CAP_EPSILON_MPS = 0.1
 # acceleration (~4.4 m/s²) and does not change the emergency threshold.
 SAFETY_GUARDED_ACCELERATION_MPS2 = 5.0
 # When the physical ego footprint is still on CARLA's Driving surface but the
-# buffered 0.25 m planning clearance is temporarily unavailable at a junction
-# transition, admit only a low-speed physically-contained recovery prefix.
+# buffered 0.25 m planning clearance is temporarily unavailable, admit only a
+# low-speed physically-contained recovery prefix.  Outside a junction the
+# candidate must make measurable progress and restore the full buffer inside
+# the fixed execution horizon; this prevents stationary pseudo-recovery.
 SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS = 0.75
+SAFETY_BOUNDARY_RECOVERY_MIN_DISPLACEMENT_M = 0.10
 # A fresh equal-tier safe-prefix plan may not discard materially better
 # executable headroom while the active plan is still above its bounded
 # retention deadline.  The thresholds reuse the physical stop buffer and

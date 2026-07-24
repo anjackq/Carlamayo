@@ -10,6 +10,7 @@ from module import carla_safety_adapter
 from module.carla_safety_adapter import (
     CarlaGroundTruthSafetyAdapter,
     PlanAdmissionStatus,
+    RoadRecoveryMode,
     StoppingReserveStatus,
     decide_plan_admission,
     raw_physical_stopping_speed_cap_mps,
@@ -27,6 +28,11 @@ NARROW_JUNCTION_GAP_FIXTURE = (
     Path(__file__).parent
     / "fixtures"
     / "job_22863131_narrow_junction_gap.json"
+)
+BOUNDARY_RECOVERY_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "job_22863138_boundary_recovery.json"
 )
 
 
@@ -713,6 +719,10 @@ def test_full_safe_path_has_unbounded_stopping_reserve_and_additive_json(
     assert payload["stopping_reserve_status"] == "UNBOUNDED"
     assert payload["raw_physical_stopping_cap_mps"] is None
     assert payload["stopping_reserve_profile"]["status"] == "UNBOUNDED"
+    assert payload["recovery_mode"] == "NONE"
+    assert payload["near_term_end_clearance_road"]["status"] == "SAFE"
+    assert payload["recovery_path_length_m"] > 0.0
+    assert payload["recovery_displacement_m"] > 0.0
 
 
 def test_current_ego_off_lane_remains_an_immediate_fail_closed_trigger(
@@ -783,6 +793,7 @@ def test_junction_transition_can_admit_low_speed_physical_recovery_prefix(
     assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
     assert envelope.junction_context is True
     assert envelope.recovery_required is True
+    assert envelope.recovery_mode is RoadRecoveryMode.JUNCTION_CLEARANCE
     assert envelope.target_speed_cap_mps == pytest.approx(
         carla_safety_adapter.cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS
     )
@@ -816,9 +827,278 @@ def test_nonjunction_clearance_violation_does_not_receive_recovery_grace(
     )
     assert envelope.junction_context is False
     assert envelope.recovery_required is False
+    assert envelope.recovery_mode is RoadRecoveryMode.NONE
     assert (
         decide_plan_admission(envelope)
         is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_nonjunction_boundary_recovery_requires_and_restores_clearance(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan(plan_id="boundary-recovery")
+    plan.world_points[:, 1] = np.linspace(0.5, 0.0, len(plan.world_points))
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.current_ego_road.status is AssessmentStatus.SAFE
+    assert (
+        envelope.current_ego_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.SAFE
+    )
+    assert envelope.recovery_displacement_m >= (
+        carla_safety_adapter.cfg.SAFETY_BOUNDARY_RECOVERY_MIN_DISPLACEMENT_M
+    )
+    assert envelope.junction_context is False
+    assert envelope.recovery_required is True
+    assert envelope.recovery_mode is RoadRecoveryMode.BOUNDARY_CLEARANCE
+    assert envelope.target_speed_cap_mps == pytest.approx(
+        carla_safety_adapter.cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS
+    )
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX
+    )
+
+
+def test_nonjunction_boundary_recovery_rejects_outward_motion(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan(plan_id="boundary-outward")
+    plan.world_points[:, 1] = np.linspace(0.5, 0.6, len(plan.world_points))
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.recovery_required is False
+    assert envelope.recovery_mode is RoadRecoveryMode.NONE
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_nonjunction_boundary_recovery_rejects_physical_excursion(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan(plan_id="boundary-physical-excursion")
+    plan.world_points[:, 1] = 0.0
+    plan.world_points[:8, 1] = np.linspace(0.5, 0.8, 8)
+    plan.world_points[8:16, 1] = np.linspace(0.8, 0.0, 8)
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.near_term_path_surface.status is AssessmentStatus.UNSAFE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.SAFE
+    )
+    assert envelope.recovery_required is False
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_nonjunction_boundary_recovery_rejects_stationary_stop(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = np.linspace(0.001, 0.1, len(points))
+    points[:, 1] = 0.5
+    plan = types.SimpleNamespace(
+        plan_id="boundary-stationary-stop",
+        world_points=points,
+        waypoint_times_s=5.0 + np.arange(1, 65, dtype=np.float64) * 0.1,
+        terminal_stop_index=0,
+    )
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.UNSAFE
+    )
+    assert envelope.recovery_displacement_m < (
+        carla_safety_adapter.cfg.SAFETY_BOUNDARY_RECOVERY_MIN_DISPLACEMENT_M
+    )
+    assert envelope.recovery_required is False
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_nonjunction_boundary_recovery_does_not_authorize_explicit_stop(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan(plan_id="boundary-recenter-stop")
+    plan.world_points[:, 1] = np.linspace(0.5, 0.0, len(plan.world_points))
+    plan.terminal_stop_index = 15
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.SAFE
+    )
+    assert envelope.recovery_required is False
+    assert envelope.recovery_mode is RoadRecoveryMode.NONE
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_nonjunction_boundary_recovery_end_query_failure_fails_closed(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 1.5:
+            raise RuntimeError("endpoint map unavailable")
+        return FakeWaypoint(location, lane_width=2.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    plan = _long_plan(plan_id="boundary-unknown-end")
+    plan.world_points[:, 1] = np.linspace(0.5, 0.0, len(plan.world_points))
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.UNKNOWN
+    )
+    assert envelope.recovery_required is False
+    assert (
+        decide_plan_admission(envelope)
+        is PlanAdmissionStatus.REJECT_FALLBACK_STOP
+    )
+
+
+def test_boundary_recovery_returns_to_buffered_semantics_after_horizon(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    plan = _long_plan(plan_id="boundary-recovery-then-regress")
+    plan.world_points[:, 1] = 0.0
+    plan.world_points[:16, 1] = np.linspace(0.5, 0.0, 16)
+    plan.world_points[16:, 1] = np.linspace(0.0, 0.6, 48)
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+
+    assert envelope.recovery_mode is RoadRecoveryMode.BOUNDARY_CLEARANCE
+    assert envelope.near_term_path_surface.status is AssessmentStatus.SAFE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.SAFE
+    )
+    assert envelope.full_path_surface.status is AssessmentStatus.SAFE
+    assert envelope.full_path_road.status is AssessmentStatus.UNSAFE
+    assert envelope.last_safe_waypoint_index is not None
+    assert envelope.last_safe_waypoint_index < len(plan.world_points) - 1
+    assert envelope.target_speed_cap_mps is not None
+
+
+def test_job_22863138_boundary_recovery_fixture_captures_source_gate():
+    replay = json.loads(BOUNDARY_RECOVERY_FIXTURE.read_text())
+    containment = replay["source_containment"]
+    trajectory = replay["trajectory_facts"]
+    expected = replay["expected_policy"]
+
+    assert containment["current_physical_status"] == "SAFE"
+    assert containment["current_clearance_status"] == "UNSAFE"
+    assert containment["near_term_physical_status"] == "SAFE"
+    assert containment["near_term_end_clearance_status"] == "SAFE"
+    assert containment["near_term_end_clearance_margin_m"] > 0.0
+    assert trajectory["terminal_stop_index"] is None
+    assert trajectory["near_term_recovery_displacement_m"] >= (
+        carla_safety_adapter.cfg.SAFETY_BOUNDARY_RECOVERY_MIN_DISPLACEMENT_M
+    )
+    assert expected["recovery_mode"] == RoadRecoveryMode.BOUNDARY_CLEARANCE.value
+    assert (
+        expected["admission_status"]
+        == PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX.value
+    )
+    assert expected["maximum_authorized_waypoint_index"] == 16
+    assert expected["maximum_speed_cap_mps"] == pytest.approx(
+        carla_safety_adapter.cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS
     )
 
 
