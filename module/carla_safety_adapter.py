@@ -1117,6 +1117,41 @@ class CarlaGroundTruthSafetyAdapter:
             profile.times_s[remaining_indices]
             <= near_term_origin_s + float(cfg.SAFETY_EXECUTION_HORIZON_S)
         ]
+        source_waypoint_times_s = np.asarray(
+            plan.waypoint_times_s,
+            dtype=np.float64,
+        )
+        recovery_horizon_end_s = (
+            near_term_origin_s + float(cfg.SAFETY_EXECUTION_HORIZON_S)
+        )
+        recovery_endpoint_waypoint_index = int(
+            np.searchsorted(
+                source_waypoint_times_s,
+                recovery_horizon_end_s
+                + float(cfg.TRAJECTORY_TIME_EPSILON_S),
+                side="right",
+            )
+            - 1
+        )
+        recovery_endpoint_profile_index: int | None = None
+        if recovery_endpoint_waypoint_index >= 0:
+            endpoint_time_s = float(
+                source_waypoint_times_s[recovery_endpoint_waypoint_index]
+            )
+            endpoint_profile_candidates = np.flatnonzero(
+                (
+                    profile.upper_waypoint_indices
+                    == recovery_endpoint_waypoint_index
+                )
+                & (
+                    np.abs(profile.times_s - endpoint_time_s)
+                    <= float(cfg.TRAJECTORY_TIME_EPSILON_S)
+                )
+            )
+            if len(endpoint_profile_candidates) > 0:
+                recovery_endpoint_profile_index = int(
+                    endpoint_profile_candidates[-1]
+                )
         full_path = self._assess_profile_indices(
             profile,
             remaining_indices,
@@ -1143,23 +1178,42 @@ class CarlaGroundTruthSafetyAdapter:
         )
         near_term_end = self._assess_profile_indices(
             profile,
-            near_term_indices[-1:],
+            (
+                np.asarray(
+                    [recovery_endpoint_profile_index],
+                    dtype=np.int64,
+                )
+                if recovery_endpoint_profile_index is not None
+                else np.empty(0, dtype=np.int64)
+            ),
             empty_reason="near_term_end_path_exhausted",
         )
         junction_context = bool(
             current_junction_context
             or self._indices_have_junction(profile, near_term_indices)
         )
-        recovery_path_length_m = max(
-            0.0,
-            float(profile.cumulative_distance_m[int(near_term_indices[-1])])
-            - projection.progress_m,
-        )
-        recovery_displacement_m = float(
-            np.linalg.norm(
-                profile.points[int(near_term_indices[-1]), :2]
-                - np.asarray(ego.center_xy, dtype=np.float64)
+        recovery_path_length_m = (
+            max(
+                0.0,
+                float(
+                    profile.cumulative_distance_m[
+                        recovery_endpoint_profile_index
+                    ]
+                )
+                - projection.progress_m,
             )
+            if recovery_endpoint_profile_index is not None
+            else 0.0
+        )
+        recovery_displacement_m = (
+            float(
+                np.linalg.norm(
+                    profile.points[recovery_endpoint_profile_index, :2]
+                    - np.asarray(ego.center_xy, dtype=np.float64)
+                )
+            )
+            if recovery_endpoint_profile_index is not None
+            else 0.0
         )
         junction_recovery_required = bool(
             current_road.status is AssessmentStatus.SAFE
@@ -1203,11 +1257,7 @@ class CarlaGroundTruthSafetyAdapter:
             lateral_clearance_m=self.policy.lateral_clearance_m,
         )
         boundary_recovery_authorized_waypoint_index = (
-            int(
-                profile.upper_waypoint_indices[
-                    int(near_term_indices[-1])
-                ]
-            )
+            recovery_endpoint_waypoint_index
             if boundary_recovery_required
             else None
         )
@@ -1328,21 +1378,10 @@ class CarlaGroundTruthSafetyAdapter:
             float(cfg.SAFETY_GUARDED_ACCELERATION_MPS2)
             * float(cfg.CONTROL_DT)
         )
-        if boundary_recovery_required:
-            # The recovery prefix is physically contained and controller
-            # authority ends at its near-term endpoint.  Applying the normal
-            # one-tick acceleration subtraction here can collapse a low-speed
-            # recovery cap to zero even while the current speed remains below
-            # the physical stopping boundary.
-            target_speed_cap = min(
-                raw_physical_cap,
-                float(cfg.TRAJECTORY_MAX_SPEED_MPS),
-            )
-        else:
-            target_speed_cap = min(
-                max(0.0, raw_physical_cap - acceleration_guard_mps),
-                float(cfg.TRAJECTORY_MAX_SPEED_MPS),
-            )
+        target_speed_cap = min(
+            max(0.0, raw_physical_cap - acceleration_guard_mps),
+            float(cfg.TRAJECTORY_MAX_SPEED_MPS),
+        )
         if recovery_required:
             target_speed_cap = min(
                 target_speed_cap,

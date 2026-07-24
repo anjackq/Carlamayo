@@ -1076,6 +1076,112 @@ def test_boundary_recovery_returns_to_buffered_semantics_after_horizon(
     assert envelope.target_speed_cap_mps is not None
 
 
+def test_boundary_recovery_authority_ends_at_last_complete_source_waypoint(
+    driving_lane_type,
+):
+    adapter, _, ego = _adapter(
+        RecordingMap(lambda location: FakeWaypoint(location, lane_width=2.0))
+    )
+    segment_lengths = np.where(
+        np.arange(63, dtype=np.int64) % 2 == 0,
+        0.55,
+        0.30,
+    )
+    segment_lengths[15] = 0.55
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = np.concatenate(
+        [[0.30], 0.30 + np.cumsum(segment_lengths)]
+    )
+    points[:, 1] = np.linspace(0.5, 0.0, len(points))
+    plan = types.SimpleNamespace(
+        plan_id="boundary-variable-densification",
+        world_points=points,
+        waypoint_times_s=5.0 + np.arange(1, 65, dtype=np.float64) * 0.1,
+    )
+    tick_context = _tick_context(
+        ego,
+        simulation_time_s=5.0,
+        ego_x=0.55,
+        ego_y=0.5,
+    )
+
+    envelope = adapter.assess_plan_road(
+        tick_context=tick_context,
+        plan=plan,
+    )
+    profile = adapter._profile_for_plan(
+        plan,
+        adapter._ego_from_context(tick_context),
+    )
+    projection = carla_safety_adapter._project_path_progress(
+        points=profile.points,
+        cumulative_distance_m=profile.cumulative_distance_m,
+        ego_xy=(0.55, 0.5),
+        ego_yaw_rad=0.0,
+    )
+    near_origin_s = float(profile.times_s[projection.first_path_index])
+    near_indices = np.arange(
+        projection.first_path_index,
+        len(profile.points),
+        dtype=np.int64,
+    )
+    near_indices = near_indices[
+        profile.times_s[near_indices]
+        <= near_origin_s + carla_safety_adapter.cfg.SAFETY_EXECUTION_HORIZON_S
+    ]
+
+    # The last dense pose lies inside source segment 15 -> 16.  Authorizing
+    # its upper source index would let the controller pass the pose whose
+    # clearance was actually checked.
+    assert int(profile.upper_waypoint_indices[int(near_indices[-1])]) == 16
+    assert profile.times_s[int(near_indices[-1])] > plan.waypoint_times_s[15]
+    assert envelope.recovery_mode is RoadRecoveryMode.BOUNDARY_CLEARANCE
+    assert (
+        envelope.near_term_end_clearance_road.status
+        is AssessmentStatus.SAFE
+    )
+    assert envelope.last_safe_waypoint_index == 15
+
+
+def test_boundary_recovery_keeps_one_tick_acceleration_guard(
+    driving_lane_type,
+):
+    def resolve(location):
+        if location.x >= 3.1:
+            return None
+        return FakeWaypoint(location, lane_width=2.0)
+
+    adapter, _, ego = _adapter(RecordingMap(resolve))
+    plan = _long_plan(plan_id="boundary-guarded-cap")
+    plan.world_points[:, 1] = 0.0
+    plan.world_points[:16, 1] = np.linspace(0.5, 0.0, 16)
+
+    envelope = adapter.assess_plan_road(
+        tick_context=_tick_context(
+            ego,
+            simulation_time_s=5.0,
+            ego_y=0.5,
+        ),
+        plan=plan,
+    )
+    raw_cap = (
+        envelope.stopping_reserve_profile.raw_physical_stopping_cap_mps
+    )
+    acceleration_guard_mps = (
+        carla_safety_adapter.cfg.SAFETY_GUARDED_ACCELERATION_MPS2
+        * carla_safety_adapter.cfg.CONTROL_DT
+    )
+
+    assert envelope.recovery_mode is RoadRecoveryMode.BOUNDARY_CLEARANCE
+    assert raw_cap > acceleration_guard_mps
+    assert raw_cap - acceleration_guard_mps < (
+        carla_safety_adapter.cfg.SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS
+    )
+    assert envelope.target_speed_cap_mps == pytest.approx(
+        raw_cap - acceleration_guard_mps
+    )
+
+
 def test_job_22863138_boundary_recovery_fixture_captures_source_gate():
     replay = json.loads(BOUNDARY_RECOVERY_FIXTURE.read_text())
     containment = replay["source_containment"]
