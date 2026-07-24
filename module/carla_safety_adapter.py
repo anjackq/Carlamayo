@@ -7,10 +7,12 @@ snapshot associated with the current control tick.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -71,6 +73,77 @@ class RoadRecoveryMode(str, Enum):
     NONE = "NONE"
     JUNCTION_CLEARANCE = "JUNCTION_CLEARANCE"
     BOUNDARY_CLEARANCE = "BOUNDARY_CLEARANCE"
+
+
+@dataclass(frozen=True)
+class RoadTickFacts:
+    """Immutable exact-map facts shared by every plan in one serial batch."""
+
+    frame_id: int
+    simulation_time_s: float
+    ego: EgoKinematics
+    ego_center_z: float
+    current_ego_samples: tuple[RoadContainmentSample, ...]
+    current_ego_clearance_road: RoadContainmentAssessment
+    current_ego_road: RoadContainmentAssessment
+    current_junction_context: bool
+    map_digest: str
+    policy_digest: str
+    bounding_box_digest: str
+    fallback_yaw_rad: float
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "frame_id": self.frame_id,
+            "simulation_time_s": self.simulation_time_s,
+            "current_ego_clearance_road": (
+                self.current_ego_clearance_road.to_json_dict()
+            ),
+            "current_ego_road": self.current_ego_road.to_json_dict(),
+            "current_junction_context": bool(self.current_junction_context),
+            "map_digest": self.map_digest,
+            "policy_digest": self.policy_digest,
+            "bounding_box_digest": self.bounding_box_digest,
+            "fallback_yaw_rad": self.fallback_yaw_rad,
+        }
+
+
+@dataclass(frozen=True)
+class RoadAssessmentBatchStats:
+    """Timing and exact-query workload for one ordered road-assessment batch."""
+
+    backend_status: str = "serial"
+    road_batch_wall_ms: float = 0.0
+    validation_ms: float = 0.0
+    densify_heading_ms: float = 0.0
+    map_query_ms: float = 0.0
+    aggregate_ms: float = 0.0
+    plan_count: int = 0
+    pose_count: int = 0
+    map_query_count: int = 0
+    worker_count: int = 1
+    chunk_count: int = 0
+    profile_cache_hits: int = 0
+    profile_cache_misses: int = 0
+    error_count: int = 0
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "backend_status": self.backend_status,
+            "road_batch_wall_ms": self.road_batch_wall_ms,
+            "validation_ms": self.validation_ms,
+            "densify_heading_ms": self.densify_heading_ms,
+            "map_query_ms": self.map_query_ms,
+            "aggregate_ms": self.aggregate_ms,
+            "plan_count": self.plan_count,
+            "pose_count": self.pose_count,
+            "map_query_count": self.map_query_count,
+            "worker_count": self.worker_count,
+            "chunk_count": self.chunk_count,
+            "profile_cache_hits": self.profile_cache_hits,
+            "profile_cache_misses": self.profile_cache_misses,
+            "error_count": self.error_count,
+        }
 
 
 @dataclass(frozen=True)
@@ -207,7 +280,7 @@ class RoadExecutionEnvelope:
 class _TimedRoadProfile:
     """Cached exact-map samples for one immutable fixed-world plan."""
 
-    plan_id: str
+    cache_key: str
     points: np.ndarray
     times_s: np.ndarray
     cumulative_distance_m: np.ndarray
@@ -224,6 +297,39 @@ class _PathProgressProjection:
     first_path_index: int
     cross_track_m: float
     heading_error_deg: float
+
+
+@dataclass
+class _RoadBatchAccumulator:
+    """Mutable timing scratchpad converted to a frozen public contract."""
+
+    validation_s: float = 0.0
+    densify_heading_s: float = 0.0
+    map_query_s: float = 0.0
+    aggregate_s: float = 0.0
+    pose_count: int = 0
+    map_query_count: int = 0
+    profile_cache_hits: int = 0
+    profile_cache_misses: int = 0
+    error_count: int = 0
+
+
+class _PlanIdGeometryMismatch(ValueError):
+    """The same logical plan identity was reused for different trajectory data."""
+
+
+def _timed_road_profile_cacheable(profile: _TimedRoadProfile) -> bool:
+    """Return false when transient map-query failures contaminated a profile."""
+
+    return all(
+        sample.contained is not None
+        and not (
+            sample.reason is not None
+            and "carla_map_query_error" in sample.reason
+        )
+        for pose_samples in profile.samples_by_pose
+        for sample in pose_samples
+    )
 
 
 def decide_plan_admission(
@@ -485,6 +591,170 @@ def _wrapped_angle_degrees(angle_deg: float) -> float:
     return (float(angle_deg) + 180.0) % 360.0 - 180.0
 
 
+def _sha256_text(label: str, value: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(label.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(value.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _map_content_digest(carla_map: Any) -> str:
+    """Hash OpenDRIVE when available, with a stable map-name fallback."""
+
+    to_opendrive = getattr(carla_map, "to_opendrive", None)
+    if callable(to_opendrive):
+        try:
+            opendrive = to_opendrive()
+            if isinstance(opendrive, str) and opendrive:
+                return _sha256_text("carla_opendrive", opendrive)
+        except Exception:
+            pass
+
+    map_name = getattr(carla_map, "name", None)
+    if map_name is not None:
+        return _sha256_text("carla_map_name", str(map_name))
+    fallback = (
+        f"{type(carla_map).__module__}.{type(carla_map).__qualname__}:"
+        f"{id(carla_map)}"
+    )
+    return _sha256_text("carla_map_object", fallback)
+
+
+def _policy_content_digest(policy: SafetyPolicy) -> str:
+    if is_dataclass(policy):
+        values = {
+            item.name: getattr(policy, item.name)
+            for item in fields(policy)
+        }
+    else:
+        values = dict(vars(policy))
+    payload = json.dumps(
+        values,
+        allow_nan=False,
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _sha256_text("safety_policy", payload)
+
+
+def _bounding_box_content_digest(bounding_box: Any) -> str:
+    extent = getattr(bounding_box, "extent", None)
+    location = getattr(bounding_box, "location", None)
+    rotation = getattr(bounding_box, "rotation", None)
+    values = {
+        "extent": [
+            float(getattr(extent, axis, 0.0))
+            for axis in ("x", "y", "z")
+        ],
+        "location": [
+            float(getattr(location, axis, 0.0))
+            for axis in ("x", "y", "z")
+        ],
+        "rotation": [
+            float(getattr(rotation, angle, 0.0))
+            for angle in ("roll", "pitch", "yaw")
+        ],
+    }
+    payload = json.dumps(
+        values,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _sha256_text("ego_bounding_box", payload)
+
+
+def _plan_geometry_digest(plan: Any) -> str:
+    """Hash exactly the geometry/timestamps consumed by the road profile."""
+
+    points = np.asarray(plan.world_points, dtype=np.float64)
+    times = np.asarray(plan.waypoint_times_s, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1] < 3
+        or len(points) == 0
+        or times.ndim != 1
+        or len(times) != len(points)
+        or not np.isfinite(points[:, :3]).all()
+        or not np.isfinite(times).all()
+        or (len(times) > 1 and not np.all(np.diff(times) > 0.0))
+    ):
+        raise ValueError("invalid timed world path")
+
+    normalized_points = np.ascontiguousarray(points[:, :3], dtype="<f8")
+    normalized_times = np.ascontiguousarray(times, dtype="<f8")
+    digest = hashlib.sha256()
+    digest.update(b"trajectory_geometry_timestamps_v1\0")
+    digest.update(
+        json.dumps(
+            {
+                "points_shape": list(normalized_points.shape),
+                "times_shape": list(normalized_times.shape),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    )
+    digest.update(b"\0")
+    digest.update(normalized_points.tobytes(order="C"))
+    digest.update(b"\0")
+    digest.update(normalized_times.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _road_profile_cache_key(
+    *,
+    geometry_digest: str,
+    map_digest: str,
+    policy_digest: str,
+    bounding_box_digest: str,
+    fallback_yaw_rad: float,
+) -> str:
+    fallback_yaw = float(fallback_yaw_rad)
+    if not math.isfinite(fallback_yaw):
+        raise ValueError("fallback yaw must be finite")
+    digest = hashlib.sha256()
+    digest.update(b"exact_road_profile_v1\0")
+    for value in (
+        geometry_digest,
+        map_digest,
+        policy_digest,
+        bounding_box_digest,
+        fallback_yaw.hex(),
+    ):
+        digest.update(value.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _effective_profile_fallback_yaw(
+    plan: Any,
+    fallback_yaw_rad: float,
+) -> float:
+    """Return zero when trajectory headings never consume the fallback yaw."""
+
+    points = np.asarray(plan.world_points, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1] < 2
+        or len(points) == 0
+        or not np.isfinite(points[:, :2]).all()
+    ):
+        raise ValueError("invalid world path")
+    pairwise_delta = points[:, None, :2] - points[None, :, :2]
+    maximum_distance_by_point = np.sqrt(
+        np.max(np.sum(pairwise_delta * pairwise_delta, axis=2), axis=1)
+    )
+    if np.any(
+        maximum_distance_by_point
+        < float(cfg.TRAJECTORY_HEADING_MIN_DISPLACEMENT_M)
+    ):
+        return float(fallback_yaw_rad)
+    return 0.0
+
+
 def _densify_timed_path(
     path_points: Any,
     waypoint_times_s: Any,
@@ -706,12 +976,29 @@ class CarlaGroundTruthSafetyAdapter:
         self.ego_vehicle = ego_vehicle
         self.policy = policy or SafetyPolicy()
         self._map = world.get_map()
+        self._map_digest = _map_content_digest(self._map)
         self._road_profile_cache: OrderedDict[str, _TimedRoadProfile] = OrderedDict()
+        self._plan_geometry_by_id: dict[str, str] = {}
+        self._road_tick_facts_cache_key: tuple[Any, ...] | None = None
+        self._road_tick_facts_cache: RoadTickFacts | None = None
+        self._last_road_batch_stats = RoadAssessmentBatchStats()
 
     def reset(self, ego_vehicle: Any | None = None) -> None:
         if ego_vehicle is not None:
             self.ego_vehicle = ego_vehicle
+        self._map = self.world.get_map()
+        self._map_digest = _map_content_digest(self._map)
         self._road_profile_cache.clear()
+        self._plan_geometry_by_id.clear()
+        self._road_tick_facts_cache_key = None
+        self._road_tick_facts_cache = None
+        self._last_road_batch_stats = RoadAssessmentBatchStats()
+
+    @property
+    def last_road_batch_stats(self) -> RoadAssessmentBatchStats:
+        """Stats from the most recent single-plan or batch road assessment."""
+
+        return self._last_road_batch_stats
 
     def _query_footprint(
         self,
@@ -721,6 +1008,7 @@ class CarlaGroundTruthSafetyAdapter:
         half_length_m: float,
         half_width_m: float,
         sample_index_start: int,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
     ) -> tuple[RoadContainmentSample, ...]:
         try:
             points = _footprint_points(
@@ -731,17 +1019,28 @@ class CarlaGroundTruthSafetyAdapter:
             )
             waypoints = []
             for point in points:
-                waypoint = self._map.get_waypoint(
-                    carla.Location(
-                        x=float(point[0]),
-                        y=float(point[1]),
-                        z=float(point[2]),
-                    ),
-                    project_to_road=False,
-                    lane_type=carla.LaneType.Driving,
-                )
+                query_started_s = time.perf_counter()
+                if batch_accumulator is not None:
+                    batch_accumulator.map_query_count += 1
+                try:
+                    waypoint = self._map.get_waypoint(
+                        carla.Location(
+                            x=float(point[0]),
+                            y=float(point[1]),
+                            z=float(point[2]),
+                        ),
+                        project_to_road=False,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                finally:
+                    if batch_accumulator is not None:
+                        batch_accumulator.map_query_s += (
+                            time.perf_counter() - query_started_s
+                        )
                 waypoints.append(waypoint)
         except Exception as exc:
+            if batch_accumulator is not None:
+                batch_accumulator.error_count += 1
             return (
                 RoadContainmentSample(
                     sample_index=sample_index_start,
@@ -902,15 +1201,29 @@ class CarlaGroundTruthSafetyAdapter:
         self,
         plan: Any,
         ego: EgoKinematics,
+        *,
+        cache_key: str,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
     ) -> _TimedRoadProfile:
+        densify_started_s = time.perf_counter()
         points, times, distances, upper_indices = _densify_timed_path(
             plan.world_points,
             plan.waypoint_times_s,
             max_spacing_m=self.policy.path_sample_spacing_m,
         )
+        if batch_accumulator is not None:
+            batch_accumulator.densify_heading_s += (
+                time.perf_counter() - densify_started_s
+            )
+            batch_accumulator.pose_count += len(points)
         samples_by_pose = []
         for index, point in enumerate(points):
+            heading_started_s = time.perf_counter()
             yaw = _path_yaw(points, index, ego.yaw_rad)
+            if batch_accumulator is not None:
+                batch_accumulator.densify_heading_s += (
+                    time.perf_counter() - heading_started_s
+                )
             samples_by_pose.append(
                 self._query_footprint(
                     center_xyz=point[:3],
@@ -918,14 +1231,16 @@ class CarlaGroundTruthSafetyAdapter:
                     half_length_m=ego.half_length_m,
                     half_width_m=ego.half_width_m,
                     sample_index_start=index * 5,
+                    batch_accumulator=batch_accumulator,
                 )
             )
+        aggregate_started_s = time.perf_counter()
         flattened = tuple(sample for pose in samples_by_pose for sample in pose)
         quality = "carla_ground_truth_exact_lane_and_footprint"
         if any(sample.is_junction for sample in flattened):
             quality = "carla_ground_truth_drivable_only_at_junction"
-        return _TimedRoadProfile(
-            plan_id=str(plan.plan_id),
+        profile = _TimedRoadProfile(
+            cache_key=cache_key,
             points=points,
             times_s=times,
             cumulative_distance_m=distances,
@@ -933,18 +1248,94 @@ class CarlaGroundTruthSafetyAdapter:
             samples_by_pose=tuple(samples_by_pose),
             quality=quality,
         )
+        if batch_accumulator is not None:
+            batch_accumulator.aggregate_s += (
+                time.perf_counter() - aggregate_started_s
+            )
+        return profile
 
-    def _profile_for_plan(self, plan: Any, ego: EgoKinematics) -> _TimedRoadProfile:
-        plan_id = str(plan.plan_id)
-        profile = self._road_profile_cache.get(plan_id)
+    def _profile_for_plan(
+        self,
+        plan: Any,
+        ego: EgoKinematics,
+        *,
+        tick_facts: RoadTickFacts | None = None,
+        batch_accumulator: _RoadBatchAccumulator | None = None,
+    ) -> _TimedRoadProfile:
+        validation_started_s = time.perf_counter()
+        try:
+            plan_id = str(plan.plan_id)
+            geometry_digest = _plan_geometry_digest(plan)
+            prior_geometry_digest = self._plan_geometry_by_id.get(plan_id)
+            if (
+                prior_geometry_digest is not None
+                and prior_geometry_digest != geometry_digest
+            ):
+                raise _PlanIdGeometryMismatch(
+                    f"plan_id {plan_id!r} was reused for different geometry"
+                )
+            self._plan_geometry_by_id.setdefault(plan_id, geometry_digest)
+
+            map_digest = (
+                tick_facts.map_digest
+                if tick_facts is not None
+                else self._map_digest
+            )
+            policy_digest = (
+                tick_facts.policy_digest
+                if tick_facts is not None
+                else _policy_content_digest(self.policy)
+            )
+            bounding_box_digest = (
+                tick_facts.bounding_box_digest
+                if tick_facts is not None
+                else _bounding_box_content_digest(
+                    self.ego_vehicle.bounding_box
+                )
+            )
+            raw_fallback_yaw_rad = (
+                tick_facts.fallback_yaw_rad
+                if tick_facts is not None
+                else ego.yaw_rad
+            )
+            fallback_yaw_rad = _effective_profile_fallback_yaw(
+                plan,
+                raw_fallback_yaw_rad,
+            )
+            cache_key = _road_profile_cache_key(
+                geometry_digest=geometry_digest,
+                map_digest=map_digest,
+                policy_digest=policy_digest,
+                bounding_box_digest=bounding_box_digest,
+                fallback_yaw_rad=fallback_yaw_rad,
+            )
+        finally:
+            if batch_accumulator is not None:
+                batch_accumulator.validation_s += (
+                    time.perf_counter() - validation_started_s
+                )
+
+        profile = self._road_profile_cache.get(cache_key)
         if profile is not None:
-            self._road_profile_cache.move_to_end(plan_id)
+            self._road_profile_cache.move_to_end(cache_key)
+            if batch_accumulator is not None:
+                batch_accumulator.profile_cache_hits += 1
             return profile
 
-        profile = self._build_timed_road_profile(plan, ego)
-        self._road_profile_cache[plan_id] = profile
-        while len(self._road_profile_cache) > int(cfg.SAFETY_ROAD_PROFILE_CACHE_SIZE):
-            self._road_profile_cache.popitem(last=False)
+        if batch_accumulator is not None:
+            batch_accumulator.profile_cache_misses += 1
+        profile = self._build_timed_road_profile(
+            plan,
+            ego,
+            cache_key=cache_key,
+            batch_accumulator=batch_accumulator,
+        )
+        if _timed_road_profile_cacheable(profile):
+            self._road_profile_cache[cache_key] = profile
+            while len(self._road_profile_cache) > int(
+                cfg.SAFETY_ROAD_PROFILE_CACHE_SIZE
+            ):
+                self._road_profile_cache.popitem(last=False)
         return profile
 
     @staticmethod
@@ -1558,31 +1949,63 @@ class CarlaGroundTruthSafetyAdapter:
         except Exception:
             return None
 
-    def assess_plan_road(
+    def _road_tick_facts(
         self,
         *,
         tick_context: Any,
-        plan: Any,
-    ) -> RoadExecutionEnvelope:
-        """Return the timed road envelope without querying dynamic actors."""
+        batch_accumulator: _RoadBatchAccumulator,
+    ) -> RoadTickFacts:
+        """Build the one exact ego-footprint assessment shared by a batch."""
 
-        try:
-            if int(tick_context.snapshot.frame) != int(tick_context.frame_id):
-                raise ValueError("snapshot frame mismatch")
-            ego = self._ego_from_context(tick_context)
-        except Exception as exc:
-            return self._unknown_envelope(
-                f"invalid_ego_snapshot:{type(exc).__name__}"
-            )
-
+        validation_started_s = time.perf_counter()
+        if int(tick_context.snapshot.frame) != int(tick_context.frame_id):
+            raise ValueError("snapshot frame mismatch")
+        ego = self._ego_from_context(tick_context)
+        simulation_time_s = float(tick_context.simulation_time_s)
         ego_center_z = float(tick_context.ego_transform.location.z)
+        if not math.isfinite(simulation_time_s) or not math.isfinite(ego_center_z):
+            raise ValueError("invalid tick time or ego elevation")
+        policy_digest = _policy_content_digest(self.policy)
+        bounding_box_digest = _bounding_box_content_digest(
+            self.ego_vehicle.bounding_box
+        )
+        tick_cache_key = (
+            int(tick_context.frame_id),
+            simulation_time_s.hex(),
+            self._map_digest,
+            policy_digest,
+            bounding_box_digest,
+            int(ego.actor_id),
+            float(ego.center_xy[0]).hex(),
+            float(ego.center_xy[1]).hex(),
+            ego_center_z.hex(),
+            float(ego.yaw_rad).hex(),
+            float(ego.velocity_xy[0]).hex(),
+            float(ego.velocity_xy[1]).hex(),
+            float(ego.half_length_m).hex(),
+            float(ego.half_width_m).hex(),
+        )
+        batch_accumulator.validation_s += (
+            time.perf_counter() - validation_started_s
+        )
+        if (
+            tick_cache_key == self._road_tick_facts_cache_key
+            and self._road_tick_facts_cache is not None
+        ):
+            return self._road_tick_facts_cache
+
         current_samples = self._query_footprint(
-            center_xyz=np.array([*ego.center_xy, ego_center_z], dtype=np.float64),
+            center_xyz=np.array(
+                [*ego.center_xy, ego_center_z],
+                dtype=np.float64,
+            ),
             yaw_rad=ego.yaw_rad,
             half_length_m=ego.half_length_m,
             half_width_m=ego.half_width_m,
             sample_index_start=0,
+            batch_accumulator=batch_accumulator,
         )
+        aggregate_started_s = time.perf_counter()
         current_clearance_road = assess_road_containment(
             current_samples,
             quality="carla_ground_truth_current_ego_clearance",
@@ -1597,22 +2020,157 @@ class CarlaGroundTruthSafetyAdapter:
         current_junction_context = any(
             sample.is_junction is True for sample in current_samples
         )
+        tick_facts = RoadTickFacts(
+            frame_id=int(tick_context.frame_id),
+            simulation_time_s=simulation_time_s,
+            ego=ego,
+            ego_center_z=ego_center_z,
+            current_ego_samples=current_samples,
+            current_ego_clearance_road=current_clearance_road,
+            current_ego_road=current_road,
+            current_junction_context=current_junction_context,
+            map_digest=self._map_digest,
+            policy_digest=policy_digest,
+            bounding_box_digest=bounding_box_digest,
+            fallback_yaw_rad=ego.yaw_rad,
+        )
+        batch_accumulator.aggregate_s += (
+            time.perf_counter() - aggregate_started_s
+        )
+        self._road_tick_facts_cache_key = tick_cache_key
+        self._road_tick_facts_cache = tick_facts
+        return tick_facts
+
+    def _finish_road_batch_stats(
+        self,
+        *,
+        batch_accumulator: _RoadBatchAccumulator,
+        batch_started_s: float,
+        plan_count: int,
+    ) -> None:
+        self._last_road_batch_stats = RoadAssessmentBatchStats(
+            backend_status=(
+                "serial_degraded"
+                if batch_accumulator.error_count
+                else "serial"
+            ),
+            road_batch_wall_ms=(
+                (time.perf_counter() - batch_started_s) * 1000.0
+            ),
+            validation_ms=batch_accumulator.validation_s * 1000.0,
+            densify_heading_ms=(
+                batch_accumulator.densify_heading_s * 1000.0
+            ),
+            map_query_ms=batch_accumulator.map_query_s * 1000.0,
+            aggregate_ms=batch_accumulator.aggregate_s * 1000.0,
+            plan_count=int(plan_count),
+            pose_count=int(batch_accumulator.pose_count),
+            map_query_count=int(batch_accumulator.map_query_count),
+            worker_count=1,
+            chunk_count=1 if plan_count else 0,
+            profile_cache_hits=int(batch_accumulator.profile_cache_hits),
+            profile_cache_misses=int(batch_accumulator.profile_cache_misses),
+            error_count=int(batch_accumulator.error_count),
+        )
+
+    def assess_plans_road(
+        self,
+        *,
+        tick_context: Any,
+        plans: Any,
+    ) -> tuple[RoadExecutionEnvelope, ...]:
+        """Assess an ordered plan batch with one shared exact ego-footprint query."""
+
+        batch_started_s = time.perf_counter()
+        batch_accumulator = _RoadBatchAccumulator()
+        ordered_plans = tuple(plans)
+        if not ordered_plans:
+            self._finish_road_batch_stats(
+                batch_accumulator=batch_accumulator,
+                batch_started_s=batch_started_s,
+                plan_count=0,
+            )
+            return ()
+
         try:
-            profile = self._profile_for_plan(plan, ego)
-            return self._road_execution_envelope(
-                profile=profile,
-                plan=plan,
-                ego=ego,
-                current_time_s=float(tick_context.simulation_time_s),
-                current_road=current_road,
-                current_clearance_road=current_clearance_road,
-                current_junction_context=current_junction_context,
+            tick_facts = self._road_tick_facts(
+                tick_context=tick_context,
+                batch_accumulator=batch_accumulator,
             )
         except Exception as exc:
-            return self._unknown_envelope(
-                f"invalid_world_path:{type(exc).__name__}",
-                current_road=current_road,
+            batch_accumulator.error_count += len(ordered_plans)
+            envelopes = tuple(
+                self._unknown_envelope(
+                    f"invalid_ego_snapshot:{type(exc).__name__}"
+                )
+                for _plan in ordered_plans
             )
+            self._finish_road_batch_stats(
+                batch_accumulator=batch_accumulator,
+                batch_started_s=batch_started_s,
+                plan_count=len(ordered_plans),
+            )
+            return envelopes
+
+        envelopes = []
+        for plan in ordered_plans:
+            try:
+                profile = self._profile_for_plan(
+                    plan,
+                    tick_facts.ego,
+                    tick_facts=tick_facts,
+                    batch_accumulator=batch_accumulator,
+                )
+                aggregate_started_s = time.perf_counter()
+                envelope = self._road_execution_envelope(
+                    profile=profile,
+                    plan=plan,
+                    ego=tick_facts.ego,
+                    current_time_s=tick_facts.simulation_time_s,
+                    current_road=tick_facts.current_ego_road,
+                    current_clearance_road=(
+                        tick_facts.current_ego_clearance_road
+                    ),
+                    current_junction_context=(
+                        tick_facts.current_junction_context
+                    ),
+                )
+                batch_accumulator.aggregate_s += (
+                    time.perf_counter() - aggregate_started_s
+                )
+            except _PlanIdGeometryMismatch:
+                batch_accumulator.error_count += 1
+                envelope = self._unknown_envelope(
+                    "plan_id_geometry_mismatch",
+                    current_road=tick_facts.current_ego_road,
+                )
+            except Exception as exc:
+                batch_accumulator.error_count += 1
+                envelope = self._unknown_envelope(
+                    f"invalid_world_path:{type(exc).__name__}",
+                    current_road=tick_facts.current_ego_road,
+                )
+            envelopes.append(envelope)
+
+        self._finish_road_batch_stats(
+            batch_accumulator=batch_accumulator,
+            batch_started_s=batch_started_s,
+            plan_count=len(ordered_plans),
+        )
+        return tuple(envelopes)
+
+    def assess_plan_road(
+        self,
+        *,
+        tick_context: Any,
+        plan: Any,
+    ) -> RoadExecutionEnvelope:
+        """Return the timed road envelope without querying dynamic actors."""
+
+        return self.assess_plans_road(
+            tick_context=tick_context,
+            plans=(plan,),
+        )[0]
 
     @staticmethod
     def _shield_road_from_envelope(
@@ -1704,8 +2262,10 @@ __all__ = [
     "CarlaGroundTruthSafetyAdapter",
     "CarlaSafetyAssessment",
     "PlanAdmissionStatus",
+    "RoadAssessmentBatchStats",
     "RoadRecoveryMode",
     "RoadExecutionEnvelope",
+    "RoadTickFacts",
     "StoppingReserveProfile",
     "StoppingReserveStatus",
     "decide_plan_admission",

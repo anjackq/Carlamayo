@@ -1027,6 +1027,7 @@ def main():
                 request_lifetime_s=request_lifetime_s,
                 model_inference_latency_s=result.get("model_inference_time"),
                 worker_compute_latency_s=result.get("inference_time"),
+                result_processing_ms=result.get("result_processing_ms"),
                 prompt_revision=request["prompt_revision"],
                 respawn_revision=request["respawn_revision"],
                 source_plan_id=result.get("accepted_plan_id"),
@@ -1048,6 +1049,7 @@ def main():
             source_simulation_time_s=None,
             frame_id_quality=None,
             coc_sha256=None,
+            result_processing_ms=None,
         ):
             nonlocal active_sync_request
 
@@ -1093,6 +1095,7 @@ def main():
                 inference_wall_latency_s=request_lifetime_s,
                 request_lifetime_s=request_lifetime_s,
                 model_inference_latency_s=model_inference_latency_s,
+                result_processing_ms=result_processing_ms,
                 prompt_revision=nav_state.revision,
                 respawn_revision=respawn_revision,
                 source_plan_id=source_plan_id,
@@ -1510,6 +1513,7 @@ def main():
             active_envelope = _active_plan_road_envelope()
             candidate_records = []
             candidate_count = len(proposal["trajectory_samples"])
+            validation_started_s = time.perf_counter()
 
             for candidate_index in range(candidate_count):
                 plan_id = (
@@ -1529,9 +1533,6 @@ def main():
                     "coc_sha256": coc_audit["coc_sha256"],
                 }
                 plan = None
-                envelope = None
-                admission = None
-                admission_error = None
                 rejection_reason = None
                 motion_profile = None
                 motion_profile_compute_ms = None
@@ -1559,31 +1560,118 @@ def main():
                         motion_profile_compute_ms = (
                             time.perf_counter() - motion_profile_started_s
                         ) * 1000.0
+                candidate_records.append(
+                    {
+                        "candidate_proposal": candidate_proposal,
+                        "plan": plan,
+                        "envelope": None,
+                        "admission": None,
+                        "admission_error": None,
+                        "evaluation": None,
+                        "motion_profile": motion_profile,
+                        "motion_profile_compute_ms": motion_profile_compute_ms,
+                        "rejection_reason": rejection_reason,
+                    }
+                )
+
+            candidate_validation_ms = (
+                time.perf_counter() - validation_started_s
+            ) * 1000.0
+            road_batch_started_s = time.perf_counter()
+            valid_records = [
+                record
+                for record in candidate_records
+                if record["plan"] is not None
+                and record["rejection_reason"] is None
+            ]
+            batch_stats = None
+            batch_method = (
+                getattr(safety_adapter, "assess_plans_road", None)
+                if safety_adapter is not None
+                else None
+            )
+            batch_failed = False
+            if valid_records and callable(batch_method):
+                try:
+                    envelopes = tuple(
+                        batch_method(
+                            tick_context=tick_context,
+                            plans=tuple(
+                                record["plan"] for record in valid_records
+                            ),
+                        )
+                    )
+                    if len(envelopes) != len(valid_records):
+                        raise RuntimeError(
+                            "road_batch_result_count_mismatch:"
+                            f"{len(envelopes)}!={len(valid_records)}"
+                        )
+                    if any(envelope is None for envelope in envelopes):
+                        raise RuntimeError("road_batch_missing_envelope")
+                except Exception as exc:
+                    batch_failed = True
+                    error = (
+                        "carla_safety_adapter_unavailable"
+                        if str(exc) == "carla_safety_adapter_unavailable"
+                        else f"candidate_road_assessment_error:{type(exc).__name__}"
+                    )
+                    for record in valid_records:
+                        record["admission_error"] = error
+                        record["admission"] = (
+                            PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+                            if active_envelope is not None
+                            else PlanAdmissionStatus.REJECT_FALLBACK_STOP
+                        )
+                else:
+                    for record, envelope in zip(valid_records, envelopes):
+                        record["envelope"] = envelope
+                    batch_stats = getattr(
+                        safety_adapter,
+                        "last_road_batch_stats",
+                        None,
+                    )
+            else:
+                for record in valid_records:
                     try:
-                        if rejection_reason is None:
-                            envelope = _assess_plan_road_envelope(plan)
+                        record["envelope"] = _assess_plan_road_envelope(
+                            record["plan"]
+                        )
+                        if record["envelope"] is None:
+                            raise RuntimeError("road_assessment_missing_envelope")
                     except Exception as exc:
-                        admission_error = (
+                        record["admission_error"] = (
                             "carla_safety_adapter_unavailable"
                             if str(exc) == "carla_safety_adapter_unavailable"
                             else f"candidate_road_assessment_error:{type(exc).__name__}"
                         )
-                        admission = PlanAdmissionStatus.REJECT_FALLBACK_STOP
-                    else:
-                        if envelope is None:
-                            admission = None
-                        else:
-                            admission = decide_plan_admission(
-                                envelope,
-                                active_envelope,
-                            )
-                    if admission not in (
-                        PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
-                        PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
-                        PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
-                    ):
-                        rejection_reason = f"road_admission:{admission.value}"
+                        record["admission"] = (
+                            PlanAdmissionStatus.REJECT_FALLBACK_STOP
+                        )
+            road_batch_wall_ms = (
+                time.perf_counter() - road_batch_started_s
+            ) * 1000.0
 
+            for record in valid_records:
+                if record["admission"] is None:
+                    record["admission"] = decide_plan_admission(
+                        record["envelope"],
+                        active_envelope,
+                    )
+                if record["admission"] not in (
+                    PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
+                    PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
+                    PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
+                ):
+                    record["rejection_reason"] = (
+                        f"road_admission:{record['admission'].value}"
+                    )
+
+            for candidate_index, record in enumerate(candidate_records):
+                points = proposal["trajectory_samples"][candidate_index]
+                plan = record["plan"]
+                envelope = record["envelope"]
+                admission = record["admission"]
+                motion_profile = record["motion_profile"]
                 progress_m, lateral_m = _candidate_path_features(points)
                 margin_m = None
                 if envelope is not None:
@@ -1601,14 +1689,16 @@ def main():
                     if envelope is not None
                     else None
                 )
-                evaluation = CandidateEvaluation(
+                record["evaluation"] = CandidateEvaluation(
                     candidate_index=candidate_index,
-                    plan_id=plan_id,
+                    plan_id=record["candidate_proposal"]["proposal_id"],
                     admission_status=(
                         admission.value if admission is not None else None
                     ),
-                    rejection_reason=rejection_reason,
-                    stop_requested=bool(plan.stop_requested) if plan is not None else False,
+                    rejection_reason=record["rejection_reason"],
+                    stop_requested=(
+                        bool(plan.stop_requested) if plan is not None else False
+                    ),
                     forward_progress_m=progress_m,
                     representative_lateral_m=lateral_m,
                     full_path_margin_m=margin_m,
@@ -1635,20 +1725,9 @@ def main():
                         else None
                     ),
                 )
-                candidate_records.append(
-                    {
-                        "candidate_proposal": candidate_proposal,
-                        "plan": plan,
-                        "envelope": envelope,
-                        "admission": admission,
-                        "admission_error": admission_error,
-                        "evaluation": evaluation,
-                        "motion_profile": motion_profile,
-                        "motion_profile_compute_ms": motion_profile_compute_ms,
-                    }
-                )
 
             prefer_moving = _verified_empty_road()
+            ranking_started_s = time.perf_counter()
             selection = rank_candidate_evaluations(
                 [record["evaluation"] for record in candidate_records],
                 navigation_text=(
@@ -1659,10 +1738,62 @@ def main():
                 prefer_moving=prefer_moving,
                 current_speed_mps=float(state["speed"]),
             )
+            ranking_ms = (
+                time.perf_counter() - ranking_started_s
+            ) * 1000.0
+            selection_compute_ms = (
+                time.perf_counter() - selection_started_s
+            ) * 1000.0
+            stats_fields = {
+                "validation_ms": None,
+                "densify_heading_ms": None,
+                "map_query_ms": None,
+                "aggregate_ms": None,
+                "plan_count": len(valid_records),
+                "pose_count": None,
+                "map_query_count": None,
+                "worker_count": None,
+                "chunk_count": None,
+                "profile_cache_hits": None,
+                "profile_cache_misses": None,
+                "error_count": int(batch_failed),
+                "backend_status": (
+                    "batch_error"
+                    if batch_failed
+                    else (
+                        "batch"
+                        if valid_records and callable(batch_method)
+                        else (
+                            "legacy_per_plan"
+                            if valid_records
+                            else "not_run"
+                        )
+                    )
+                ),
+            }
+            if batch_stats is not None:
+                try:
+                    if callable(getattr(batch_stats, "to_json_dict", None)):
+                        raw_stats = batch_stats.to_json_dict()
+                    elif isinstance(batch_stats, dict):
+                        raw_stats = batch_stats
+                    else:
+                        raw_stats = {
+                            key: getattr(batch_stats, key, None)
+                            for key in stats_fields
+                        }
+                except Exception:
+                    raw_stats = {}
+                if not isinstance(raw_stats, dict):
+                    raw_stats = {}
+                for key in stats_fields:
+                    if raw_stats.get(key) is not None:
+                        stats_fields[key] = raw_stats[key]
             ranks_by_index = {
                 ranked.evaluation.candidate_index: ranked
                 for ranked in selection.ranked_candidates
             }
+            telemetry_emit_started_s = time.perf_counter()
             for record in candidate_records:
                 candidate_index = record["evaluation"].candidate_index
                 ranked = ranks_by_index[candidate_index]
@@ -1705,6 +1836,9 @@ def main():
                     verified_empty_road=prefer_moving,
                     **ranked.to_json_dict(),
                 )
+            telemetry_emit_ms = (
+                time.perf_counter() - telemetry_emit_started_s
+            ) * 1000.0
             emit_runtime_event(
                 "candidate_selection",
                 aggregate_age=False,
@@ -1712,6 +1846,12 @@ def main():
                 layer="ALPAMAYO_PROPOSAL",
                 proposal_id=proposal["proposal_id"],
                 preselected_candidate_index=proposal["preselected_index"],
+                selection_compute_ms=selection_compute_ms,
+                candidate_validation_ms=candidate_validation_ms,
+                road_batch_wall_ms=road_batch_wall_ms,
+                ranking_ms=ranking_ms,
+                telemetry_emit_ms=telemetry_emit_ms,
+                **stats_fields,
                 selection_latency_ms=(
                     (time.perf_counter() - selection_started_s) * 1000.0
                 ),
@@ -1751,6 +1891,14 @@ def main():
                 "verified_empty_road": prefer_moving,
                 "active_envelope": active_envelope,
                 "rejection_reason": selected_record["evaluation"].rejection_reason,
+                "selection_profile": {
+                    "selection_compute_ms": selection_compute_ms,
+                    "candidate_validation_ms": candidate_validation_ms,
+                    "road_batch_wall_ms": road_batch_wall_ms,
+                    "ranking_ms": ranking_ms,
+                    "telemetry_emit_ms": telemetry_emit_ms,
+                    **stats_fields,
+                },
             }
 
         def _road_envelope_executable(envelope):
@@ -3632,6 +3780,7 @@ def main():
                         pending_request_id = None
                     result_status = "completed"
                     result_rejection_reason = None
+                    result_processing_started_s = time.perf_counter()
                     try:
                         proposal = None
                         if (
@@ -3751,6 +3900,9 @@ def main():
                             if args.debug_worker_traceback and latest_result.get("traceback"):
                                 print(latest_result["traceback"].rstrip())
                     except Exception as exc:
+                        latest_result["result_processing_ms"] = (
+                            time.perf_counter() - result_processing_started_s
+                        ) * 1000.0
                         _emit_async_terminal(
                             latest_result.get("request_id"),
                             "error",
@@ -3759,6 +3911,9 @@ def main():
                         )
                         print(f"[Frame {frame_count}] Rejected malformed inference result: {exc}")
                     else:
+                        latest_result["result_processing_ms"] = (
+                            time.perf_counter() - result_processing_started_s
+                        ) * 1000.0
                         _emit_async_terminal(
                             latest_result.get("request_id"),
                             result_status,
@@ -3827,6 +3982,7 @@ def main():
                             )
                             model_start_time = time.monotonic()
                             stage = "model_inference"
+                            result_processing_started_s = None
                             try:
                                 if model_input_error is not None:
                                     raise RuntimeError(f"model_input_error:{model_input_error}")
@@ -3836,6 +3992,7 @@ def main():
                                 )
                                 model_inference_time = time.monotonic() - model_start_time
                                 stage = "result_processing"
+                                result_processing_started_s = time.perf_counter()
                                 answer = extract_answer_text(extra)
                                 nav_state.set_vqa_answer(answer)
                                 current_inference_time = model_inference_time
@@ -3855,6 +4012,15 @@ def main():
                                         if stage == "result_processing"
                                         else time.monotonic() - model_start_time
                                     ),
+                                    result_processing_ms=(
+                                        (
+                                            time.perf_counter()
+                                            - result_processing_started_s
+                                        )
+                                        * 1000.0
+                                        if result_processing_started_s is not None
+                                        else None
+                                    ),
                                 )
                                 message = f"VQA {stage} failed; retaining safe fallback: {exc}"
                                 nav_state.set_error(message)
@@ -3867,6 +4033,15 @@ def main():
                                     rejection_reason=None,
                                     submission_monotonic_s=submission_monotonic_s,
                                     model_inference_latency_s=model_inference_time,
+                                    result_processing_ms=(
+                                        (
+                                            time.perf_counter()
+                                            - result_processing_started_s
+                                        )
+                                        * 1000.0
+                                        if result_processing_started_s is not None
+                                        else None
+                                    ),
                                 )
                     elif (
                         last_inference_submit_simulation_time_s is None
@@ -3907,6 +4082,7 @@ def main():
                         )
                         model_start_time = time.monotonic()
                         stage = "model_inference"
+                        result_processing_started_s = None
                         try:
                             if model_input_error is not None:
                                 raise RuntimeError(f"model_input_error:{model_input_error}")
@@ -3917,6 +4093,7 @@ def main():
                             )
                             model_inference_time = time.monotonic() - model_start_time
                             stage = "result_processing"
+                            result_processing_started_s = time.perf_counter()
                             sync_result = {
                                 "request_id": request_id,
                                 "mode": args.mode,
@@ -3967,6 +4144,15 @@ def main():
                                     if stage == "result_processing"
                                     else time.monotonic() - model_start_time
                                 ),
+                                result_processing_ms=(
+                                    (
+                                        time.perf_counter()
+                                        - result_processing_started_s
+                                    )
+                                    * 1000.0
+                                    if result_processing_started_s is not None
+                                    else None
+                                ),
                             )
                             failure_kind = (
                                 "Rejected Alpamayo proposal"
@@ -3985,6 +4171,10 @@ def main():
                                     _simulation_elapsed_proxy_s()
                                 ),
                             )
+                            result_processing_ms = (
+                                time.perf_counter()
+                                - result_processing_started_s
+                            ) * 1000.0
                             if application["status"] == "rejected_plan":
                                 rejection_reason = application[
                                     "rejection_reason"
@@ -4002,6 +4192,7 @@ def main():
                                     submission_monotonic_s=submission_monotonic_s,
                                     model_inference_latency_s=model_inference_time,
                                     coc_sha256=proposal["coc_sha256"],
+                                    result_processing_ms=result_processing_ms,
                                 )
                             elif application["status"] == "retained_active_plan":
                                 print(
@@ -4018,6 +4209,7 @@ def main():
                                     model_inference_latency_s=model_inference_time,
                                     source_plan_id=current_plan_id,
                                     coc_sha256=proposal["coc_sha256"],
+                                    result_processing_ms=result_processing_ms,
                                 )
                             else:
                                 print(
@@ -4045,6 +4237,7 @@ def main():
                                     model_inference_latency_s=model_inference_time,
                                     source_plan_id=current_plan_id,
                                     coc_sha256=proposal["coc_sha256"],
+                                    result_processing_ms=result_processing_ms,
                                 )
 
             expired_plan_reason = None
