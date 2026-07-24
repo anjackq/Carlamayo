@@ -28,6 +28,10 @@ from module.candidate_selector import (
 from module.geometry import pose_matrix_from_state
 from module.navigation_control import NavigationControlState
 from module.pid_controller import OfficialPIDFollower
+from module.plan_handoff import (
+    PlanHandoffStatus,
+    decide_plan_handoff,
+)
 from module.proposal_audit import coc_audit_fields
 from module.respawn_control import RespawnMonitor
 from module.runtime_metrics import JsonlWriter, RUNTIME_SCHEMA_VERSION, RuntimeMetrics
@@ -43,6 +47,7 @@ from module.safety_shield import (
 from module.trajectory_runtime import (
     TrajectoryValidationError,
     build_fixed_world_trajectory,
+    compute_trajectory_motion_profile,
     validate_plan_alignment,
     validate_plan_for_execution,
 )
@@ -802,6 +807,8 @@ def main():
         current_plan_source_loop_tick_id = None
         current_plan_source_elapsed_proxy_s = None
         current_plan_admission_status = None
+        latest_candidate_admission_status = None
+        latest_handoff_status = None
         current_road_envelope = None
         latest_proposal_plan_id = None
         current_carla_frame_id = None
@@ -1178,6 +1185,7 @@ def main():
             nonlocal current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s
             nonlocal current_road_envelope
+            nonlocal current_plan_admission_status
 
             current_plan = None
             current_trajectory = None
@@ -1185,6 +1193,7 @@ def main():
             current_plan_source_loop_tick_id = None
             current_plan_source_elapsed_proxy_s = None
             current_road_envelope = None
+            current_plan_admission_status = None
             pid_follower.reset_plan_progress()
 
         def _assess_plan_road_envelope(plan):
@@ -1246,10 +1255,10 @@ def main():
             active_envelope,
             admission_error,
         ):
-            nonlocal current_plan_admission_status, latest_proposal_plan_id
+            nonlocal latest_candidate_admission_status, latest_proposal_plan_id
 
             latest_proposal_plan_id = candidate_plan.plan_id
-            current_plan_admission_status = admission
+            latest_candidate_admission_status = admission
             emit_runtime_event(
                 "plan_admission",
                 aggregate_age=False,
@@ -1287,10 +1296,19 @@ def main():
             lateral_index = int(np.argmax(np.abs(lateral_values)))
             return progress, float(lateral_values[lateral_index])
 
+        def _verified_empty_road():
+            if not args.empty_road or safety_adapter is None or tick_context is None:
+                return False
+            try:
+                actors = safety_adapter._actors_from_context(tick_context)
+            except Exception:
+                return False
+            return actors is not None and len(actors) == 0
+
         def _select_road_aware_candidate(result, proposal):
             """Validate and road-rank every sample before choosing one."""
 
-            nonlocal current_plan_admission_status, latest_proposal_plan_id
+            nonlocal latest_candidate_admission_status, latest_proposal_plan_id
 
             selection_started_s = time.perf_counter()
             active_envelope = _active_plan_road_envelope()
@@ -1319,6 +1337,7 @@ def main():
                 admission = None
                 admission_error = None
                 rejection_reason = None
+                motion_profile = None
                 try:
                     plan, _validity = _build_and_validate_fixed_plan(
                         result,
@@ -1332,7 +1351,15 @@ def main():
                     )
                 else:
                     try:
-                        envelope = _assess_plan_road_envelope(plan)
+                        motion_profile = compute_trajectory_motion_profile(
+                            plan,
+                            float(current_simulation_time_s),
+                        )
+                    except TrajectoryValidationError as exc:
+                        rejection_reason = exc.reason
+                    try:
+                        if rejection_reason is None:
+                            envelope = _assess_plan_road_envelope(plan)
                     except Exception as exc:
                         admission_error = (
                             "carla_safety_adapter_unavailable"
@@ -1341,10 +1368,13 @@ def main():
                         )
                         admission = PlanAdmissionStatus.REJECT_FALLBACK_STOP
                     else:
-                        admission = decide_plan_admission(
-                            envelope,
-                            active_envelope,
-                        )
+                        if envelope is None:
+                            admission = None
+                        else:
+                            admission = decide_plan_admission(
+                                envelope,
+                                active_envelope,
+                            )
                     if admission not in (
                         PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
                         PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
@@ -1362,8 +1392,13 @@ def main():
                         continuity_m = float(continuity_m)
                     except (TypeError, ValueError):
                         continuity_m = None
-                    if continuity_m is not None and not math.isfinite(continuity_m):
-                        continuity_m = None
+                if continuity_m is not None and not math.isfinite(continuity_m):
+                    continuity_m = None
+                reserve = (
+                    envelope.stopping_reserve_profile
+                    if envelope is not None
+                    else None
+                )
                 evaluation = CandidateEvaluation(
                     candidate_index=candidate_index,
                     plan_id=plan_id,
@@ -1376,6 +1411,27 @@ def main():
                     representative_lateral_m=lateral_m,
                     full_path_margin_m=margin_m,
                     continuity_m=continuity_m,
+                    motion_class=(
+                        motion_profile.motion_class.value
+                        if motion_profile is not None
+                        else None
+                    ),
+                    initial_target_speed_mps=(
+                        motion_profile.initial_target_speed_mps
+                        if motion_profile is not None
+                        else None
+                    ),
+                    stopping_reserve_status=(
+                        reserve.status.value if reserve is not None else None
+                    ),
+                    stopping_reserve_m=(
+                        reserve.stopping_reserve_m if reserve is not None else None
+                    ),
+                    time_to_first_bad_s=(
+                        envelope.time_to_first_bad_s
+                        if envelope is not None
+                        else None
+                    ),
                 )
                 candidate_records.append(
                     {
@@ -1385,9 +1441,11 @@ def main():
                         "admission": admission,
                         "admission_error": admission_error,
                         "evaluation": evaluation,
+                        "motion_profile": motion_profile,
                     }
                 )
 
+            prefer_moving = _verified_empty_road()
             selection = rank_candidate_evaluations(
                 [record["evaluation"] for record in candidate_records],
                 navigation_text=(
@@ -1395,7 +1453,8 @@ def main():
                     if result.get("mode", args.mode) == "navigation"
                     else None
                 ),
-                prefer_moving=bool(args.empty_road),
+                prefer_moving=prefer_moving,
+                current_speed_mps=float(state["speed"]),
             )
             ranks_by_index = {
                 ranked.evaluation.candidate_index: ranked
@@ -1418,6 +1477,12 @@ def main():
                         else None
                     ),
                     admission_error=record["admission_error"],
+                    trajectory_motion_profile=(
+                        record["motion_profile"].to_json_dict()
+                        if record["motion_profile"] is not None
+                        else None
+                    ),
+                    verified_empty_road=prefer_moving,
                     **ranked.to_json_dict(),
                 )
             emit_runtime_event(
@@ -1445,7 +1510,7 @@ def main():
             )
             latest_proposal_plan_id = selected_record["evaluation"].plan_id
             if selected_record["admission"] is not None:
-                current_plan_admission_status = selected_record["admission"]
+                latest_candidate_admission_status = selected_record["admission"]
             if (
                 selected_record["plan"] is not None
                 and selected_record["admission"] is not None
@@ -1462,7 +1527,192 @@ def main():
                 "plan": selected_record["plan"],
                 "envelope": selected_record["envelope"],
                 "admission": selected_record["admission"],
+                "motion_profile": selected_record["motion_profile"],
+                "verified_empty_road": prefer_moving,
+                "active_envelope": active_envelope,
                 "rejection_reason": selected_record["evaluation"].rejection_reason,
+            }
+
+        def _road_envelope_executable(envelope):
+            if envelope is None or envelope.emergency_required:
+                return False
+            clearance = (
+                envelope.current_ego_clearance_road
+                or envelope.current_ego_road
+            )
+            return bool(
+                envelope.current_ego_road.status is AssessmentStatus.SAFE
+                and (
+                    clearance.status is AssessmentStatus.SAFE
+                    or envelope.recovery_required
+                )
+                and envelope.last_safe_waypoint_index is not None
+            )
+
+        def _apply_selected_plan_outcome(
+            outcome,
+            *,
+            inference_time_s,
+            trajectory_timestamp_s,
+            source_loop_tick_id,
+            source_elapsed_proxy_s,
+        ):
+            """Apply one sync/async selection through the same bounded handoff."""
+
+            nonlocal current_plan, current_trajectory, current_plan_id
+            nonlocal current_selected_traj_idx, prev_selected_trajectory
+            nonlocal current_pred_xyz, current_cot, current_inference_time
+            nonlocal current_trajectory_ts, current_road_envelope
+            nonlocal current_plan_source_loop_tick_id
+            nonlocal current_plan_source_elapsed_proxy_s
+            nonlocal current_plan_admission_status
+            nonlocal latest_handoff_status
+
+            proposal = outcome["proposal"]
+            candidate_plan = outcome["plan"]
+            candidate_envelope = outcome["envelope"]
+            candidate_admission = outcome["admission"]
+            accepted = candidate_plan is not None and candidate_admission in (
+                PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
+                PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
+                PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
+            )
+            current_inference_time = float(inference_time_s)
+            if not accepted:
+                rejection_reason = (
+                    outcome["rejection_reason"]
+                    or "all_candidates_failed_validation"
+                )
+                if candidate_admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
+                    _clear_active_plan_state()
+                return {
+                    "status": "rejected_plan",
+                    "rejection_reason": rejection_reason,
+                    "activated": False,
+                    "retained": (
+                        candidate_admission
+                        is PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+                    ),
+                    "handoff": None,
+                }
+
+            active_envelope = outcome.get("active_envelope")
+            active_motion = None
+            active_executable = bool(
+                current_plan is not None
+                and _road_envelope_executable(active_envelope)
+            )
+            if active_executable:
+                try:
+                    active_motion = compute_trajectory_motion_profile(
+                        current_plan,
+                        float(current_simulation_time_s),
+                    )
+                except TrajectoryValidationError:
+                    active_executable = False
+
+            candidate_motion = outcome.get("motion_profile")
+            candidate_reserve = (
+                candidate_envelope.stopping_reserve_profile
+                if candidate_envelope is not None
+                else None
+            )
+            active_reserve = (
+                active_envelope.stopping_reserve_profile
+                if active_envelope is not None
+                else None
+            )
+            handoff = decide_plan_handoff(
+                candidate_plan_id=candidate_plan.plan_id,
+                candidate_admission_status=candidate_admission,
+                candidate_motion_class=(
+                    candidate_motion.motion_class
+                    if candidate_motion is not None
+                    else None
+                ),
+                candidate_reserve_status=(
+                    candidate_reserve.status
+                    if candidate_reserve is not None
+                    else None
+                ),
+                candidate_explicit_stop=bool(candidate_plan.stop_requested),
+                active_plan_id=(
+                    current_plan.plan_id if current_plan is not None else None
+                ),
+                active_admission_status=current_plan_admission_status,
+                active_motion_class=(
+                    active_motion.motion_class if active_motion is not None else None
+                ),
+                active_reserve_status=(
+                    active_reserve.status if active_reserve is not None else None
+                ),
+                active_remaining_horizon_s=(
+                    active_motion.remaining_horizon_s
+                    if active_motion is not None
+                    else None
+                ),
+                active_executable=active_executable,
+                verified_empty_road=bool(outcome.get("verified_empty_road")),
+                retention_deadline_s=(
+                    float(cfg.TRAJECTORY_MIN_REMAINING_HORIZON_S)
+                    + float(inference_interval_sec)
+                ),
+            )
+            latest_handoff_status = handoff.status
+            emit_runtime_event(
+                "plan_handoff",
+                aggregate_age=False,
+                aggregate_rejection=False,
+                layer="CONTROLLER_EXECUTION",
+                **handoff.to_json_dict(),
+                candidate_motion_profile=(
+                    candidate_motion.to_json_dict()
+                    if candidate_motion is not None
+                    else None
+                ),
+                active_motion_profile=(
+                    active_motion.to_json_dict()
+                    if active_motion is not None
+                    else None
+                ),
+                candidate_road_envelope=(
+                    candidate_envelope.to_json_dict()
+                    if candidate_envelope is not None
+                    else None
+                ),
+                active_road_envelope=(
+                    active_envelope.to_json_dict()
+                    if active_envelope is not None
+                    else None
+                ),
+            )
+            if not handoff.activate_candidate:
+                return {
+                    "status": "retained_active_plan",
+                    "rejection_reason": None,
+                    "activated": False,
+                    "retained": True,
+                    "handoff": handoff,
+                }
+
+            current_plan = candidate_plan
+            current_selected_traj_idx = proposal["selected_index"]
+            current_trajectory = proposal["selected_points"]
+            prev_selected_trajectory = current_trajectory.copy()
+            current_pred_xyz = proposal["trajectory_samples"]
+            current_cot = proposal["coc_text"]
+            current_trajectory_ts = float(trajectory_timestamp_s)
+            current_plan_id = candidate_plan.plan_id
+            current_road_envelope = candidate_envelope
+            current_plan_source_loop_tick_id = int(source_loop_tick_id)
+            current_plan_source_elapsed_proxy_s = float(source_elapsed_proxy_s)
+            current_plan_admission_status = candidate_admission
+            return {
+                "status": "accepted_plan",
+                "rejection_reason": None,
+                "activated": True,
+                "retained": False,
+                "handoff": handoff,
             }
 
         def _current_plan_timing_proxies():
@@ -1588,6 +1838,24 @@ def main():
                     current_plan_admission_status.value
                     if isinstance(current_plan_admission_status, PlanAdmissionStatus)
                     else current_plan_admission_status
+                ),
+                active_plan_admission_status=(
+                    current_plan_admission_status.value
+                    if isinstance(current_plan_admission_status, PlanAdmissionStatus)
+                    else current_plan_admission_status
+                ),
+                latest_candidate_admission_status=(
+                    latest_candidate_admission_status.value
+                    if isinstance(
+                        latest_candidate_admission_status,
+                        PlanAdmissionStatus,
+                    )
+                    else latest_candidate_admission_status
+                ),
+                latest_handoff_status=(
+                    latest_handoff_status.value
+                    if isinstance(latest_handoff_status, PlanHandoffStatus)
+                    else latest_handoff_status
                 ),
                 road_execution_envelope=(
                     current_road_envelope.to_json_dict()
@@ -1854,7 +2122,8 @@ def main():
             nonlocal current_plan_id, current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s, respawn_count
             nonlocal current_plan_admission_status, current_road_envelope
-            nonlocal latest_proposal_plan_id
+            nonlocal latest_proposal_plan_id, latest_candidate_admission_status
+            nonlocal latest_handoff_status
             nonlocal last_applied_control_echo
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
@@ -1881,6 +2150,8 @@ def main():
             current_plan_admission_status = None
             current_road_envelope = None
             latest_proposal_plan_id = None
+            latest_candidate_admission_status = None
+            latest_handoff_status = None
             last_applied_control_echo = None
             prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 1.0}
             prev_nominal_control = {
@@ -2274,6 +2545,8 @@ def main():
                     current_plan_admission_status = None
                     current_road_envelope = None
                     latest_proposal_plan_id = None
+                    latest_candidate_admission_status = None
+                    latest_handoff_status = None
                     pending_inference = False
                     pending_request_id = None
                     safety_shield.reset()
@@ -2663,44 +2936,38 @@ def main():
                                 proposal,
                             )
                             proposal = outcome["proposal"]
-                            candidate_plan = outcome["plan"]
-                            candidate_envelope = outcome["envelope"]
                             admission = outcome["admission"]
-                            if candidate_plan is None or admission not in (
-                                PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
-                                PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
-                                PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
-                            ):
-                                result_status = "rejected_plan"
-                                result_rejection_reason = (
-                                    outcome["rejection_reason"]
-                                    or "all_candidates_failed_validation"
-                                )
-                                if admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
-                                    _clear_active_plan_state()
+                            application = _apply_selected_plan_outcome(
+                                outcome,
+                                inference_time_s=inference_time,
+                                trajectory_timestamp_s=float(
+                                    latest_result["result_ts"]
+                                ),
+                                source_loop_tick_id=int(
+                                    latest_result["source_loop_tick_id"]
+                                ),
+                                source_elapsed_proxy_s=float(
+                                    latest_result["source_elapsed_proxy_s"]
+                                ),
+                            )
+                            result_status = application["status"]
+                            result_rejection_reason = application[
+                                "rejection_reason"
+                            ]
+                            if result_status == "rejected_plan":
                                 print(
                                     f"[Frame {frame_count}] Rejected Alpamayo proposal: "
                                     f"{result_rejection_reason}"
                                 )
+                            elif result_status == "retained_active_plan":
+                                latest_result["retained_plan_id"] = current_plan_id
+                                print(
+                                    f"[Frame {frame_count}] Retained active plan "
+                                    f"{current_plan_id}: "
+                                    f"{application['handoff'].status.value}"
+                                )
                             else:
-                                current_plan = candidate_plan
-                                current_selected_traj_idx = proposal["selected_index"]
-                                current_trajectory = proposal["selected_points"]
-                                prev_selected_trajectory = current_trajectory.copy()
-                                current_pred_xyz = proposal["trajectory_samples"]
-                                current_cot = proposal["coc_text"]
-                                current_trajectory_ts = float(latest_result["result_ts"])
-                                current_plan_id = candidate_plan.plan_id
-                                current_road_envelope = candidate_envelope
                                 latest_result["accepted_plan_id"] = current_plan_id
-                                current_plan_source_loop_tick_id = int(
-                                    latest_result["source_loop_tick_id"]
-                                )
-                                current_plan_source_elapsed_proxy_s = float(
-                                    latest_result["source_elapsed_proxy_s"]
-                                )
-                                result_status = "accepted_plan"
-
                                 print(
                                     f"[Frame {frame_count}] Inference done: "
                                     f"{inference_time:.2f}s "
@@ -2922,8 +3189,6 @@ def main():
                                 proposal,
                             )
                             proposal = outcome["proposal"]
-                            candidate_plan = outcome["plan"]
-                            candidate_envelope = outcome["envelope"]
                             admission = outcome["admission"]
                         except Exception as exc:
                             rejected_output = (
@@ -2955,17 +3220,19 @@ def main():
                             nav_state.set_error(str(rejection_reason))
                             print(f"[Frame {frame_count}] {failure_kind}: {rejection_reason}")
                         else:
-                            if candidate_plan is None or admission not in (
-                                PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
-                                PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
-                                PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
-                            ):
-                                rejection_reason = (
-                                    outcome["rejection_reason"]
-                                    or "all_candidates_failed_validation"
-                                )
-                                if admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
-                                    _clear_active_plan_state()
+                            application = _apply_selected_plan_outcome(
+                                outcome,
+                                inference_time_s=model_inference_time,
+                                trajectory_timestamp_s=time.monotonic(),
+                                source_loop_tick_id=int(frame_count),
+                                source_elapsed_proxy_s=(
+                                    _simulation_elapsed_proxy_s()
+                                ),
+                            )
+                            if application["status"] == "rejected_plan":
+                                rejection_reason = application[
+                                    "rejection_reason"
+                                ]
                                 nav_state.set_error(rejection_reason)
                                 print(
                                     f"[Frame {frame_count}] Rejected Alpamayo proposal: "
@@ -2980,22 +3247,23 @@ def main():
                                     model_inference_latency_s=model_inference_time,
                                     coc_sha256=proposal["coc_sha256"],
                                 )
-                            else:
-                                current_plan = candidate_plan
-                                current_selected_traj_idx = proposal["selected_index"]
-                                current_trajectory = proposal["selected_points"]
-                                prev_selected_trajectory = current_trajectory.copy()
-                                current_pred_xyz = proposal["trajectory_samples"]
-                                current_cot = proposal["coc_text"]
-                                current_inference_time = model_inference_time
-                                current_trajectory_ts = time.monotonic()
-                                current_plan_id = candidate_plan.plan_id
-                                current_road_envelope = candidate_envelope
-                                current_plan_source_loop_tick_id = int(frame_count)
-                                current_plan_source_elapsed_proxy_s = (
-                                    _simulation_elapsed_proxy_s()
+                            elif application["status"] == "retained_active_plan":
+                                print(
+                                    f"[Frame {frame_count}] Retained active plan "
+                                    f"{current_plan_id}: "
+                                    f"{application['handoff'].status.value}"
                                 )
-
+                                _emit_sync_terminal(
+                                    request_id=request_id,
+                                    mode=args.mode,
+                                    status="retained_active_plan",
+                                    rejection_reason=None,
+                                    submission_monotonic_s=submission_monotonic_s,
+                                    model_inference_latency_s=model_inference_time,
+                                    source_plan_id=current_plan_id,
+                                    coc_sha256=proposal["coc_sha256"],
+                                )
+                            else:
                                 print(
                                     f"[Frame {frame_count}] Inference: "
                                     f"{model_inference_time:.2f}s"
