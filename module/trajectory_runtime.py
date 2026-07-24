@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
@@ -25,6 +26,53 @@ class TrajectoryValidationError(ValueError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class TrajectoryMotionClass(str, Enum):
+    """Intent class derived only from timestamped trajectory geometry."""
+
+    MOVING = "MOVING"
+    DELAYED_START = "DELAYED_START"
+    CREEP_OR_STALL = "CREEP_OR_STALL"
+    EXPLICIT_STOP = "EXPLICIT_STOP"
+
+
+@dataclass(frozen=True)
+class TrajectoryMotionProfile:
+    """Elapsed-prefix-aware motion facts shared by selection and telemetry."""
+
+    first_future_index: int
+    remaining_horizon_s: float
+    initial_target_speed_mps: float
+    near_term_path_length_m: float
+    near_term_mean_speed_mps: float
+    near_term_peak_speed_mps: float
+    remaining_path_length_m: float
+    remaining_peak_speed_mps: float
+    peak_smoothed_deceleration_mps2: float
+    time_to_effective_stop_s: float | None
+    motion_class: TrajectoryMotionClass
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "first_future_index": int(self.first_future_index),
+            "remaining_horizon_s": float(self.remaining_horizon_s),
+            "initial_target_speed_mps": float(self.initial_target_speed_mps),
+            "near_term_path_length_m": float(self.near_term_path_length_m),
+            "near_term_mean_speed_mps": float(self.near_term_mean_speed_mps),
+            "near_term_peak_speed_mps": float(self.near_term_peak_speed_mps),
+            "remaining_path_length_m": float(self.remaining_path_length_m),
+            "remaining_peak_speed_mps": float(self.remaining_peak_speed_mps),
+            "peak_smoothed_deceleration_mps2": float(
+                self.peak_smoothed_deceleration_mps2
+            ),
+            "time_to_effective_stop_s": (
+                None
+                if self.time_to_effective_stop_s is None
+                else float(self.time_to_effective_stop_s)
+            ),
+            "motion_class": self.motion_class.value,
+        }
 
 
 @dataclass(frozen=True)
@@ -78,6 +126,240 @@ class PlanAlignmentValidity:
     rejection_reason: str | None
     tracking_error_m: float
     heading_error_deg: float
+
+
+def target_speed_from_timestamps(
+    points: Any,
+    waypoint_times_s: Any,
+    start_idx: int,
+    *,
+    capture_origin_world: Any | None = None,
+    terminal_stop_index: int | None = None,
+    window_segments: int = 6,
+) -> float:
+    """Return the controller's median speed over the next timestamped segments."""
+
+    try:
+        path = np.asarray(points, dtype=np.float64)
+        times = np.asarray(waypoint_times_s, dtype=np.float64)
+        index = int(start_idx)
+        window_count = int(window_segments)
+    except (TypeError, ValueError):
+        return 0.0
+    if (
+        path.ndim != 2
+        or path.shape[1] != 3
+        or times.ndim != 1
+        or len(path) != len(times)
+        or len(path) == 0
+        or not np.isfinite(path).all()
+        or not np.isfinite(times).all()
+        or np.any(np.diff(times) <= 0.0)
+        or index < 0
+        or window_count < 1
+    ):
+        return 0.0
+
+    speed_index_offset = 0
+    if capture_origin_world is not None:
+        try:
+            origin = np.asarray(capture_origin_world, dtype=np.float64)
+        except (TypeError, ValueError):
+            origin = np.empty((0,), dtype=np.float64)
+        if origin.shape == (3,) and np.isfinite(origin).all():
+            first_dt = (
+                float(times[1] - times[0])
+                if len(times) > 1
+                else float(cfg.TRAJECTORY_WAYPOINT_DT)
+            )
+            path = np.vstack([origin, path])
+            times = np.concatenate([[times[0] - first_dt], times])
+            speed_index_offset = 1
+
+    if len(path) < 2:
+        return 0.0
+    segment_distance = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
+    segment_dt = np.diff(times)
+    speeds = np.divide(
+        segment_distance,
+        segment_dt,
+        out=np.zeros_like(segment_distance),
+        where=segment_dt > 1e-6,
+    )
+    segment_idx = min(max(0, index + speed_index_offset), len(speeds) - 1)
+    window = speeds[segment_idx : min(len(speeds), segment_idx + window_count)]
+    target_speed = float(np.median(window)) if len(window) else 0.0
+    if terminal_stop_index is not None and index >= int(terminal_stop_index):
+        target_speed = 0.0
+    return float(np.clip(target_speed, 0.0, cfg.TRAJECTORY_MAX_SPEED_MPS))
+
+
+def _clip_timed_path_at(
+    points: np.ndarray,
+    times: np.ndarray,
+    current_time_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Discard elapsed geometry while retaining a partial crossing segment."""
+
+    if current_time_s <= float(times[0]):
+        return points.copy(), times.copy()
+    if current_time_s >= float(times[-1]):
+        return points[-1:].copy(), times[-1:].copy()
+
+    upper = int(np.searchsorted(times, current_time_s, side="right"))
+    lower = upper - 1
+    dt = float(times[upper] - times[lower])
+    fraction = 0.0 if dt <= 0.0 else (current_time_s - float(times[lower])) / dt
+    interpolated = points[lower] + float(fraction) * (points[upper] - points[lower])
+    clipped_points = np.vstack([interpolated, points[upper:]])
+    clipped_times = np.concatenate([[current_time_s], times[upper:]])
+    return clipped_points, clipped_times
+
+
+def compute_trajectory_motion_profile(
+    plan: FixedWorldTrajectory,
+    current_simulation_time_s: float,
+    *,
+    execution_horizon_s: float | None = None,
+) -> TrajectoryMotionProfile:
+    """Compute motion intent after slicing the plan at the execution timestamp."""
+
+    try:
+        current_time = float(current_simulation_time_s)
+        source_time = float(plan.source_simulation_time_s)
+        points = np.asarray(plan.world_points, dtype=np.float64)
+        waypoint_times = np.asarray(plan.waypoint_times_s, dtype=np.float64)
+        capture_pose = np.asarray(plan.capture_pose_world, dtype=np.float64)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TrajectoryValidationError("invalid_plan_geometry") from exc
+    if (
+        not math.isfinite(current_time)
+        or not math.isfinite(source_time)
+        or current_time < source_time - float(cfg.TRAJECTORY_TIME_EPSILON_S)
+        or points.ndim != 2
+        or points.shape[1] != 3
+        or waypoint_times.shape != (len(points),)
+        or capture_pose.shape != (4, 4)
+        or not np.isfinite(points).all()
+        or not np.isfinite(waypoint_times).all()
+        or not np.isfinite(capture_pose).all()
+        or np.any(np.diff(waypoint_times) <= 0.0)
+    ):
+        raise TrajectoryValidationError("invalid_plan_geometry")
+
+    first_future = int(np.searchsorted(waypoint_times, current_time, side="right"))
+    origin = capture_pose[:3, 3]
+    full_points = np.vstack([origin, points])
+    full_times = np.concatenate([[source_time], waypoint_times])
+    clipped_points, clipped_times = _clip_timed_path_at(
+        full_points,
+        full_times,
+        current_time,
+    )
+    remaining_horizon = max(0.0, float(full_times[-1]) - current_time)
+
+    if len(clipped_points) < 2:
+        segment_distance = np.empty((0,), dtype=np.float64)
+        segment_dt = np.empty((0,), dtype=np.float64)
+        speeds = np.empty((0,), dtype=np.float64)
+    else:
+        segment_distance = np.linalg.norm(
+            np.diff(clipped_points[:, :2], axis=0),
+            axis=1,
+        )
+        segment_dt = np.diff(clipped_times)
+        speeds = np.divide(
+            segment_distance,
+            segment_dt,
+            out=np.zeros_like(segment_distance),
+            where=segment_dt > 1e-6,
+        )
+
+    horizon = float(
+        cfg.SAFETY_EXECUTION_HORIZON_S
+        if execution_horizon_s is None
+        else execution_horizon_s
+    )
+    if not math.isfinite(horizon) or horizon <= 0.0:
+        raise TrajectoryValidationError("invalid_motion_execution_horizon")
+    execution_duration = min(horizon, remaining_horizon)
+    execution_end = current_time + execution_duration
+    near_distance = 0.0
+    near_speeds = []
+    for index, distance in enumerate(segment_distance):
+        start = float(clipped_times[index])
+        end = float(clipped_times[index + 1])
+        overlap = max(0.0, min(end, execution_end) - max(start, current_time))
+        if overlap <= 0.0 or end <= start:
+            continue
+        near_distance += float(distance) * overlap / (end - start)
+        near_speeds.append(float(speeds[index]))
+        if end >= execution_end:
+            break
+
+    near_mean = (
+        near_distance / execution_duration if execution_duration > 1e-9 else 0.0
+    )
+    near_peak = max(near_speeds, default=0.0)
+    remaining_distance = float(np.sum(segment_distance))
+    remaining_peak = float(np.max(speeds, initial=0.0))
+
+    smoothed = np.asarray(
+        [
+            float(np.median(speeds[index : index + 5]))
+            for index in range(len(speeds))
+        ],
+        dtype=np.float64,
+    )
+    peak_deceleration = 0.0
+    if len(smoothed) >= 2:
+        smoothed_dt = np.maximum(segment_dt[1:], 1e-6)
+        decelerations = -(np.diff(smoothed) / smoothed_dt)
+        peak_deceleration = float(np.max(decelerations, initial=0.0))
+
+    time_to_effective_stop = None
+    minimum_stop_segments = int(cfg.TRAJECTORY_STOP_TAIL_MIN_POINTS)
+    if len(speeds) >= minimum_stop_segments:
+        stop_mask = speeds <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS)
+        for start in range(0, len(stop_mask) - minimum_stop_segments + 1):
+            if bool(np.all(stop_mask[start : start + minimum_stop_segments])):
+                time_to_effective_stop = max(
+                    0.0,
+                    float(clipped_times[start]) - current_time,
+                )
+                break
+
+    initial_target = target_speed_from_timestamps(
+        points,
+        waypoint_times,
+        min(first_future, max(0, len(points) - 1)),
+        capture_origin_world=origin,
+        terminal_stop_index=plan.terminal_stop_index,
+    )
+    moving_speed = float(cfg.PID_LAUNCH_MIN_INTENT_MPS)
+    moving_distance = moving_speed * horizon
+    if plan.terminal_stop_index is not None:
+        motion_class = TrajectoryMotionClass.EXPLICIT_STOP
+    elif near_mean >= moving_speed and near_distance >= moving_distance:
+        motion_class = TrajectoryMotionClass.MOVING
+    elif remaining_peak >= moving_speed:
+        motion_class = TrajectoryMotionClass.DELAYED_START
+    else:
+        motion_class = TrajectoryMotionClass.CREEP_OR_STALL
+
+    return TrajectoryMotionProfile(
+        first_future_index=first_future,
+        remaining_horizon_s=remaining_horizon,
+        initial_target_speed_mps=initial_target,
+        near_term_path_length_m=near_distance,
+        near_term_mean_speed_mps=near_mean,
+        near_term_peak_speed_mps=near_peak,
+        remaining_path_length_m=remaining_distance,
+        remaining_peak_speed_mps=remaining_peak,
+        peak_smoothed_deceleration_mps2=peak_deceleration,
+        time_to_effective_stop_s=time_to_effective_stop,
+        motion_class=motion_class,
+    )
 
 
 def _nonnegative_int(value: Any, name: str) -> int:
@@ -569,10 +851,14 @@ __all__ = [
     "FixedWorldTrajectory",
     "PlanExecutionValidity",
     "PlanAlignmentValidity",
+    "TrajectoryMotionClass",
+    "TrajectoryMotionProfile",
     "TrajectoryValidationError",
     "build_fixed_world_trajectory",
     "classify_and_validate_model_trajectory",
+    "compute_trajectory_motion_profile",
     "detect_terminal_stop_index",
+    "target_speed_from_timestamps",
     "validate_model_trajectory",
     "validate_plan_for_execution",
     "validate_plan_alignment",

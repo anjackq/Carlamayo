@@ -11,7 +11,10 @@ import carla
 import numpy as np
 
 from . import config as cfg
-from .trajectory_runtime import detect_terminal_stop_index
+from .trajectory_runtime import (
+    detect_terminal_stop_index,
+    target_speed_from_timestamps,
+)
 
 
 def _resolve_vehicle_pid_controller():
@@ -117,56 +120,13 @@ class OfficialPIDFollower:
     ):
         """Derive speed from temporal waypoint spacing, including terminal stops."""
 
-        points = np.asarray(wp_world, dtype=np.float64)
-        times = np.asarray(waypoint_times_s, dtype=np.float64)
-        if (
-            points.ndim != 2
-            or points.shape[1] != 3
-            or times.ndim != 1
-            or len(points) != len(times)
-            or len(points) == 0
-            or not np.isfinite(points).all()
-            or not np.isfinite(times).all()
-        ):
-            return 0.0
-
-        speed_index_offset = 0
-        if capture_origin_world is not None:
-            origin = np.asarray(capture_origin_world, dtype=np.float64)
-            if origin.shape == (3,) and np.isfinite(origin).all():
-                first_dt = (
-                    float(times[1] - times[0])
-                    if len(times) > 1
-                    else float(cfg.TRAJECTORY_WAYPOINT_DT)
-                )
-                points = np.vstack([origin, points])
-                times = np.concatenate([[times[0] - first_dt], times])
-                speed_index_offset = 1
-
-        if len(points) < 2:
-            return 0.0
-
-        segment_distance = np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)
-        segment_dt = np.diff(times)
-        speeds = np.divide(
-            segment_distance,
-            segment_dt,
-            out=np.zeros_like(segment_distance),
-            where=segment_dt > 1e-6,
+        return target_speed_from_timestamps(
+            wp_world,
+            waypoint_times_s,
+            start_idx,
+            capture_origin_world=capture_origin_world,
+            terminal_stop_index=terminal_stop_index,
         )
-        if len(speeds) == 0:
-            return 0.0
-
-        segment_idx = min(
-            max(0, int(start_idx) + speed_index_offset),
-            len(speeds) - 1,
-        )
-        window = speeds[segment_idx : min(len(speeds), segment_idx + 6)]
-        target_speed_mps = float(np.median(window)) if len(window) else 0.0
-
-        if terminal_stop_index is not None and int(start_idx) >= int(terminal_stop_index):
-            target_speed_mps = 0.0
-        return float(np.clip(target_speed_mps, 0.0, cfg.TRAJECTORY_MAX_SPEED_MPS))
 
     @staticmethod
     def _launch_floor_speed(

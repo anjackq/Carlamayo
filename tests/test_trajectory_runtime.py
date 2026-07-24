@@ -5,10 +5,13 @@ import pytest
 
 from module.geometry import pose_matrix_from_components
 from module.trajectory_runtime import (
+    TrajectoryMotionClass,
     TrajectoryValidationError,
     build_fixed_world_trajectory,
     classify_and_validate_model_trajectory,
+    compute_trajectory_motion_profile,
     detect_terminal_stop_index,
+    target_speed_from_timestamps,
     validate_model_trajectory,
     validate_plan_alignment,
     validate_plan_for_execution,
@@ -128,6 +131,104 @@ def test_waypoint_times_are_absolute_simulation_times():
     assert plan.waypoint_times_s[0] == pytest.approx(10.1)
     assert plan.waypoint_times_s[-1] == pytest.approx(16.4)
     np.testing.assert_allclose(plan.waypoint_offsets_s, np.arange(1, 65) * 0.1)
+
+
+def test_motion_profile_reports_constant_speed_and_pid_target_semantics():
+    plan = _build_plan(source_time=10.0, points=_moving_points(step_m=0.5))
+
+    profile = compute_trajectory_motion_profile(plan, 10.0)
+    controller_target = target_speed_from_timestamps(
+        plan.world_points,
+        plan.waypoint_times_s,
+        0,
+        capture_origin_world=plan.capture_pose_world[:3, 3],
+        terminal_stop_index=plan.terminal_stop_index,
+    )
+
+    assert profile.first_future_index == 0
+    assert profile.remaining_horizon_s == pytest.approx(6.4)
+    assert profile.initial_target_speed_mps == pytest.approx(controller_target)
+    assert profile.initial_target_speed_mps == pytest.approx(5.0)
+    assert profile.near_term_path_length_m == pytest.approx(7.5)
+    assert profile.near_term_mean_speed_mps == pytest.approx(5.0)
+    assert profile.near_term_peak_speed_mps == pytest.approx(5.0)
+    assert profile.remaining_path_length_m == pytest.approx(32.0)
+    assert profile.remaining_peak_speed_mps == pytest.approx(5.0)
+    assert profile.motion_class is TrajectoryMotionClass.MOVING
+
+
+def test_motion_profile_interpolates_an_elapsed_partial_segment():
+    plan = _build_plan(source_time=10.0, points=_moving_points(step_m=0.5))
+
+    profile = compute_trajectory_motion_profile(plan, 10.15)
+
+    assert profile.first_future_index == 1
+    assert profile.remaining_horizon_s == pytest.approx(6.25)
+    assert profile.near_term_path_length_m == pytest.approx(7.5)
+    assert profile.near_term_mean_speed_mps == pytest.approx(5.0)
+    assert profile.remaining_path_length_m == pytest.approx(31.25)
+    assert profile.initial_target_speed_mps == pytest.approx(
+        target_speed_from_timestamps(
+            plan.world_points,
+            plan.waypoint_times_s,
+            1,
+            capture_origin_world=plan.capture_pose_world[:3, 3],
+            terminal_stop_index=plan.terminal_stop_index,
+        )
+    )
+
+
+def test_motion_profile_distinguishes_delayed_start_from_creep():
+    delayed = np.zeros((64, 3), dtype=np.float64)
+    delayed_steps = np.concatenate(
+        [np.full(20, 0.01), np.full(44, 0.2)]
+    )
+    delayed[:, 0] = np.cumsum(delayed_steps)
+    creep = _moving_points(step_m=0.04)
+
+    delayed_profile = compute_trajectory_motion_profile(
+        _build_plan(points=delayed),
+        10.0,
+    )
+    creep_profile = compute_trajectory_motion_profile(
+        _build_plan(points=creep),
+        10.0,
+    )
+
+    assert delayed_profile.near_term_path_length_m < 0.75
+    assert delayed_profile.remaining_peak_speed_mps == pytest.approx(2.0)
+    assert delayed_profile.motion_class is TrajectoryMotionClass.DELAYED_START
+    assert creep_profile.near_term_path_length_m == pytest.approx(0.6)
+    assert creep_profile.near_term_mean_speed_mps == pytest.approx(0.4)
+    assert creep_profile.motion_class is TrajectoryMotionClass.CREEP_OR_STALL
+
+
+def test_motion_profile_terminal_geometry_has_explicit_stop_priority():
+    points = _moving_points(step_m=0.2)
+    points[40:] = points[39]
+    plan = _build_plan(points=points)
+
+    profile = compute_trajectory_motion_profile(plan, 10.0)
+
+    assert plan.terminal_stop_index is not None
+    assert profile.motion_class is TrajectoryMotionClass.EXPLICIT_STOP
+    assert profile.time_to_effective_stop_s == pytest.approx(
+        plan.waypoint_times_s[plan.terminal_stop_index] - plan.source_simulation_time_s
+    )
+
+
+def test_motion_profile_reports_smoothed_deceleration():
+    speeds = np.concatenate(
+        [np.full(20, 2.0), np.linspace(2.0, 0.0, 20), np.zeros(24)]
+    )
+    points = np.zeros((64, 3), dtype=np.float64)
+    points[:, 0] = np.cumsum(speeds * 0.1)
+    plan = _build_plan(points=points)
+
+    profile = compute_trajectory_motion_profile(plan, 10.0)
+
+    assert profile.peak_smoothed_deceleration_mps2 > 0.0
+    assert profile.time_to_effective_stop_s is not None
 
 
 def test_execution_validation_uses_strictly_future_waypoints_and_boundary_tolerance():
