@@ -1,6 +1,7 @@
 """Modular entrypoint for CARLA closed-loop control with Alpamayo."""
 
 import argparse
+import importlib
 import math
 import os
 import queue
@@ -11,7 +12,6 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from module import config as cfg
 from module.active_plan_availability import (
@@ -62,18 +62,144 @@ from module.trajectory_runtime import (
 from module.vlm_generate_optimization import VlmGenerateTiming
 from module.visualization import VideoRecorder, create_visualization_frame
 from module.carla_interface import CARLAInterface
-from module.inference import (
-    configure_cuda_linalg_library,
-    extract_answer_text,
-    extract_cot_text,
-    extract_cot_texts,
-    extract_trajectory_samples,
-    load_model,
-    prepare_model_input,
-    run_inference,
-    run_vqa,
-    select_trajectory_by_prev_similarity,
-)
+
+
+class _LazyModuleProxy:
+    """Import a heavy module only when one of its attributes is first used."""
+
+    __slots__ = ("_module", "_module_name")
+
+    def __init__(self, module_name):
+        object.__setattr__(self, "_module_name", str(module_name))
+        object.__setattr__(self, "_module", None)
+
+    def _load(self):
+        module = object.__getattribute__(self, "_module")
+        if module is None:
+            module = importlib.import_module(object.__getattribute__(self, "_module_name"))
+            object.__setattr__(self, "_module", module)
+        return module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._load(), name, value)
+
+    def __delattr__(self, name):
+        if name in self.__slots__:
+            object.__delattr__(self, name)
+            return
+        delattr(self._load(), name)
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(dir(self._load())))
+
+    def __repr__(self):
+        module_name = object.__getattribute__(self, "_module_name")
+        loaded = object.__getattribute__(self, "_module") is not None
+        return f"<lazy module proxy {module_name!r} loaded={loaded}>"
+
+
+# Keep ``torch`` as a monkeypatchable module-level public name without making
+# lightweight CLI, road-worker, or replay imports initialize the CUDA stack.
+torch = _LazyModuleProxy("torch")
+
+
+def _inference_callable(name):
+    """Resolve one public inference helper without importing it at module load."""
+
+    return getattr(importlib.import_module("module.inference"), name)
+
+
+def configure_cuda_linalg_library(library):
+    return _inference_callable("configure_cuda_linalg_library")(library)
+
+
+def extract_answer_text(extra):
+    return _inference_callable("extract_answer_text")(extra)
+
+
+def extract_cot_text(extra, candidate_index=0):
+    return _inference_callable("extract_cot_text")(
+        extra,
+        candidate_index=candidate_index,
+    )
+
+
+def extract_cot_texts(extra, candidate_count):
+    return _inference_callable("extract_cot_texts")(extra, candidate_count)
+
+
+def extract_trajectory_samples(pred_xyz):
+    return _inference_callable("extract_trajectory_samples")(pred_xyz)
+
+
+def load_model(use_quantization, device_map="auto"):
+    return _inference_callable("load_model")(
+        use_quantization,
+        device_map=device_map,
+    )
+
+
+def prepare_model_input(
+    images_array,
+    history_xyz,
+    history_rot,
+    *,
+    camera_indices=None,
+):
+    return _inference_callable("prepare_model_input")(
+        images_array,
+        history_xyz,
+        history_rot,
+        camera_indices=camera_indices,
+    )
+
+
+def run_inference(
+    model,
+    processor,
+    data,
+    navigation_text=None,
+    navigation_weight=1.0,
+    num_traj_samples=None,
+    diffusion_temperature=1.0,
+    vlm_generate_timing=None,
+    disable_unused_generate_logits=True,
+    vlm_image_pixels=None,
+):
+    return _inference_callable("run_inference")(
+        model,
+        processor,
+        data,
+        navigation_text=navigation_text,
+        navigation_weight=navigation_weight,
+        num_traj_samples=num_traj_samples,
+        diffusion_temperature=diffusion_temperature,
+        vlm_generate_timing=vlm_generate_timing,
+        disable_unused_generate_logits=disable_unused_generate_logits,
+        vlm_image_pixels=vlm_image_pixels,
+    )
+
+
+def run_vqa(model, processor, data, question):
+    return _inference_callable("run_vqa")(
+        model,
+        processor,
+        data,
+        question=question,
+    )
+
+
+def select_trajectory_by_prev_similarity(traj_samples, prev_traj):
+    return _inference_callable("select_trajectory_by_prev_similarity")(
+        traj_samples,
+        prev_traj,
+    )
 
 
 def derive_pygame_ui_video_path(output_video_path):

@@ -7,7 +7,6 @@ import textwrap
 
 import cv2
 import numpy as np
-import torch
 
 
 def project_world_points_to_camera(
@@ -184,8 +183,13 @@ def project_trajectory_to_image(cam_img, pred_xyz, selected_idx=0, camera_height
     focal_length_px = img_width / (2 * np.tan(np.radians(fov / 2)))
 
     result = cam_img.copy()
-    if isinstance(pred_xyz, torch.Tensor):
-        arr = pred_xyz.detach().cpu().numpy()
+    detach = getattr(pred_xyz, "detach", None)
+    if callable(detach):
+        detached = detach()
+        cpu = getattr(detached, "cpu", None)
+        host_value = cpu() if callable(cpu) else detached
+        to_numpy = getattr(host_value, "numpy", None)
+        arr = to_numpy() if callable(to_numpy) else np.asarray(host_value)
     else:
         arr = np.asarray(pred_xyz)
 
