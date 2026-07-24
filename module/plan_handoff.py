@@ -41,6 +41,7 @@ class PlanHandoffStatus(str, Enum):
     ACTIVATE_FRESH = "ACTIVATE_FRESH"
     ACTIVATE_RETENTION_DEADLINE = "ACTIVATE_RETENTION_DEADLINE"
     RETAIN_ACTIVE_STOPPING_RESERVE = "RETAIN_ACTIVE_STOPPING_RESERVE"
+    RETAIN_ACTIVE_SAFETY_HEADROOM = "RETAIN_ACTIVE_SAFETY_HEADROOM"
     RETAIN_ACTIVE_MOTION_QUALITY = "RETAIN_ACTIVE_MOTION_QUALITY"
     NO_EXECUTABLE_PLAN = "NO_EXECUTABLE_PLAN"
 
@@ -59,6 +60,10 @@ class PlanHandoffDecision:
     active_motion_class: str | None
     candidate_reserve_status: str | None
     active_reserve_status: str | None
+    candidate_distance_to_first_bad_m: float | None
+    active_distance_to_first_bad_m: float | None
+    candidate_time_to_first_bad_s: float | None
+    active_time_to_first_bad_s: float | None
     active_remaining_horizon_s: float | None
     reason: str
 
@@ -79,6 +84,12 @@ class PlanHandoffDecision:
             "active_motion_class": self.active_motion_class,
             "candidate_reserve_status": self.candidate_reserve_status,
             "active_reserve_status": self.active_reserve_status,
+            "candidate_distance_to_first_bad_m": (
+                self.candidate_distance_to_first_bad_m
+            ),
+            "active_distance_to_first_bad_m": self.active_distance_to_first_bad_m,
+            "candidate_time_to_first_bad_s": self.candidate_time_to_first_bad_s,
+            "active_time_to_first_bad_s": self.active_time_to_first_bad_s,
             "active_remaining_horizon_s": self.active_remaining_horizon_s,
             "reason": self.reason,
         }
@@ -92,7 +103,7 @@ def _value(value: Any) -> str | None:
     return result or None
 
 
-def _finite_horizon(value: Any) -> float | None:
+def _nonnegative_finite(value: Any) -> float | None:
     if value is None:
         return None
     try:
@@ -115,15 +126,21 @@ def decide_plan_handoff(
     candidate_admission_status: Any,
     candidate_motion_class: Any,
     candidate_reserve_status: Any,
+    candidate_distance_to_first_bad_m: float | None = None,
+    candidate_time_to_first_bad_s: float | None = None,
     candidate_explicit_stop: bool,
     active_plan_id: str | None,
     active_admission_status: Any,
     active_motion_class: Any,
     active_reserve_status: Any,
+    active_distance_to_first_bad_m: float | None = None,
+    active_time_to_first_bad_s: float | None = None,
     active_remaining_horizon_s: float | None,
     active_executable: bool,
     verified_empty_road: bool,
     retention_deadline_s: float = 3.0,
+    minimum_headroom_distance_regression_m: float = 2.0,
+    minimum_headroom_time_regression_s: float = 0.5,
 ) -> PlanHandoffDecision:
     """Decide replacement after both plans have independently passed admission."""
 
@@ -133,7 +150,19 @@ def decide_plan_handoff(
     active_motion = _value(active_motion_class)
     candidate_reserve = _value(candidate_reserve_status)
     active_reserve = _value(active_reserve_status)
-    active_horizon = _finite_horizon(active_remaining_horizon_s)
+    active_horizon = _nonnegative_finite(active_remaining_horizon_s)
+    candidate_bad_distance = _nonnegative_finite(
+        candidate_distance_to_first_bad_m
+    )
+    active_bad_distance = _nonnegative_finite(active_distance_to_first_bad_m)
+    candidate_bad_time = _nonnegative_finite(candidate_time_to_first_bad_s)
+    active_bad_time = _nonnegative_finite(active_time_to_first_bad_s)
+    distance_regression = _nonnegative_finite(
+        minimum_headroom_distance_regression_m
+    )
+    time_regression = _nonnegative_finite(minimum_headroom_time_regression_s)
+    if distance_regression is None or time_regression is None:
+        raise ValueError("headroom regression thresholds must be finite and nonnegative")
 
     common = {
         "candidate_plan_id": (
@@ -146,6 +175,10 @@ def decide_plan_handoff(
         "active_motion_class": active_motion,
         "candidate_reserve_status": candidate_reserve,
         "active_reserve_status": active_reserve,
+        "candidate_distance_to_first_bad_m": candidate_bad_distance,
+        "active_distance_to_first_bad_m": active_bad_distance,
+        "candidate_time_to_first_bad_s": candidate_bad_time,
+        "active_time_to_first_bad_s": active_bad_time,
         "active_remaining_horizon_s": active_horizon,
     }
     candidate_admitted = candidate_admission in ACCEPTED_ADMISSION_STATUSES
@@ -187,6 +220,13 @@ def decide_plan_handoff(
             reason="active_plan_retention_deadline_reached",
             **common,
         )
+    if candidate_safety > active_safety:
+        return PlanHandoffDecision(
+            status=PlanHandoffStatus.RETAIN_ACTIVE_STOPPING_RESERVE,
+            activate_candidate=False,
+            reason="candidate_safety_tier_worse_than_active",
+            **common,
+        )
     if (
         candidate_reserve == "FRAGILE"
         and active_reserve in {"ROBUST", "UNBOUNDED"}
@@ -197,6 +237,32 @@ def decide_plan_handoff(
             reason="active_plan_has_guarded_stopping_reserve",
             **common,
         )
+    if (
+        candidate_safety == active_safety
+        and candidate_admission == "ACCEPT_SAFE_PREFIX"
+        and active_admission == "ACCEPT_SAFE_PREFIX"
+    ):
+        if (
+            candidate_bad_distance is None
+            or active_bad_distance is None
+            or candidate_bad_time is None
+            or active_bad_time is None
+        ):
+            return PlanHandoffDecision(
+                status=PlanHandoffStatus.RETAIN_ACTIVE_SAFETY_HEADROOM,
+                activate_candidate=False,
+                reason="safe_prefix_headroom_unavailable",
+                **common,
+            )
+        distance_loss = active_bad_distance - candidate_bad_distance
+        time_loss = active_bad_time - candidate_bad_time
+        if distance_loss >= distance_regression and time_loss >= time_regression:
+            return PlanHandoffDecision(
+                status=PlanHandoffStatus.RETAIN_ACTIVE_SAFETY_HEADROOM,
+                activate_candidate=False,
+                reason="candidate_materially_reduces_safety_headroom",
+                **common,
+            )
     if (
         verified_empty_road
         and candidate_motion in _MOTION_TIER

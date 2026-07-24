@@ -1724,6 +1724,16 @@ def main():
                     if candidate_reserve is not None
                     else None
                 ),
+                candidate_distance_to_first_bad_m=(
+                    candidate_envelope.distance_to_first_bad_m
+                    if candidate_envelope is not None
+                    else None
+                ),
+                candidate_time_to_first_bad_s=(
+                    candidate_envelope.time_to_first_bad_s
+                    if candidate_envelope is not None
+                    else None
+                ),
                 candidate_explicit_stop=bool(candidate_plan.stop_requested),
                 active_plan_id=(
                     current_plan.plan_id if current_plan is not None else None
@@ -1735,6 +1745,16 @@ def main():
                 active_reserve_status=(
                     active_reserve.status if active_reserve is not None else None
                 ),
+                active_distance_to_first_bad_m=(
+                    active_envelope.distance_to_first_bad_m
+                    if active_envelope is not None
+                    else None
+                ),
+                active_time_to_first_bad_s=(
+                    active_envelope.time_to_first_bad_s
+                    if active_envelope is not None
+                    else None
+                ),
                 active_remaining_horizon_s=(
                     active_motion.remaining_horizon_s
                     if active_motion is not None
@@ -1745,6 +1765,12 @@ def main():
                 retention_deadline_s=(
                     float(cfg.TRAJECTORY_MIN_REMAINING_HORIZON_S)
                     + float(inference_interval_sec)
+                ),
+                minimum_headroom_distance_regression_m=float(
+                    cfg.PLAN_HANDOFF_HEADROOM_DISTANCE_REGRESSION_M
+                ),
+                minimum_headroom_time_regression_s=float(
+                    cfg.PLAN_HANDOFF_HEADROOM_TIME_REGRESSION_S
                 ),
             )
             latest_handoff_status = handoff.status

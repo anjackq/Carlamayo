@@ -181,6 +181,12 @@ SAFETY_GUARDED_ACCELERATION_MPS2 = 5.0
 # buffered 0.25 m planning clearance is temporarily unavailable at a junction
 # transition, admit only a low-speed physically-contained recovery prefix.
 SAFETY_JUNCTION_RECOVERY_SPEED_CAP_MPS = 0.75
+# A fresh equal-tier safe-prefix plan may not discard materially better
+# executable headroom while the active plan is still above its bounded
+# retention deadline.  The thresholds reuse the physical stop buffer and
+# reaction interval instead of introducing a speed-preference hysteresis.
+PLAN_HANDOFF_HEADROOM_DISTANCE_REGRESSION_M = SAFETY_STOP_BUFFER_M
+PLAN_HANDOFF_HEADROOM_TIME_REGRESSION_S = SAFETY_REACTION_TIME_S
 # Road profiles are immutable per fixed-world plan.  Keep a small bounded cache
 # so candidate admission can reuse the same exact CARLA map queries at control
 # time without growing for the whole episode.
