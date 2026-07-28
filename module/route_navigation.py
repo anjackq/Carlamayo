@@ -20,7 +20,8 @@ ROUTE_ASSOCIATION_MAX_DISTANCE_M = 3.0
 ROUTE_ARRIVAL_DISTANCE_M = 1.5
 ROUTE_PROMPT_DISTANCE_OMIT_M = 15.0
 ROUTE_MANEUVER_COALESCE_DISTANCE_M = 18.0
-ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M = 1.25
+ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M = 1.5
+ROUTE_JUNCTION_TOPOLOGY_LOOKBACK_M = 3.0
 ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M = 18.0
 
 
@@ -154,9 +155,9 @@ def associate_route_index(
     Complex junctions can also return a downstream authorized connector for a
     point that is still geometrically on the current connector.  Canonicalize
     only that bounded overlap: both samples must be junction samples, the point
-    must remain within 1.25 m of the route, and its road ID must occur in the
-    next 18 m of the authorized junction sequence.  Unrelated branches,
-    adjacent lanes, and geometric divergence remain unauthorized.
+    must remain within 1.5 m of the route, and its road ID must occur from 3 m
+    behind through 18 m ahead in the authorized junction sequence.  Unrelated
+    branches, adjacent lanes, and geometric divergence remain unauthorized.
     """
 
     point = np.asarray(point_xyz, dtype=np.float64)
@@ -214,16 +215,18 @@ def associate_route_index(
         <= ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M
     ):
         geometric_progress = route.cumulative_distance_m[geometric_index]
-        for index in range(geometric_index, len(route.points)):
-            route_point = route.points[index]
+        for index, route_point in enumerate(route.points):
+            if not route_point.is_junction:
+                continue
             route_delta = (
                 route.cumulative_distance_m[index] - geometric_progress
             )
+            if route_delta < -ROUTE_JUNCTION_TOPOLOGY_LOOKBACK_M:
+                continue
             if route_delta > ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M:
                 break
             if (
-                route_point.is_junction
-                and route_point.road_id == identity_values[0]
+                route_point.road_id == identity_values[0]
             ):
                 return RouteAssociation(
                     route_index=geometric_index,
@@ -545,6 +548,7 @@ __all__ = [
     "ROUTE_ARRIVAL_DISTANCE_M",
     "ROUTE_ASSOCIATION_MAX_DISTANCE_M",
     "ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M",
+    "ROUTE_JUNCTION_TOPOLOGY_LOOKBACK_M",
     "ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M",
     "ROUTE_MANEUVER_COALESCE_DISTANCE_M",
     "RouteAssociation",

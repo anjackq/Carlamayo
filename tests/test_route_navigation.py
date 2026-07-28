@@ -237,6 +237,29 @@ def test_junction_topology_overlap_outside_lookahead_is_unavailable():
     assert update.context.tracker_status is RouteTrackerStatus.ROUTE_UNAVAILABLE
 
 
+def test_previous_junction_connector_overlap_keeps_tracker_available():
+    route = build_route_plan(
+        [
+            _point(0.0, road=1577, lane=-3, junction=True),
+            _point(1.0, road=1624, lane=-5, junction=True),
+            _point(10.0, road=1608, lane=-1, junction=True),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+    tracker.route_index = 1
+    update = tracker.update(
+        (1.2, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+        ego_lane_identity=(1577, 0, -3),
+        ego_lane_is_junction=True,
+        require_lane_identity=True,
+    )
+
+    assert update.context.tracker_status is RouteTrackerStatus.AVAILABLE
+    assert tracker.route_index == 1
+
+
 def test_arrival_context_requests_destination_stop():
     tracker = RouteNavigationTracker(_route())
     update = tracker.update(

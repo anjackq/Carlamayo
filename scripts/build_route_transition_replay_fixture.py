@@ -27,11 +27,13 @@ from module.geometry import model_ego_points_to_world, pose_matrix_from_componen
 from module.route_navigation import associate_route_index
 
 
-SCHEMA_VERSION = "carlamayo.route-transition-replay.v2"
+SCHEMA_VERSION = "carlamayo.route-transition-replay.v3"
 SOURCE_JOB_ID = 22921097
 SOURCE_REQUEST_ID = 31
 TOPOLOGY_SOURCE_JOB_ID = 22922863
 TOPOLOGY_SOURCE_REQUEST_ID = 35
+PREVIOUS_CONNECTOR_SOURCE_JOB_ID = 22923017
+PREVIOUS_CONNECTOR_SOURCE_REQUEST_ID = 41
 FORBIDDEN_KEYS = {
     "camera_frames",
     "camera_images",
@@ -123,6 +125,7 @@ def validate_fixture(payload: dict[str, Any]) -> None:
     if payload.get("source_jobs") != [
         SOURCE_JOB_ID,
         TOPOLOGY_SOURCE_JOB_ID,
+        PREVIOUS_CONNECTOR_SOURCE_JOB_ID,
     ]:
         raise ValueError("unexpected source jobs")
     route_points = payload.get("route_points")
@@ -170,6 +173,26 @@ def validate_fixture(payload: dict[str, Any]) -> None:
         == len(topology_trajectory)
     ):
         raise ValueError("fixture topology overlap metadata is inconsistent")
+    previous_case = payload.get("previous_connector_overlap_case")
+    if not isinstance(previous_case, dict):
+        raise ValueError("fixture previous connector overlap case is missing")
+    previous_trajectory = previous_case.get("selected_trajectory_world")
+    previous_facts = previous_case.get("candidate_lane_facts")
+    previous_times = previous_case.get("waypoint_times_s")
+    if not (
+        isinstance(previous_trajectory, list)
+        and len(previous_trajectory) == 64
+        and all(
+            isinstance(point, list) and len(point) == 3
+            for point in previous_trajectory
+        )
+        and isinstance(previous_facts, list)
+        and isinstance(previous_times, list)
+        and len(previous_facts)
+        == len(previous_times)
+        == len(previous_trajectory)
+    ):
+        raise ValueError("fixture previous connector metadata is inconsistent")
     unsigned = dict(payload)
     integrity = unsigned.pop("integrity_sha256", None)
     if integrity != _canonical_digest(unsigned):
@@ -180,6 +203,7 @@ def build_fixture(
     *,
     runtime_jsonl: Path,
     topology_runtime_jsonl: Path,
+    previous_connector_runtime_jsonl: Path,
     town03_xodr: Path,
     carla_python_api_path: Path,
 ) -> dict[str, Any]:
@@ -325,9 +349,89 @@ def build_fixture(
     topology_source_time = float(
         topology_proposal["source_simulation_time_s"]
     )
+    previous_events = _read_events(previous_connector_runtime_jsonl)
+    previous_proposal = _single_event(
+        previous_events,
+        "alpamayo_proposal",
+        request_id=PREVIOUS_CONNECTOR_SOURCE_REQUEST_ID,
+    )
+    previous_submitted = _single_event(
+        previous_events,
+        "inference_submitted",
+        request_id=PREVIOUS_CONNECTOR_SOURCE_REQUEST_ID,
+    )
+    previous_tick = _single_event(
+        previous_events,
+        "tick",
+        loop_tick_id=int(previous_submitted["source_loop_tick_id"]),
+    )
+    previous_position = previous_tick["ego_position_world"]
+    previous_pose = pose_matrix_from_components(
+        float(previous_position["x"]),
+        float(previous_position["y"]),
+        float(previous_position["z"]),
+        yaw_deg=float(previous_tick["ego_yaw_deg"]),
+    )
+    previous_selected_index = int(
+        previous_proposal["selected_candidate_index"]
+    )
+    previous_model_points = np.asarray(
+        previous_proposal["candidate_trajectories_model"][
+            previous_selected_index
+        ],
+        dtype=np.float64,
+    )
+    previous_world_points = model_ego_points_to_world(
+        previous_pose,
+        previous_model_points,
+    )
+    previous_lane_facts = query_candidate_lane_facts(
+        world_map,
+        previous_world_points,
+        carla_module=carla,
+    )
+    previous_route_index = int(
+        previous_proposal["navigation_context"]["route_index"]
+    )
+    first_previous_overlap_index = None
+    for index, (point, fact) in enumerate(
+        zip(previous_world_points, previous_lane_facts)
+    ):
+        distances = np.linalg.norm(
+            route_xy[previous_route_index:] - point[None, :2],
+            axis=1,
+        )
+        associated_index = previous_route_index + int(np.argmin(distances))
+        route_point = route.points[associated_index]
+        if (
+            fact.available
+            and bool(fact.is_junction)
+            and route_point.is_junction
+            and fact.road_id != route_point.road_id
+            and any(
+                candidate.road_id == fact.road_id
+                for candidate in route.points[
+                    max(0, previous_route_index - 2):
+                    previous_route_index
+                ]
+            )
+        ):
+            first_previous_overlap_index = index
+            break
+    if first_previous_overlap_index is None:
+        raise ValueError(
+            "previous connector replay contains no junction identity overlap"
+        )
+    previous_source_time = float(
+        previous_proposal["source_simulation_time_s"]
+    )
     unsigned = {
         "schema_version": SCHEMA_VERSION,
-        "source_jobs": [SOURCE_JOB_ID, TOPOLOGY_SOURCE_JOB_ID],
+        "source_jobs": [
+            SOURCE_JOB_ID,
+            TOPOLOGY_SOURCE_JOB_ID,
+            PREVIOUS_CONNECTOR_SOURCE_JOB_ID,
+        ],
         "source_job_id": SOURCE_JOB_ID,
         "source_request_id": SOURCE_REQUEST_ID,
         "source_commit": "23dba07",
@@ -383,6 +487,36 @@ def build_fixture(
                 "unrelated_branch_status": "DEVIATE",
             },
         },
+        "previous_connector_overlap_case": {
+            "source_job_id": PREVIOUS_CONNECTOR_SOURCE_JOB_ID,
+            "source_request_id": PREVIOUS_CONNECTOR_SOURCE_REQUEST_ID,
+            "source_commit": "ab3fc15",
+            "source_loop_tick_id": int(
+                previous_submitted["source_loop_tick_id"]
+            ),
+            "source_simulation_time_s": previous_source_time,
+            "current_route_index": previous_route_index,
+            "selected_candidate_index": previous_selected_index,
+            "selected_trajectory_world": previous_world_points.tolist(),
+            "waypoint_times_s": (
+                previous_source_time
+                + 0.1 * np.arange(1, len(previous_world_points) + 1)
+            ).tolist(),
+            "candidate_lane_facts": [
+                _lane_fact_dict(fact) for fact in previous_lane_facts
+            ],
+            "first_overlap_waypoint_index": int(
+                first_previous_overlap_index
+            ),
+            "expected": {
+                "near_term_route_status": "MATCH",
+                "full_path_route_status": "MATCH",
+                "reason_code": (
+                    "junction_topology_overlap_canonicalized"
+                ),
+                "unrelated_branch_status": "DEVIATE",
+            },
+        },
         "expected": {
             "tracker_status": "AVAILABLE",
             "current_route_status": "MATCH",
@@ -419,6 +553,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--previous-connector-runtime-jsonl",
+        type=Path,
+        default=Path(
+            f"/home/aqiu/carlamayo-runs/"
+            f"{PREVIOUS_CONNECTOR_SOURCE_JOB_ID}/runtime.jsonl"
+        ),
+    )
+    parser.add_argument(
         "--carla-python-api-path",
         type=Path,
         default=Path("/home/aqiu/carla/PythonAPI/carla"),
@@ -438,6 +580,9 @@ def main() -> None:
     payload = build_fixture(
         runtime_jsonl=args.runtime_jsonl,
         topology_runtime_jsonl=args.topology_runtime_jsonl,
+        previous_connector_runtime_jsonl=(
+            args.previous_connector_runtime_jsonl
+        ),
         town03_xodr=args.town03_xodr,
         carla_python_api_path=args.carla_python_api_path,
     )

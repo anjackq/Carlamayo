@@ -129,6 +129,31 @@ def test_future_connector_overlap_outside_route_corridor_is_deviation():
     assert "unauthorized_junction_branch" in assessment.reason_codes
 
 
+def test_previous_connector_overlap_is_canonicalized_after_transition():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((1, 0, 0), 1624, 0, -5, True, "RIGHT"),
+            RoutePoint((10, 0, 0), 1608, 1, -1, True, "RIGHT"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=1,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[(1.2, 0, 0), (1.8, 0, 0)],
+        waypoint_times_s=[0.5, 1.0],
+        source_simulation_time_s=0.0,
+        lane_facts=[
+            _fact(1577, lane=-3, junction=True),
+            _fact(1577, lane=-3, junction=True),
+        ],
+    )
+
+    assert assessment.full_path_route_status is RouteStatus.MATCH
+    assert "junction_topology_overlap_canonicalized" in assessment.reason_codes
+
+
 def test_wrong_junction_branch_is_deviation_and_prefix_is_bounded():
     assessment = assess_route_candidate(
         route=_route(),
