@@ -19,21 +19,14 @@ export CARLAMAYO_CARLA_PYTHONAPI="$CARLAMAYO_CARLA_ROOT/PythonAPI/carla"
 cd "$CARLAMAYO_REPO_ROOT"
 
 # Per-job ports allow multiple seed runs to share the six-GPU node without
-# racing on CARLA's default RPC/streaming ports or Traffic Manager port.
-if [[ -n "${CARLAMAYO_CARLA_PORT:-}" ]]; then
-    CARLAMAYO_RPC_PORT="$CARLAMAYO_CARLA_PORT"
-elif [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
-    # CARLA uses the RPC port plus two adjacent streaming/secondary ports.
-    # Give each job a four-port slot so consecutive job IDs cannot overlap.
-    CARLAMAYO_RPC_PORT=$((20000 + 4 * (SLURM_JOB_ID % 10000)))
-else
-    CARLAMAYO_RPC_PORT=2000
-fi
-if ! [[ "$CARLAMAYO_RPC_PORT" =~ ^[0-9]+$ ]] \
-    || ((CARLAMAYO_RPC_PORT < 1024 || CARLAMAYO_RPC_PORT > 65532)); then
-    echo "Invalid CARLAMAYO_CARLA_PORT: ${CARLAMAYO_RPC_PORT}" >&2
-    exit 1
-fi
+# racing on CARLA's RPC/streaming or Traffic Manager ports.  The job-ID slot
+# is only a starting point: a node-local flock and live probe resolve collisions
+# with jobs whose IDs differ by 10,000 or which use manually selected ports.
+source "$CARLAMAYO_REPO_ROOT/scripts/slurm_port_reservation.sh"
+carlamayo_reserve_port_slot \
+    "${CARLAMAYO_CARLA_PORT:-}" \
+    "${SLURM_JOB_ID:-0}"
+CARLAMAYO_RPC_PORT="$CARLAMAYO_RESERVED_PORT"
 export CARLAMAYO_CARLA_PORT="$CARLAMAYO_RPC_PORT"
 export CARLAMAYO_TRAFFIC_MANAGER_PORT=$((CARLAMAYO_RPC_PORT + 3))
 
@@ -69,6 +62,7 @@ cleanup() {
         kill "$CARLAMAYO_CARLA_PID" 2>/dev/null || true
         wait "$CARLAMAYO_CARLA_PID" 2>/dev/null || true
     fi
+    carlamayo_release_port_slot
 }
 trap cleanup EXIT INT TERM
 

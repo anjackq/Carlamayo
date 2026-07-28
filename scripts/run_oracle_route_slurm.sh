@@ -18,11 +18,11 @@ export CARLAMAYO_CARLA_PYTHONAPI="$CARLAMAYO_CARLA_ROOT/PythonAPI/carla"
 
 cd "$CARLAMAYO_REPO_ROOT"
 
-if [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
-    CARLAMAYO_RPC_PORT=$((20000 + 4 * (SLURM_JOB_ID % 10000)))
-else
-    CARLAMAYO_RPC_PORT=2000
-fi
+source "$CARLAMAYO_REPO_ROOT/scripts/slurm_port_reservation.sh"
+carlamayo_reserve_port_slot \
+    "${CARLAMAYO_CARLA_PORT:-}" \
+    "${SLURM_JOB_ID:-0}"
+CARLAMAYO_RPC_PORT="$CARLAMAYO_RESERVED_PORT"
 export CARLAMAYO_CARLA_PORT="$CARLAMAYO_RPC_PORT"
 export CARLAMAYO_TRAFFIC_MANAGER_PORT=$((CARLAMAYO_RPC_PORT + 3))
 
@@ -51,6 +51,7 @@ cleanup() {
         kill "$CARLAMAYO_CARLA_PID" 2>/dev/null || true
         wait "$CARLAMAYO_CARLA_PID" 2>/dev/null || true
     fi
+    carlamayo_release_port_slot
 }
 trap cleanup EXIT INT TERM
 
