@@ -249,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     start_wall = time.monotonic()
     tick_count = 0
     integrated_distance = 0.0
+    maximum_route_progress = 0.0
+    minimum_capture_speed_error = math.inf
     previous_position = None
     plan = None
     oracle = None
@@ -356,6 +358,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 route,
                 position,
                 start_index=tracker.route_index,
+            )
+            maximum_route_progress = max(maximum_route_progress, route_progress)
+            capture_speed_error = (
+                float(state["speed"])
+                if args.capture_stationary_at_marker
+                else abs(float(state["speed"]) - args.target_speed_mps)
+            )
+            minimum_capture_speed_error = min(
+                minimum_capture_speed_error,
+                capture_speed_error,
             )
             if (
                 navigation_context.tracker_status
@@ -590,7 +602,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 break
             if tick_count * float(cfg.CONTROL_DT) >= args.max_episode_seconds:
                 break
-        return_code = 0
+        if args.capture_inference_fixture is not None and capture_identity is None:
+            stop_reason = "fixture_not_captured"
+            return_code = 2
+        else:
+            return_code = 0
     except Exception as exc:
         stop_reason = f"error:{type(exc).__name__}:{exc}"
         return_code = 1
@@ -605,6 +621,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 loop_tick_count=tick_count,
                 simulation_duration_s=tick_count * float(cfg.CONTROL_DT),
                 integrated_distance_m=integrated_distance,
+                maximum_route_progress_m=maximum_route_progress,
+                minimum_capture_speed_error_mps=(
+                    minimum_capture_speed_error
+                    if math.isfinite(minimum_capture_speed_error)
+                    else None
+                ),
                 collision_count=carla_if.get_episode_collision_count(),
                 camera_fixture=capture_identity,
             )
