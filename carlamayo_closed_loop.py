@@ -9,6 +9,7 @@ import random
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -1166,6 +1167,10 @@ def main():
         current_selected_traj_idx = 0
         current_cot = ""
         current_coc_semantic_audit = None
+        latest_visual_proposal_plan = None
+        latest_visual_proposal_route_assessment = None
+        latest_visual_proposal_admission = None
+        latest_visual_proposal_handoff_status = None
         current_inference_time = 0.0
         vlm_generate_timing = VlmGenerateTiming()
         respawn_monitor = RespawnMonitor(cooldown_frames=cfg.RESPAWN_COLLISION_COOLDOWN_FRAMES)
@@ -1198,6 +1203,7 @@ def main():
         current_simulation_time_s = None
         current_frame_id_quality = "loop_counter_proxy"
         current_observation_entry = None
+        actual_path_history_world = deque(maxlen=120)
         prev_control = {"steer": 0.0, "throttle": 0.0, "brake": 0.0}
         prev_nominal_control = {
             "steering": 0.0,
@@ -2925,11 +2931,21 @@ def main():
             """Apply one sync/async selection through the same bounded handoff."""
 
             nonlocal current_inference_time
+            nonlocal latest_visual_proposal_plan
+            nonlocal latest_visual_proposal_route_assessment
+            nonlocal latest_visual_proposal_admission
+            nonlocal latest_visual_proposal_handoff_status
 
             proposal = outcome["proposal"]
             candidate_plan = outcome["plan"]
             candidate_envelope = outcome["envelope"]
             candidate_admission = outcome["admission"]
+            latest_visual_proposal_plan = candidate_plan
+            latest_visual_proposal_route_assessment = outcome.get(
+                "route_assessment"
+            )
+            latest_visual_proposal_admission = candidate_admission
+            latest_visual_proposal_handoff_status = None
             accepted = (
                 candidate_plan is not None
                 and _is_accepted_admission(candidate_admission)
@@ -2942,6 +2958,9 @@ def main():
                 )
                 if candidate_admission is PlanAdmissionStatus.REJECT_FALLBACK_STOP:
                     _clear_active_plan_state()
+                latest_visual_proposal_handoff_status = (
+                    PlanHandoffStatus.NO_EXECUTABLE_PLAN
+                )
                 return {
                     "status": "rejected_plan",
                     "rejection_reason": rejection_reason,
@@ -2964,6 +2983,7 @@ def main():
                 verified_empty_road=bool(outcome.get("verified_empty_road")),
                 handoff_source="inference_result",
             )
+            latest_visual_proposal_handoff_status = handoff.status
             if not handoff.activate_candidate:
                 _store_retained_standby(
                     outcome,
@@ -3077,6 +3097,108 @@ def main():
                     if safety_override_applied
                     else ("CONTROLLER_EXECUTION" if requested_control is not None else "FALLBACK")
                 )
+            proposal_visualization = None
+            if (
+                latest_visual_proposal_plan is not None
+                and current_simulation_time_s is not None
+            ):
+                proposal_age_s = max(
+                    0.0,
+                    float(current_simulation_time_s)
+                    - float(
+                        latest_visual_proposal_plan.source_simulation_time_s
+                    ),
+                )
+                proposal_first_future_index = int(
+                    np.searchsorted(
+                        latest_visual_proposal_plan.waypoint_times_s,
+                        float(current_simulation_time_s),
+                        side="right",
+                    )
+                )
+                proposal_remaining_points = (
+                    latest_visual_proposal_plan.world_points[
+                        proposal_first_future_index:
+                    ]
+                )
+                proposal_remaining_path_length_m = 0.0
+                if len(proposal_remaining_points) > 1:
+                    proposal_remaining_path_length_m = float(
+                        np.linalg.norm(
+                            np.diff(proposal_remaining_points[:, :2], axis=0),
+                            axis=1,
+                        ).sum()
+                    )
+                proposal_visualization = {
+                    "plan_id": latest_visual_proposal_plan.plan_id,
+                    "source_frame_id": int(
+                        latest_visual_proposal_plan.source_frame_id
+                    ),
+                    "source_age_s": proposal_age_s,
+                    "first_future_index": proposal_first_future_index,
+                    "remaining_point_count": int(
+                        len(proposal_remaining_points)
+                    ),
+                    "remaining_path_length_m": (
+                        proposal_remaining_path_length_m
+                    ),
+                    "admission_status": (
+                        latest_visual_proposal_admission.value
+                        if isinstance(
+                            latest_visual_proposal_admission,
+                            PlanAdmissionStatus,
+                        )
+                        else latest_visual_proposal_admission
+                    ),
+                    "handoff_status": (
+                        latest_visual_proposal_handoff_status.value
+                        if isinstance(
+                            latest_visual_proposal_handoff_status,
+                            PlanHandoffStatus,
+                        )
+                        else latest_visual_proposal_handoff_status
+                    ),
+                    "near_term_route_status": (
+                        latest_visual_proposal_route_assessment
+                        .near_term_route_status.value
+                        if latest_visual_proposal_route_assessment
+                        is not None
+                        else None
+                    ),
+                    "full_path_route_status": (
+                        latest_visual_proposal_route_assessment
+                        .full_path_route_status.value
+                        if latest_visual_proposal_route_assessment
+                        is not None
+                        else None
+                    ),
+                }
+            active_visualization = None
+            if current_plan is not None and current_simulation_time_s is not None:
+                active_first_future_index = int(
+                    np.searchsorted(
+                        current_plan.waypoint_times_s,
+                        float(current_simulation_time_s),
+                        side="right",
+                    )
+                )
+                active_remaining_points = current_plan.world_points[
+                    active_first_future_index:
+                ]
+                active_remaining_path_length_m = 0.0
+                if len(active_remaining_points) > 1:
+                    active_remaining_path_length_m = float(
+                        np.linalg.norm(
+                            np.diff(active_remaining_points[:, :2], axis=0),
+                            axis=1,
+                        ).sum()
+                    )
+                active_visualization = {
+                    "plan_id": current_plan.plan_id,
+                    "first_future_index": active_first_future_index,
+                    "remaining_point_count": int(len(active_remaining_points)),
+                    "remaining_path_length_m": active_remaining_path_length_m,
+                }
             return emit_runtime_event(
                 event_type,
                 loop_tick_id=int(frame_count),
@@ -3137,7 +3259,9 @@ def main():
                 safety_assessment=safety_assessment,
                 rejection_reason=rejection_reason,
                 proposal_plan_id=latest_proposal_plan_id,
+                proposal_visualization=proposal_visualization,
                 active_plan_id=current_plan_id,
+                active_visualization=active_visualization,
                 plan_admission_status=(
                     current_plan_admission_status.value
                     if isinstance(current_plan_admission_status, PlanAdmissionStatus)
@@ -3220,6 +3344,11 @@ def main():
                 ),
                 source_plan_loop_tick_id=current_plan_source_loop_tick_id,
                 prompt_revision=nav_state.revision,
+                navigation_context=(
+                    current_navigation_context.to_json_dict()
+                    if current_navigation_context is not None
+                    else None
+                ),
                 respawn_revision=respawn_revision,
                 inference_pending=bool(pending_inference),
                 collision_count=carla_if.get_episode_collision_count(),
@@ -3470,6 +3599,10 @@ def main():
             nonlocal current_plan_admission_status, current_road_envelope
             nonlocal current_route_assessment
             nonlocal current_coc_semantic_audit
+            nonlocal latest_visual_proposal_plan
+            nonlocal latest_visual_proposal_route_assessment
+            nonlocal latest_visual_proposal_admission
+            nonlocal latest_visual_proposal_handoff_status
             nonlocal latest_proposal_plan_id, latest_candidate_admission_status
             nonlocal latest_handoff_status
             nonlocal last_applied_control_echo
@@ -3478,6 +3611,7 @@ def main():
             nonlocal current_navigation_context
             nonlocal route_unavailable_since_s
             nonlocal last_route_replan_attempt_s
+            nonlocal actual_path_history_world
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
             _clear_retained_standby("respawn")
@@ -3528,6 +3662,10 @@ def main():
             current_road_envelope = None
             current_route_assessment = None
             current_coc_semantic_audit = None
+            latest_visual_proposal_plan = None
+            latest_visual_proposal_route_assessment = None
+            latest_visual_proposal_admission = None
+            latest_visual_proposal_handoff_status = None
             latest_proposal_plan_id = None
             latest_candidate_admission_status = None
             latest_handoff_status = None
@@ -3561,6 +3699,7 @@ def main():
                 collision_count=carla_if.get_collision_count(),
             )
             frame_buffer.clear()
+            actual_path_history_world.clear()
             _clear_async_queues("respawn")
             emit_runtime_event(
                 "respawn",
@@ -3893,12 +4032,17 @@ def main():
             nonlocal current_plan_admission_status, current_road_envelope
             nonlocal current_route_assessment
             nonlocal current_coc_semantic_audit
+            nonlocal latest_visual_proposal_plan
+            nonlocal latest_visual_proposal_route_assessment
+            nonlocal latest_visual_proposal_admission
+            nonlocal latest_visual_proposal_handoff_status
             nonlocal latest_proposal_plan_id
             nonlocal latest_candidate_admission_status
             nonlocal latest_handoff_status
             nonlocal active_plan_availability
             nonlocal pending_inference, pending_request_id
             nonlocal last_seen_nav_revision
+            nonlocal last_inference_submit_simulation_time_s
 
             _clear_retained_standby(reason)
             prev_selected_trajectory = None
@@ -3913,6 +4057,10 @@ def main():
             current_road_envelope = None
             current_route_assessment = None
             current_coc_semantic_audit = None
+            latest_visual_proposal_plan = None
+            latest_visual_proposal_route_assessment = None
+            latest_visual_proposal_admission = None
+            latest_visual_proposal_handoff_status = None
             latest_proposal_plan_id = None
             latest_candidate_admission_status = None
             latest_handoff_status = None
@@ -3931,6 +4079,9 @@ def main():
             )
             pending_inference = False
             pending_request_id = None
+            # A semantic route transition must not wait for the previous
+            # one-second cadence before requesting freshly conditioned output.
+            last_inference_submit_simulation_time_s = None
             if safety_adapter is not None:
                 clear_plan_caches = getattr(
                     safety_adapter,
@@ -4158,6 +4309,20 @@ def main():
             current_carla_frame_id = observation_entry["frame_id"]
             current_simulation_time_s = observation_entry["simulation_time_s"]
             current_frame_id_quality = observation_entry["frame_id_quality"]
+            if state.get("pose_world") is not None:
+                actual_path_history_world.append(
+                    np.asarray(
+                        state["pose_world"],
+                        dtype=np.float64,
+                    )[:3, 3].copy()
+                )
+            elif all(axis in state for axis in ("x", "y", "z")):
+                actual_path_history_world.append(
+                    np.asarray(
+                        [state["x"], state["y"], state["z"]],
+                        dtype=np.float64,
+                    )
+                )
             if route_tracker is not None:
                 ego_xyz = tuple(
                     float(value)
@@ -5408,6 +5573,55 @@ def main():
                         relative_last_safe_index = min(
                             authorized_relative_indices
                         )
+                    proposal_world_trajectory = None
+                    proposal_age_s = None
+                    if latest_visual_proposal_plan is not None:
+                        proposal_age_s = max(
+                            0.0,
+                            float(current_simulation_time_s)
+                            - float(
+                                latest_visual_proposal_plan.source_simulation_time_s
+                            ),
+                        )
+                        proposal_first_future_index = int(
+                            np.searchsorted(
+                                latest_visual_proposal_plan.waypoint_times_s,
+                                float(current_simulation_time_s),
+                                side="right",
+                            )
+                        )
+                        proposal_world_trajectory = (
+                            latest_visual_proposal_plan.world_points[
+                                proposal_first_future_index:
+                            ]
+                        )
+                    route_reference_world = None
+                    if route_plan is not None and route_tracker is not None:
+                        route_start_index = int(route_tracker.route_index)
+                        route_start_distance = float(
+                            route_plan.cumulative_distance_m[route_start_index]
+                        )
+                        route_end_index = route_start_index
+                        while (
+                            route_end_index + 1 < len(route_plan.points)
+                            and float(
+                                route_plan.cumulative_distance_m[
+                                    route_end_index + 1
+                                ]
+                            )
+                            - route_start_distance
+                            <= 60.0
+                        ):
+                            route_end_index += 1
+                        route_reference_world = np.asarray(
+                            [
+                                point.xyz
+                                for point in route_plan.points[
+                                    route_start_index : route_end_index + 1
+                                ]
+                            ],
+                            dtype=np.float64,
+                        )
                     coc_issue_count = 0
                     if current_coc_semantic_audit is not None:
                         audit_counts = current_coc_semantic_audit.to_json_dict()[
@@ -5488,6 +5702,54 @@ def main():
                         coc_issue_count=coc_issue_count,
                         last_safe_waypoint_index=relative_last_safe_index,
                         camera_alignment_mode=args.camera_alignment,
+                        proposal_world_trajectory=proposal_world_trajectory,
+                        proposal_source_frame_id=(
+                            latest_visual_proposal_plan.source_frame_id
+                            if latest_visual_proposal_plan is not None
+                            else None
+                        ),
+                        proposal_source_age_s=proposal_age_s,
+                        proposal_plan_id=(
+                            latest_visual_proposal_plan.plan_id
+                            if latest_visual_proposal_plan is not None
+                            else None
+                        ),
+                        proposal_admission_status=(
+                            latest_visual_proposal_admission.value
+                            if isinstance(
+                                latest_visual_proposal_admission,
+                                PlanAdmissionStatus,
+                            )
+                            else latest_visual_proposal_admission
+                        ),
+                        proposal_near_term_route_status=(
+                            latest_visual_proposal_route_assessment
+                            .near_term_route_status.value
+                            if latest_visual_proposal_route_assessment
+                            is not None
+                            else None
+                        ),
+                        proposal_full_path_route_status=(
+                            latest_visual_proposal_route_assessment
+                            .full_path_route_status.value
+                            if latest_visual_proposal_route_assessment
+                            is not None
+                            else None
+                        ),
+                        proposal_handoff_status=(
+                            latest_visual_proposal_handoff_status.value
+                            if isinstance(
+                                latest_visual_proposal_handoff_status,
+                                PlanHandoffStatus,
+                            )
+                            else latest_visual_proposal_handoff_status
+                        ),
+                        active_plan_id=current_plan.plan_id,
+                        route_reference_world=route_reference_world,
+                        actual_history_world=np.asarray(
+                            actual_path_history_world,
+                            dtype=np.float64,
+                        ),
                     )
                     latest_ui_frame = vis_frame
                     if cfg.SAVE_VIDEO:

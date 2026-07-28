@@ -11,6 +11,7 @@ from module.visualization import (
     create_open_loop_visualization_frame,
     create_visualization_frame,
     project_trajectory_to_image,
+    project_world_polyline_to_image,
     project_world_points_to_camera,
     project_world_trajectory_to_image,
     save_open_loop_video,
@@ -165,6 +166,28 @@ def test_calibrated_world_trajectory_distinguishes_safe_future_and_first_bad():
     assert np.any(np.all(rendered == (0, 255, 80), axis=2))
     assert np.any(np.all(rendered == (255, 210, 0), axis=2))
     assert np.any(np.all(rendered == (255, 0, 0), axis=2))
+
+
+def test_diagnostic_world_polyline_uses_distinct_color_and_dash_pattern():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [[2.0, 0.0, 0.0], [4.0, 0.1, 0.0], [6.0, 0.2, 0.0], [8.0, 0.3, 0.0]]
+    )
+
+    rendered = project_world_polyline_to_image(
+        image,
+        points,
+        np.eye(4),
+        intrinsic,
+        color=(255, 80, 255),
+        dashed=True,
+    )
+
+    assert np.any(np.all(rendered == (255, 80, 255), axis=2))
 
 
 def test_create_visualization_frame_preserves_rgb_shape_and_adds_overlay():

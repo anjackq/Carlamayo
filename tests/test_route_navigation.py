@@ -2,6 +2,7 @@ import pytest
 
 from module.route_navigation import (
     NavigationAction,
+    NavigationManeuverPhase,
     RouteNavigationTracker,
     RoutePoint,
     RouteTrackerStatus,
@@ -47,6 +48,11 @@ def test_prompt_distance_buckets_and_close_range_omission():
         NavigationAction.STRAIGHT,
         10.0,
     ) == "Continue straight at the next junction."
+    assert format_navigation_prompt(
+        NavigationAction.RIGHT,
+        0.0,
+        maneuver_phase=NavigationManeuverPhase.ACTIVE,
+    ) == "Follow the current lane through the right turn."
 
 
 def test_route_rejects_lane_change_edges():
@@ -131,6 +137,38 @@ def test_tracker_association_is_monotonic_and_epoch_changes_by_maneuver():
         source_simulation_time_s=3.1,
     )
     assert tracker.route_index >= 3
+
+
+def test_active_turn_phase_replaces_stale_next_junction_prompt_and_epoch():
+    route = build_route_plan(
+        [
+            _point(0),
+            _point(10),
+            _point(20, option="RIGHT", road=2, junction=True),
+            _point(30, option="RIGHT", road=2, junction=True),
+            _point(40, road=3),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+    approach = tracker.update(
+        (0.0, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+    )
+    active = tracker.update(
+        (30.0, 0.0, 0.0),
+        source_frame_id=2,
+        source_simulation_time_s=0.2,
+    )
+
+    assert approach.context.maneuver_phase is NavigationManeuverPhase.APPROACH
+    assert approach.context.text == "Turn right at the next junction in 20m."
+    assert active.context.maneuver_phase is NavigationManeuverPhase.ACTIVE
+    assert active.context.text == "Follow the current lane through the right turn."
+    assert active.context.target_route_index == 2
+    assert active.context.conditioning_epoch == 1
+    assert active.epoch_changed
+    assert active.context.maneuver_id.endswith(":active")
 
 
 def test_route_loss_is_fail_closed_without_epoch_change():

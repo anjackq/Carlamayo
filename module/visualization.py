@@ -138,6 +138,50 @@ def project_world_trajectory_to_image(
     return result
 
 
+def project_world_polyline_to_image(
+    cam_img,
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+    *,
+    color,
+    thickness=4,
+    dashed=False,
+):
+    """Draw one diagnostic world polyline without implying control authority."""
+
+    result = np.asarray(cam_img).copy()
+    points = np.asarray(world_points, dtype=np.float64)
+    if len(points) < 2:
+        return result
+    pixels, valid = project_world_points_to_camera(
+        points,
+        camera_pose_world,
+        camera_intrinsic,
+    )
+    height, width = result.shape[:2]
+    inside = (
+        valid
+        & (pixels[:, 0] >= 0.0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0.0)
+        & (pixels[:, 1] < height)
+    )
+    for index in range(len(pixels) - 1):
+        if dashed and index % 2:
+            continue
+        if inside[index] and inside[index + 1]:
+            cv2.line(
+                result,
+                tuple(np.rint(pixels[index]).astype(np.int32)),
+                tuple(np.rint(pixels[index + 1]).astype(np.int32)),
+                tuple(int(channel) for channel in color),
+                int(thickness),
+                cv2.LINE_AA,
+            )
+    return result
+
+
 def _project_one_trajectory(
     result,
     points_3d,
@@ -266,20 +310,70 @@ def create_visualization_frame(
     coc_issue_count=0,
     last_safe_waypoint_index=None,
     camera_alignment_mode="baseline",
+    proposal_world_trajectory=None,
+    proposal_source_frame_id=None,
+    proposal_source_age_s=None,
+    proposal_plan_id=None,
+    proposal_admission_status=None,
+    proposal_near_term_route_status=None,
+    proposal_full_path_route_status=None,
+    proposal_handoff_status=None,
+    active_plan_id=None,
+    route_reference_world=None,
+    actual_history_world=None,
 ):
-    """Create a single visualization frame with all overlays."""
-    if (
-        world_trajectory is not None
-        and camera_pose_world is not None
+    """Create a frame that distinguishes prediction, policy, and execution."""
+    calibrated_overlay_available = (
+        camera_pose_world is not None
         and camera_intrinsic is not None
-    ):
-        vis_img = project_world_trajectory_to_image(
-            cam_img,
-            world_trajectory,
-            camera_pose_world,
-            camera_intrinsic,
-            last_safe_waypoint_index=last_safe_waypoint_index,
+        and any(
+            path is not None
+            for path in (
+                world_trajectory,
+                proposal_world_trajectory,
+                route_reference_world,
+                actual_history_world,
+            )
         )
+    )
+    if calibrated_overlay_available:
+        vis_img = np.asarray(cam_img).copy()
+        if route_reference_world is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                route_reference_world,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(0, 220, 255),
+                thickness=4,
+                dashed=True,
+            )
+        if actual_history_world is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                actual_history_world,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(255, 140, 0),
+                thickness=4,
+            )
+        if proposal_world_trajectory is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                proposal_world_trajectory,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(255, 80, 255),
+                thickness=5,
+            )
+        if world_trajectory is not None:
+            vis_img = project_world_trajectory_to_image(
+                vis_img,
+                world_trajectory,
+                camera_pose_world,
+                camera_intrinsic,
+                last_safe_waypoint_index=last_safe_waypoint_index,
+            )
     else:
         vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
     vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
@@ -328,19 +422,46 @@ def create_visualization_frame(
         cv2.LINE_AA,
     )
 
-    source_text = "unknown" if source_frame_id is None else str(source_frame_id)
-    age_text = "unknown" if source_age_s is None else f"{source_age_s:.2f}s"
+    active_source_text = "unknown" if source_frame_id is None else str(source_frame_id)
+    active_age_text = "unknown" if source_age_s is None else f"{source_age_s:.2f}s"
+    proposal_source_text = (
+        "unknown"
+        if proposal_source_frame_id is None
+        else str(proposal_source_frame_id)
+    )
+    proposal_age_text = (
+        "unknown"
+        if proposal_source_age_s is None
+        else f"{proposal_source_age_s:.2f}s"
+    )
+    def _compact_plan_id(value):
+        text = str(value or "none")
+        return text if len(text) <= 28 else "..." + text[-25:]
+
     requested = requested_control or {}
     applied = applied_control or {}
     layer_lines = (
         (
-            f"ALPAMAYO PROPOSAL | source frame {source_text} | age {age_text} | "
-            f"admission={plan_admission_status or 'unknown'} | "
+            f"LATEST ALPAMAYO PROPOSAL [MAGENTA] | "
+            f"id={_compact_plan_id(proposal_plan_id)} | "
+            f"source={proposal_source_text} | "
+            f"age={proposal_age_text} | "
+            f"admission={proposal_admission_status or 'unknown'} | "
+            f"route={proposal_near_term_route_status or 'n/a'}/"
+            f"{proposal_full_path_route_status or 'n/a'} | "
+            f"handoff={proposal_handoff_status or 'n/a'}",
+            (255, 80, 255),
+        ),
+        (
+            f"ACTIVE EXECUTION PLAN [GREEN/YELLOW] | "
+            f"id={_compact_plan_id(active_plan_id)} | "
+            f"source={active_source_text} | "
+            f"age={active_age_text} | admission={plan_admission_status or 'unknown'} | "
             f"road={near_term_road_status or 'unknown'}/"
             f"{full_path_road_status or 'unknown'} | "
             f"route={near_term_route_status or 'n/a'}/"
             f"{full_path_route_status or 'n/a'} | CoC issues={int(coc_issue_count)}",
-            (255, 255, 0),
+            (80, 255, 120),
         ),
         (
             "CONTROLLER EXECUTION | "
@@ -366,7 +487,7 @@ def create_visualization_frame(
         ),
     )
     overlay = vis_img.copy()
-    cv2.rectangle(overlay, (10, 72), (w - 10, 182), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 72), (w - 10, 216), (0, 0, 0), -1)
     vis_img = cv2.addWeighted(overlay, 0.65, vis_img, 0.35, 0)
     for line_index, (line, color) in enumerate(layer_lines):
         cv2.putText(
@@ -379,6 +500,20 @@ def create_visualization_frame(
             2,
             cv2.LINE_AA,
         )
+
+    cv2.putText(
+        vis_img,
+        (
+            "ROUTE: CYAN DASHED | ACTUAL: ORANGE | "
+            "LATEST PROPOSAL: MAGENTA | ACTIVE: GREEN/YELLOW"
+        ),
+        (20, 236),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
     status = "PAUSED" if paused else "RUNNING"
     nav_display = navigation_text or "(no navigation text)"

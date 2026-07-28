@@ -33,6 +33,13 @@ class NavigationAction(str, Enum):
     ARRIVE = "ARRIVE"
 
 
+class NavigationManeuverPhase(str, Enum):
+    """Whether a proved route maneuver is ahead of or underneath the ego."""
+
+    APPROACH = "APPROACH"
+    ACTIVE = "ACTIVE"
+
+
 class RouteTrackerStatus(str, Enum):
     AVAILABLE = "AVAILABLE"
     ARRIVED = "ARRIVED"
@@ -97,6 +104,7 @@ class NavigationContext:
     lane_change_authorized: bool
     source_frame_id: int
     source_simulation_time_s: float
+    maneuver_phase: NavigationManeuverPhase = NavigationManeuverPhase.APPROACH
     tracker_status: RouteTrackerStatus = RouteTrackerStatus.AVAILABLE
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -115,6 +123,7 @@ class NavigationContext:
             "lane_change_authorized": bool(self.lane_change_authorized),
             "source_frame_id": int(self.source_frame_id),
             "source_simulation_time_s": float(self.source_simulation_time_s),
+            "maneuver_phase": self.maneuver_phase.value,
             "tracker_status": self.tracker_status.value,
         }
 
@@ -307,11 +316,21 @@ def quantize_prompt_distance(distance_m: float) -> int | None:
 def format_navigation_prompt(
     action: NavigationAction,
     distance_to_maneuver_m: float,
+    *,
+    maneuver_phase: NavigationManeuverPhase = NavigationManeuverPhase.APPROACH,
 ) -> str:
     """Format one route-provable maneuver and no unsupported scene facts."""
 
     if action is NavigationAction.ARRIVE:
         return "Stop at the destination."
+    if maneuver_phase is NavigationManeuverPhase.ACTIVE:
+        if action is NavigationAction.STRAIGHT:
+            return "Continue straight through the current junction."
+        if action is NavigationAction.LEFT:
+            return "Follow the current lane through the left turn."
+        if action is NavigationAction.RIGHT:
+            return "Follow the current lane through the right turn."
+        return "Continue in the current lane."
     bucket = quantize_prompt_distance(distance_to_maneuver_m)
     suffix = "" if bucket is None else f" in {bucket}m"
     if action is NavigationAction.STRAIGHT:
@@ -503,6 +522,21 @@ class RouteNavigationTracker:
 
         self.route_index = max(self.route_index, associated_index)
         action, target_index, maneuver_id = next_maneuver(self.route, self.route_index)
+        maneuver_phase = NavigationManeuverPhase.APPROACH
+        if (
+            action in {
+                NavigationAction.STRAIGHT,
+                NavigationAction.LEFT,
+                NavigationAction.RIGHT,
+            }
+            and target_index <= self.route_index
+            and _route_option_action(
+                self.route.points[self.route_index].road_option
+            )
+            is action
+        ):
+            maneuver_phase = NavigationManeuverPhase.ACTIVE
+            maneuver_id = f"{maneuver_id}:active"
         epoch_changed = self._maneuver_id is not None and maneuver_id != self._maneuver_id
         if epoch_changed:
             self.conditioning_epoch += 1
@@ -519,7 +553,11 @@ class RouteNavigationTracker:
         )
         context = NavigationContext(
             source="route",
-            text=format_navigation_prompt(action, distance_to_maneuver),
+            text=format_navigation_prompt(
+                action,
+                distance_to_maneuver,
+                maneuver_phase=maneuver_phase,
+            ),
             weight=self.weight,
             conditioning_epoch=self.conditioning_epoch,
             route_id=self.route.route_id,
@@ -532,6 +570,7 @@ class RouteNavigationTracker:
             lane_change_authorized=False,
             source_frame_id=int(source_frame_id),
             source_simulation_time_s=float(source_simulation_time_s),
+            maneuver_phase=maneuver_phase,
             tracker_status=status,
         )
         self._last_context = context
@@ -545,6 +584,7 @@ class RouteNavigationTracker:
 __all__ = [
     "NavigationAction",
     "NavigationContext",
+    "NavigationManeuverPhase",
     "ROUTE_ARRIVAL_DISTANCE_M",
     "ROUTE_ASSOCIATION_MAX_DISTANCE_M",
     "ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M",

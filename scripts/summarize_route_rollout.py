@@ -16,7 +16,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from module.carla_route_adapter import FIXED_TOWN03_DESTINATION_XYZ
-from module.route_navigation import NavigationAction, format_navigation_prompt
+from module.route_navigation import (
+    NavigationAction,
+    NavigationManeuverPhase,
+    format_navigation_prompt,
+)
 
 
 STATIONARY_SPEED_MPS = 0.2
@@ -95,12 +99,19 @@ def _prompt_mismatch(context: dict[str, Any]) -> bool:
     try:
         action = NavigationAction(str(context["action"]))
         distance = float(context["distance_to_maneuver_m"])
+        phase = NavigationManeuverPhase(
+            str(context.get("maneuver_phase", "APPROACH"))
+        )
     except (KeyError, TypeError, ValueError):
         return True
     expected = (
         ""
         if context.get("tracker_status") == "ROUTE_UNAVAILABLE"
-        else format_navigation_prompt(action, distance)
+        else format_navigation_prompt(
+            action,
+            distance,
+            maneuver_phase=phase,
+        )
     )
     return str(context.get("text", "")) != expected
 
@@ -233,9 +244,17 @@ def summarize_route_rollout(
         default=int(episode_summary.get("episode_collision_count") or 0),
     )
     prompt_mismatches = sum(_prompt_mismatch(context) for context in contexts)
-    route_unavailable_samples = sum(
+    route_unavailable_contexts = sum(
         context.get("tracker_status") == "ROUTE_UNAVAILABLE"
         for context in contexts
+    )
+    route_unavailable_events = sum(
+        event.get("event_type") == "route_unavailable"
+        for event in events
+    )
+    route_unavailable_samples = max(
+        route_unavailable_contexts,
+        route_unavailable_events,
     )
     unauthorized_acceptances = sum(
         _accepted_unauthorized(candidate) for candidate in candidates

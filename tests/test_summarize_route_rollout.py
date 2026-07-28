@@ -127,6 +127,27 @@ def test_route_summary_detects_absorbing_stop_and_policy_failures():
     assert not summary["gates"]["no_absorbing_stop"]
 
 
+def test_route_summary_accepts_active_maneuver_phase_prompt():
+    context = {
+        **_context(50.0),
+        "distance_to_maneuver_m": 0.0,
+        "maneuver_phase": "ACTIVE",
+        "text": "Follow the current lane through the right turn.",
+    }
+    summary = summarize_route_rollout(
+        [
+            {
+                "event_type": "episode_start",
+                "route_startup_facts": {"route_length_m": 100.0},
+                "navigation_context": context,
+            }
+        ]
+    )
+
+    assert summary["route"]["prompt_truth_mismatch_count"] == 0
+    assert summary["gates"]["prompt_grounded"]
+
+
 def test_route_summary_can_be_json_serialized():
     summary = summarize_route_rollout(
         [
