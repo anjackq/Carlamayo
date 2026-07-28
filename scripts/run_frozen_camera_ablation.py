@@ -60,6 +60,15 @@ def parse_args(argv=None):
     parser.add_argument("--num-traj-samples", type=int, default=3)
     parser.add_argument("--diffusion-temperature", type=float, default=1.0)
     parser.add_argument("--navigation-weight", type=float, default=None)
+    parser.add_argument(
+        "--conditioning-source",
+        choices=("shared-baseline", "per-fixture"),
+        default="shared-baseline",
+        help=(
+            "shared-baseline preserves the camera-only ablation contract; "
+            "per-fixture uses each fixture's matched ego history and navigation."
+        ),
+    )
     parser.add_argument("--quantization", action="store_true")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument(
@@ -182,7 +191,10 @@ def main(argv=None):
     for label, fixture in fixtures.items():
         if not np.array_equal(fixture["camera_ids"], history_reference["camera_ids"]):
             raise ValueError(f"fixture {label!r} has different camera IDs")
-        if fixture["metadata"].get("navigation_text") != reference_navigation:
+        if (
+            args.conditioning_source == "shared-baseline"
+            and fixture["metadata"].get("navigation_text") != reference_navigation
+        ):
             raise ValueError(f"fixture {label!r} has different navigation text")
         history_deltas[label] = {
             "captured_xyz_max_abs_delta_m": float(
@@ -247,6 +259,7 @@ def main(argv=None):
                 "num_traj_samples": args.num_traj_samples,
                 "diffusion_temperature": args.diffusion_temperature,
                 "history_reference_fixture": reference_label,
+                "conditioning_source": args.conditioning_source,
                 "captured_history_deltas": history_deltas,
             },
         )
@@ -270,7 +283,11 @@ def main(argv=None):
                     processor,
                     _model_data(
                         fixture,
-                        history_reference=history_reference,
+                        history_reference=(
+                            fixture
+                            if args.conditioning_source == "per-fixture"
+                            else history_reference
+                        ),
                     ),
                     navigation_text=navigation_text,
                     navigation_weight=navigation_weight,

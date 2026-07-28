@@ -28,6 +28,21 @@ def test_fixture_argument_rejects_missing_label():
         ablation._fixture_argument("/private/baseline.npz")
 
 
+def test_policy_conditioning_mode_is_opt_in():
+    args = ablation.parse_args(
+        [
+            "--fixture",
+            "moving=/private/moving.npz",
+            "--conditioning-source",
+            "per-fixture",
+            "--output",
+            "/private/output.jsonl",
+        ]
+    )
+
+    assert args.conditioning_source == "per-fixture"
+
+
 def test_pairwise_ade_and_candidate_hashes_are_deterministic():
     trajectories = np.zeros((3, 64, 3), dtype=np.float64)
     trajectories[1, :, 0] = 1.0
