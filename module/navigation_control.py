@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .route_navigation import NavigationContext
 
 
 DEFAULT_NAVIGATION_WEIGHT = 1.0
@@ -58,11 +62,17 @@ class NavigationControlState:
         navigation_weight: float = DEFAULT_NAVIGATION_WEIGHT,
         mode: str = "navigation",
         vqa_question: str = "",
+        navigation_source: str = "manual",
     ):
         initial = parse_navigation_command(f"{navigation_text} | {navigation_weight}")
         if mode not in {"normal", "navigation", "vqa"}:
             raise ValueError("mode must be one of: normal, navigation, vqa")
+        if navigation_source not in {"manual", "route"}:
+            raise ValueError("navigation_source must be manual or route")
+        if navigation_source == "route" and mode != "navigation":
+            raise ValueError("route navigation_source requires navigation mode")
         self.mode = mode
+        self.navigation_source = navigation_source
         self.navigation_text = initial.text
         self.navigation_weight = initial.weight
         self.vqa_question = vqa_question.strip()
@@ -93,6 +103,16 @@ class NavigationControlState:
                 weight=self.navigation_weight,
                 revision=self.revision,
             )
+        if self.navigation_source == "route":
+            self.input_text = ""
+            self.last_error = (
+                "Route mode owns navigation text; Ctrl+P may still pause/resume."
+            )
+            return NavigationCommand(
+                text=self.navigation_text,
+                weight=self.navigation_weight,
+                revision=self.revision,
+            )
 
         command = parse_navigation_command(raw, default_weight=self.navigation_weight)
         self.navigation_text = command.text
@@ -105,6 +125,16 @@ class NavigationControlState:
             weight=self.navigation_weight,
             revision=self.revision,
         )
+
+    def apply_route_context(self, context: "NavigationContext") -> None:
+        """Mirror one route-derived source context into model/UI prompt state."""
+
+        if self.navigation_source != "route" or self.mode != "navigation":
+            raise ValueError("route context requires route navigation mode")
+        self.navigation_text = str(context.text)
+        self.navigation_weight = float(context.weight)
+        self.revision = int(context.conditioning_epoch)
+        self.last_error = ""
 
     def set_error(self, message: str) -> None:
         self.last_error = message

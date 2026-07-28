@@ -171,6 +171,7 @@ def _snapshot_plan(plan: FixedWorldTrajectory) -> FixedWorldTrajectory:
         respawn_revision=respawn_revision,
         selected_candidate_index=selected_index,
         terminal_stop_index=terminal_stop_index,
+        navigation_context=plan.navigation_context,
     )
 
 
@@ -383,6 +384,14 @@ class RetainedStandbyPlan:
             "verified_empty_road": bool(self.verified_empty_road),
             "prompt_revision": int(self.plan.prompt_revision),
             "respawn_revision": int(self.plan.respawn_revision),
+            "navigation_context": (
+                self.plan.navigation_context.to_json_dict()
+                if self.plan.navigation_context is not None
+                and callable(
+                    getattr(self.plan.navigation_context, "to_json_dict", None)
+                )
+                else None
+            ),
             "stop_requested": bool(self.plan.stop_requested),
             "horizon_end_s": float(self.plan.horizon_end_s),
             "source_age_s": source_age,

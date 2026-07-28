@@ -22,6 +22,9 @@ def _candidate(
     reserve_status=None,
     reserve=None,
     time_to_bad=None,
+    route_status=None,
+    branch_match=None,
+    route_cross_track=None,
 ):
     return CandidateEvaluation(
         candidate_index=index,
@@ -38,6 +41,9 @@ def _candidate(
         stopping_reserve_status=reserve_status,
         stopping_reserve_m=reserve,
         time_to_first_bad_s=time_to_bad,
+        full_path_route_status=route_status,
+        route_branch_match=branch_match,
+        route_cross_track_error_m=route_cross_track,
     )
 
 
@@ -243,6 +249,34 @@ def test_navigation_direction_breaks_equal_road_quality_before_continuity():
 
     assert selection.selected_index == 1
     assert selection.desired_turn == "right"
+
+
+def test_structured_route_match_replaces_prompt_regex_lateral_heuristic():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                lateral=-2.0,
+                continuity=0.01,
+                route_status="DEVIATE",
+                branch_match=False,
+                route_cross_track=1.0,
+            ),
+            _candidate(
+                1,
+                lateral=2.0,
+                continuity=3.0,
+                route_status="MATCH",
+                branch_match=True,
+                route_cross_track=0.2,
+            ),
+        ],
+        navigation_text="Turn right.",
+        prefer_moving=False,
+    )
+
+    assert selection.selected_index == 1
+    assert selection.selected.route_mismatch_rank == 0.0
 
 
 def test_retain_active_beats_fallback_when_no_candidate_is_admissible():

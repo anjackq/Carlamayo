@@ -74,6 +74,9 @@ class CandidateEvaluation:
     stopping_reserve_status: str | None = None
     stopping_reserve_m: float | None = None
     time_to_first_bad_s: float | None = None
+    full_path_route_status: str | None = None
+    route_branch_match: bool | None = None
+    route_cross_track_error_m: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.candidate_index, bool) or int(self.candidate_index) < 0:
@@ -148,6 +151,35 @@ class CandidateEvaluation:
             "time_to_first_bad_s",
             _finite_or_none(self.time_to_first_bad_s, "time_to_first_bad_s"),
         )
+        route_status = (
+            None
+            if self.full_path_route_status is None
+            else str(self.full_path_route_status).strip().upper() or None
+        )
+        if route_status is not None and route_status not in {
+            "MATCH",
+            "DEVIATE",
+            "UNKNOWN",
+        }:
+            raise ValueError(f"unknown full_path_route_status: {route_status}")
+        object.__setattr__(self, "full_path_route_status", route_status)
+        object.__setattr__(
+            self,
+            "route_branch_match",
+            (
+                None
+                if self.route_branch_match is None
+                else bool(self.route_branch_match)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "route_cross_track_error_m",
+            _finite_or_none(
+                self.route_cross_track_error_m,
+                "route_cross_track_error_m",
+            ),
+        )
 
     @property
     def admitted(self) -> bool:
@@ -207,6 +239,9 @@ class RankedCandidate:
             "stopping_reserve_status": evaluation.stopping_reserve_status,
             "stopping_reserve_m": evaluation.stopping_reserve_m,
             "time_to_first_bad_s": evaluation.time_to_first_bad_s,
+            "full_path_route_status": evaluation.full_path_route_status,
+            "route_branch_match": evaluation.route_branch_match,
+            "route_cross_track_error_m": evaluation.route_cross_track_error_m,
             "category_rank": self.category_rank,
             "reserve_fragility_rank": self.reserve_fragility_rank,
             "motion_quality_rank": self.motion_quality_rank,
@@ -356,6 +391,19 @@ def rank_candidate_evaluations(
                 speed_continuity_rank = abs(
                     candidate.initial_target_speed_mps - current_speed
                 )
+        if candidate.full_path_route_status is not None:
+            route_mismatch_rank = {
+                "MATCH": 0.0,
+                "DEVIATE": 1.0,
+                "UNKNOWN": 2.0,
+            }[candidate.full_path_route_status]
+            if candidate.route_branch_match is False:
+                route_mismatch_rank += 1.0
+        else:
+            route_mismatch_rank = _route_mismatch_rank(
+                candidate.representative_lateral_m,
+                desired_turn,
+            )
         ranked.append(
             RankedCandidate(
                 evaluation=candidate,
@@ -366,10 +414,7 @@ def rank_candidate_evaluations(
                 admission_quality_rank=admission_quality,
                 negative_stopping_reserve_m=reserve_rank,
                 negative_time_to_first_bad_s=time_rank,
-                route_mismatch_rank=_route_mismatch_rank(
-                    candidate.representative_lateral_m,
-                    desired_turn,
-                ),
+                route_mismatch_rank=route_mismatch_rank,
                 negative_full_path_margin=margin_rank,
                 speed_continuity_rank_mps=speed_continuity_rank,
                 continuity_rank_m=continuity_rank,

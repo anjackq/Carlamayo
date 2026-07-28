@@ -97,6 +97,7 @@ class FixedWorldTrajectory:
     respawn_revision: int
     selected_candidate_index: int = 0
     terminal_stop_index: int | None = None
+    navigation_context: Any | None = None
 
     @property
     def horizon_end_s(self) -> float:
@@ -507,6 +508,7 @@ def build_fixed_world_trajectory(
     prompt_revision: int,
     respawn_revision: int,
     selected_candidate_index: int = 0,
+    navigation_context: Any | None = None,
 ) -> FixedWorldTrajectory:
     """Validate and anchor a model trajectory to its capture pose once."""
 
@@ -568,6 +570,7 @@ def build_fixed_world_trajectory(
         respawn_revision=respawn_rev,
         selected_candidate_index=candidate_index,
         terminal_stop_index=terminal_stop_index,
+        navigation_context=navigation_context,
     )
 
 
