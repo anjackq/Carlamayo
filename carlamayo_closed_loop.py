@@ -1550,6 +1550,7 @@ def main():
                 respawn_revision=int(result.get("respawn_revision", respawn_revision)),
                 selected_candidate_index=int(proposal["selected_index"]),
                 navigation_context=result.get("navigation_context"),
+                allow_far_lateral_route_prefix=route_tracker is not None,
             )
             validity = validate_plan_for_execution(
                 plan,
@@ -1580,6 +1581,17 @@ def main():
                 heading_error_deg=alignment.heading_error_deg,
                 stop_requested=bool(plan.stop_requested),
                 terminal_stop_index=plan.terminal_stop_index,
+                first_lateral_limit_violation_index=(
+                    plan.first_lateral_limit_violation_index
+                ),
+                first_lateral_limit_violation_time_s=(
+                    None
+                    if plan.first_lateral_limit_violation_index is None
+                    else (
+                        plan.first_lateral_limit_violation_index + 1
+                    )
+                    * float(cfg.TRAJECTORY_WAYPOINT_DT)
+                ),
                 point_count=int(len(plan.world_points)),
                 capture_pose_world=plan.capture_pose_world,
                 selected_trajectory_model=plan.model_points,
@@ -2244,6 +2256,11 @@ def main():
                     trajectory_motion_profile=(
                         record["motion_profile"].to_json_dict()
                         if record["motion_profile"] is not None
+                        else None
+                    ),
+                    first_lateral_limit_violation_index=(
+                        record["plan"].first_lateral_limit_violation_index
+                        if record["plan"] is not None
                         else None
                     ),
                     motion_profile_compute_ms=record[

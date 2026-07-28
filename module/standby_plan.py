@@ -156,6 +156,16 @@ def _snapshot_plan(plan: FixedWorldTrajectory) -> FixedWorldTrajectory:
         )
         if terminal_stop_index >= len(model_points):
             raise ValueError("plan.terminal_stop_index is out of range")
+    first_lateral_bad = plan.first_lateral_limit_violation_index
+    if first_lateral_bad is not None:
+        first_lateral_bad = _nonnegative_int(
+            first_lateral_bad,
+            "plan.first_lateral_limit_violation_index",
+        )
+        if first_lateral_bad >= len(model_points):
+            raise ValueError(
+                "plan.first_lateral_limit_violation_index is out of range"
+            )
 
     return FixedWorldTrajectory(
         plan_id=plan_id,
@@ -172,6 +182,7 @@ def _snapshot_plan(plan: FixedWorldTrajectory) -> FixedWorldTrajectory:
         selected_candidate_index=selected_index,
         terminal_stop_index=terminal_stop_index,
         navigation_context=plan.navigation_context,
+        first_lateral_limit_violation_index=first_lateral_bad,
     )
 
 

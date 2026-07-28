@@ -96,6 +96,63 @@ def test_stationary_stop_still_validates_jump_from_capture_origin():
         validate_model_trajectory(impossible_stop)
 
 
+def test_route_prefix_can_defer_only_far_lateral_limit_violation():
+    points = _moving_points()
+    points[11:16, 1] = np.linspace(2.5, 12.5, 5)
+    points[16:, 1] = 12.5
+
+    with pytest.raises(
+        TrajectoryValidationError,
+        match="excessive_lateral_displacement",
+    ):
+        build_fixed_world_trajectory(
+            plan_id="strict",
+            source_frame_id=1,
+            source_simulation_time_s=1.0,
+            capture_pose_world=np.eye(4),
+            model_points=points,
+            coc_text="",
+            prompt_revision=0,
+            respawn_revision=0,
+        )
+
+    plan = build_fixed_world_trajectory(
+        plan_id="route-prefix",
+        source_frame_id=1,
+        source_simulation_time_s=1.0,
+        capture_pose_world=np.eye(4),
+        model_points=points,
+        coc_text="",
+        prompt_revision=0,
+        respawn_revision=0,
+        allow_far_lateral_route_prefix=True,
+    )
+
+    assert plan.first_lateral_limit_violation_index == 15
+
+
+def test_route_prefix_does_not_defer_near_term_lateral_violation():
+    points = _moving_points()
+    points[10:15, 1] = np.linspace(2.5, 12.5, 5)
+    points[15:, 1] = 12.5
+
+    with pytest.raises(
+        TrajectoryValidationError,
+        match="excessive_lateral_displacement",
+    ):
+        build_fixed_world_trajectory(
+            plan_id="near-lateral",
+            source_frame_id=1,
+            source_simulation_time_s=1.0,
+            capture_pose_world=np.eye(4),
+            model_points=points,
+            coc_text="",
+            prompt_revision=0,
+            respawn_revision=0,
+            allow_far_lateral_route_prefix=True,
+        )
+
+
 def test_plan_is_anchored_once_to_an_owned_capture_pose():
     capture_pose = pose_matrix_from_components(10.0, 20.0, 1.0, yaw_deg=90.0)
     points = _moving_points(step_m=1.0)

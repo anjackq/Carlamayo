@@ -98,6 +98,7 @@ class FixedWorldTrajectory:
     selected_candidate_index: int = 0
     terminal_stop_index: int | None = None
     navigation_context: Any | None = None
+    first_lateral_limit_violation_index: int | None = None
 
     @property
     def horizon_end_s(self) -> float:
@@ -456,7 +457,21 @@ def detect_terminal_stop_index(
     return None
 
 
-def validate_model_trajectory(points: Any) -> tuple[np.ndarray, int | None]:
+def first_lateral_limit_violation_index(points: Any) -> int | None:
+    """Return the first waypoint outside the coarse model-frame lateral bound."""
+
+    array = _trajectory_array(points)
+    bad = np.flatnonzero(
+        np.abs(array[:, 1]) > float(cfg.TRAJECTORY_MAX_LATERAL_M)
+    )
+    return None if len(bad) == 0 else int(bad[0])
+
+
+def validate_model_trajectory(
+    points: Any,
+    *,
+    allow_far_lateral_route_prefix: bool = False,
+) -> tuple[np.ndarray, int | None]:
     """Validate one strict ``(64, 3)`` model proposal and find stop intent."""
 
     array = _trajectory_array(points)
@@ -471,10 +486,18 @@ def validate_model_trajectory(points: Any) -> tuple[np.ndarray, int | None]:
     )
     if float(np.max(steps, initial=0.0)) > float(cfg.TRAJECTORY_MAX_STEP_M):
         raise TrajectoryValidationError("excessive_waypoint_step")
-    if float(np.max(np.abs(array[:, 1]), initial=0.0)) > float(
-        cfg.TRAJECTORY_MAX_LATERAL_M
-    ):
-        raise TrajectoryValidationError("excessive_lateral_displacement")
+    first_lateral_bad = first_lateral_limit_violation_index(array)
+    if first_lateral_bad is not None:
+        first_lateral_bad_time_s = (
+            first_lateral_bad + 1
+        ) * float(cfg.TRAJECTORY_WAYPOINT_DT)
+        if (
+            not allow_far_lateral_route_prefix
+            or first_lateral_bad_time_s
+            <= float(cfg.SAFETY_EXECUTION_HORIZON_S)
+            + float(cfg.TRAJECTORY_TIME_EPSILON_S)
+        ):
+            raise TrajectoryValidationError("excessive_lateral_displacement")
 
     terminal_stop_index = detect_terminal_stop_index(array)
     if terminal_stop_index is None:
@@ -509,6 +532,7 @@ def build_fixed_world_trajectory(
     respawn_revision: int,
     selected_candidate_index: int = 0,
     navigation_context: Any | None = None,
+    allow_far_lateral_route_prefix: bool = False,
 ) -> FixedWorldTrajectory:
     """Validate and anchor a model trajectory to its capture pose once."""
 
@@ -520,7 +544,11 @@ def build_fixed_world_trajectory(
     respawn_rev = _nonnegative_int(respawn_revision, "respawn_revision")
     candidate_index = _nonnegative_int(selected_candidate_index, "selected_candidate_index")
 
-    points, terminal_stop_index = validate_model_trajectory(model_points)
+    points, terminal_stop_index = validate_model_trajectory(
+        model_points,
+        allow_far_lateral_route_prefix=allow_far_lateral_route_prefix,
+    )
+    first_lateral_bad = first_lateral_limit_violation_index(points)
     try:
         pose = np.array(capture_pose_world, dtype=np.float64, copy=True)
     except (TypeError, ValueError) as exc:
@@ -571,6 +599,7 @@ def build_fixed_world_trajectory(
         selected_candidate_index=candidate_index,
         terminal_stop_index=terminal_stop_index,
         navigation_context=navigation_context,
+        first_lateral_limit_violation_index=first_lateral_bad,
     )
 
 

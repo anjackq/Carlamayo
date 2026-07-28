@@ -98,6 +98,7 @@ def audit_candidate(
     candidate_index: int,
     world_map=None,
     carla_module=None,
+    allow_far_lateral_route_prefix: bool = False,
 ) -> dict[str, Any]:
     metadata = fixture["metadata"]
     source_time = float(fixture["simulation_times_s"][-1])
@@ -118,6 +119,7 @@ def audit_candidate(
             respawn_revision=0,
             selected_candidate_index=candidate_index,
             navigation_context=navigation_context,
+            allow_far_lateral_route_prefix=allow_far_lateral_route_prefix,
         )
         motion = compute_trajectory_motion_profile(plan, source_time)
         route = _route_from_metadata(metadata)
@@ -191,6 +193,11 @@ def audit_candidate(
         "navigation_action": action,
         "navigation_direction_match": direction_match,
         "motion_profile": motion.to_json_dict() if motion is not None else None,
+        "first_lateral_limit_violation_index": (
+            plan.first_lateral_limit_violation_index
+            if plan is not None
+            else None
+        ),
         "route_assessment": (
             route_assessment.to_json_dict()
             if route_assessment is not None
@@ -209,6 +216,7 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         motion_counts: Counter[str] = Counter()
         route_counts: Counter[str] = Counter()
         request_moving: dict[int, bool] = defaultdict(bool)
+        request_near_route_match: dict[int, bool] = defaultdict(bool)
         request_route_match: dict[int, bool] = defaultdict(bool)
         direction_evaluable = 0
         direction_mismatch = 0
@@ -228,6 +236,8 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 if isinstance(route, dict):
                     status = str(route.get("near_term_route_status"))
                     route_counts[status] += 1
+                    if status == "MATCH":
+                        request_near_route_match[request_seed] = True
                     if status == "MATCH" and route.get("branch_match") is True:
                         request_route_match[request_seed] = True
                 match = candidate.get("navigation_direction_match")
@@ -247,6 +257,11 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 else None
             ),
             "near_term_route_status_counts": dict(sorted(route_counts.items())),
+            "near_term_route_match_coverage_at_k": (
+                sum(request_near_route_match.values()) / request_count
+                if request_count and route_counts
+                else None
+            ),
             "route_match_branch_coverage_at_k": (
                 sum(request_route_match.values()) / request_count
                 if request_count and route_counts
@@ -272,6 +287,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--opendrive", type=Path)
+    parser.add_argument(
+        "--allow-route-safe-prefix-lateral",
+        action="store_true",
+        help=(
+            "Mirror route-mode production behavior: a coarse lateral-limit "
+            "violation after 1.5 s is assessed by exact route/road gates."
+        ),
+    )
     parser.add_argument("--output", type=_outside_repository, required=True)
     args = parser.parse_args(argv)
     labels = [label for label, _ in args.fixture]
@@ -313,6 +336,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         candidate_index=index,
                         world_map=world_map,
                         carla_module=carla_module,
+                        allow_far_lateral_route_prefix=(
+                            args.allow_route_safe_prefix_lateral
+                        ),
                     )
                     for index, candidate in enumerate(event.get("candidates", ()))
                 ],
