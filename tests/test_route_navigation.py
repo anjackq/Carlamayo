@@ -73,6 +73,29 @@ def test_zero_length_grp_maneuver_transition_is_preserved():
     assert update.context.target_route_index == 2
 
 
+def test_close_straight_entry_and_turn_exit_are_coalesced():
+    route = build_route_plan(
+        [
+            _point(0),
+            _point(10),
+            _point(20, option="STRAIGHT", junction=True),
+            _point(30, road=2),
+            _point(36, option="RIGHT", road=3, junction=True),
+            _point(46, road=4),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+    update = tracker.update(
+        (0.0, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+    )
+
+    assert update.context.action is NavigationAction.RIGHT
+    assert update.context.target_route_index == 4
+    assert update.context.text == "Turn right at the next junction in 40m."
+
+
 def test_tracker_association_is_monotonic_and_epoch_changes_by_maneuver():
     tracker = RouteNavigationTracker(_route())
     initial = tracker.update(

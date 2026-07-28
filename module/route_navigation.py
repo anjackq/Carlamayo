@@ -19,6 +19,7 @@ import numpy as np
 ROUTE_ASSOCIATION_MAX_DISTANCE_M = 3.0
 ROUTE_ARRIVAL_DISTANCE_M = 1.5
 ROUTE_PROMPT_DISTANCE_OMIT_M = 15.0
+ROUTE_MANEUVER_COALESCE_DISTANCE_M = 18.0
 
 
 class NavigationAction(str, Enum):
@@ -217,6 +218,37 @@ def next_maneuver(
     remaining = route.length_m - route.cumulative_distance_m[start]
     if remaining <= ROUTE_ARRIVAL_DISTANCE_M:
         return NavigationAction.ARRIVE, len(route.points) - 1, f"{route.route_id}:arrive"
+    def _coalesce_straight_entry(
+        action: NavigationAction,
+        action_index: int,
+    ) -> tuple[NavigationAction, int]:
+        if action is not NavigationAction.STRAIGHT:
+            return action, action_index
+        run_option = route.points[action_index].road_option
+        scan = action_index + 1
+        while (
+            scan < len(route.points)
+            and route.points[scan].road_option == run_option
+        ):
+            scan += 1
+        while scan < len(route.points):
+            next_action = _route_option_action(
+                route.points[scan].road_option
+            )
+            if next_action in {
+                NavigationAction.LEFT,
+                NavigationAction.RIGHT,
+            }:
+                separation = (
+                    route.cumulative_distance_m[scan]
+                    - route.cumulative_distance_m[action_index]
+                )
+                if separation <= ROUTE_MANEUVER_COALESCE_DISTANCE_M:
+                    return next_action, scan
+                break
+            scan += 1
+        return action, action_index
+
     active_action = _route_option_action(route.points[start].road_option)
     if active_action is not None:
         run_start = start
@@ -226,10 +258,15 @@ def next_maneuver(
             == route.points[start].road_option
         ):
             run_start -= 1
-        return (
+        selected_action, selected_index = _coalesce_straight_entry(
             active_action,
-            start,
-            f"{route.route_id}:{active_action.value}:{run_start}",
+            run_start,
+        )
+        return (
+            selected_action,
+            selected_index,
+            f"{route.route_id}:{selected_action.value}:"
+            f"{selected_index if selected_index != run_start else run_start}",
         )
     for index in range(start, len(route.points)):
         action = _route_option_action(route.points[index].road_option)
@@ -242,7 +279,15 @@ def next_maneuver(
                 == route.points[index].road_option
             ):
                 continue
-            return action, index, f"{route.route_id}:{action.value}:{index}"
+            selected_action, selected_index = _coalesce_straight_entry(
+                action,
+                index,
+            )
+            return (
+                selected_action,
+                selected_index,
+                f"{route.route_id}:{selected_action.value}:{selected_index}",
+            )
     return (
         NavigationAction.FOLLOW_LANE,
         len(route.points) - 1,
@@ -367,6 +412,7 @@ __all__ = [
     "NavigationContext",
     "ROUTE_ARRIVAL_DISTANCE_M",
     "ROUTE_ASSOCIATION_MAX_DISTANCE_M",
+    "ROUTE_MANEUVER_COALESCE_DISTANCE_M",
     "RouteNavigationTracker",
     "RoutePlan",
     "RoutePoint",
