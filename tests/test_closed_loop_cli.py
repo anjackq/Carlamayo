@@ -219,6 +219,29 @@ def test_route_navigation_arguments_resolve_agents_path(tmp_path):
     )
     assert args.carla_python_api_path == str(api_path.resolve())
     assert args.navigation_text == ""
+    assert args.route_lateral_safe_prefix is False
+
+
+def test_route_lateral_safe_prefix_is_explicit_opt_in(tmp_path):
+    api_path = tmp_path / "PythonAPI" / "carla"
+    marker = api_path / "agents" / "navigation" / "global_route_planner.py"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("# test marker\n", encoding="utf-8")
+
+    args = closed_loop.parse_args(
+        [
+            "--mode",
+            "navigation",
+            "--navigation-source",
+            "route",
+            "--route-destination=-43.350975,-2.8402605,0",
+            "--carla-python-api-path",
+            str(api_path),
+            "--route-lateral-safe-prefix",
+        ]
+    )
+
+    assert args.route_lateral_safe_prefix is True
 
 
 @pytest.mark.parametrize(
@@ -242,6 +265,7 @@ def test_route_navigation_arguments_resolve_agents_path(tmp_path):
             "Turn right.",
         ],
         ["--route-destination=1,2,3"],
+        ["--route-lateral-safe-prefix"],
     ],
 )
 def test_route_navigation_invalid_argument_combinations_fail_fast(arguments):

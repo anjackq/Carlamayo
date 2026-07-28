@@ -544,6 +544,15 @@ def parse_args(argv=None):
         help="Finite Driving-lane destination required by --navigation-source route.",
     )
     parser.add_argument(
+        "--route-lateral-safe-prefix",
+        action="store_true",
+        help=(
+            "Opt-in research mode: allow excessive lateral displacement only "
+            "after the 1.5 s execution horizon, while retaining exact road and "
+            "route authorization. Strict lateral validation remains the default."
+        ),
+    )
+    parser.add_argument(
         "--carla-python-api-path",
         default=None,
         metavar="PATH",
@@ -705,6 +714,10 @@ def parse_args(argv=None):
             parser.error(str(exc))
     elif args.route_destination is not None:
         parser.error("--route-destination requires --navigation-source route.")
+    if args.route_lateral_safe_prefix and args.navigation_source != "route":
+        parser.error(
+            "--route-lateral-safe-prefix requires --navigation-source route."
+        )
     if args.max_episode_seconds is not None and (
         not math.isfinite(args.max_episode_seconds) or args.max_episode_seconds <= 0.0
     ):
@@ -1550,7 +1563,10 @@ def main():
                 respawn_revision=int(result.get("respawn_revision", respawn_revision)),
                 selected_candidate_index=int(proposal["selected_index"]),
                 navigation_context=result.get("navigation_context"),
-                allow_far_lateral_route_prefix=route_tracker is not None,
+                allow_far_lateral_route_prefix=bool(
+                    route_tracker is not None
+                    and getattr(args, "route_lateral_safe_prefix", False)
+                ),
             )
             validity = validate_plan_for_execution(
                 plan,
@@ -4166,6 +4182,9 @@ def main():
             road_assessment_backend=args.road_assessment_backend,
             road_assessment_workers=args.road_assessment_workers,
             navigation_source=args.navigation_source,
+            route_lateral_safe_prefix=bool(
+                getattr(args, "route_lateral_safe_prefix", False)
+            ),
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
             navigation_context=(
