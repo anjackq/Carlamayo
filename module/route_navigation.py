@@ -21,7 +21,7 @@ ROUTE_ARRIVAL_DISTANCE_M = 1.5
 ROUTE_PROMPT_DISTANCE_OMIT_M = 15.0
 ROUTE_MANEUVER_COALESCE_DISTANCE_M = 18.0
 ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M = 1.5
-ROUTE_JUNCTION_TOPOLOGY_LOOKBACK_M = 3.0
+ROUTE_JUNCTION_TOPOLOGY_LOOKBACK_M = 4.5
 ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M = 18.0
 
 
@@ -161,12 +161,14 @@ def associate_route_index(
     map query still reports the incoming lane.  Prefer the nearest matching
     identity anywhere inside the existing 3 m route corridor.
 
-    Complex junctions can also return a downstream authorized connector for a
-    point that is still geometrically on the current connector.  Canonicalize
-    only that bounded overlap: both samples must be junction samples, the point
-    must remain within 1.5 m of the route, and its road ID must occur from 3 m
-    behind through 18 m ahead in the authorized junction sequence.  Unrelated
-    branches, adjacent lanes, and geometric divergence remain unauthorized.
+    Complex junctions can return an overlapping connector identity, including
+    a different section/lane on the same road, for a point sampled directly
+    from the authorized route.  Canonicalize only that bounded overlap: both
+    samples must be junction samples, the point must remain within 1.5 m of the
+    route, and its road ID must occur from 4.5 m behind through 18 m ahead in
+    the authorized junction sequence.  Unrelated roads and geometric
+    divergence remain unauthorized; adjacent lanes outside junctions retain
+    exact identity enforcement.
     """
 
     point = np.asarray(point_xyz, dtype=np.float64)
@@ -219,7 +221,6 @@ def associate_route_index(
     if (
         lane_is_junction is True
         and geometric_point.is_junction
-        and identity_values[0] != geometric_point.road_id
         and geometric_distance
         <= ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M
     ):

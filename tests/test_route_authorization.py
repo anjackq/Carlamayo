@@ -107,6 +107,51 @@ def test_bounded_future_connector_overlap_is_canonicalized():
     assert "junction_topology_overlap_canonicalized" in assessment.reason_codes
 
 
+def test_same_road_junction_lane_overlap_is_canonicalized():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((4, 0, 0), 1608, 1, -1, True, "RIGHT"),
+            RoutePoint((8, 0, 0), 61, 0, -1, False, "LANEFOLLOW"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=0,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[(3.9, 0, 0)],
+        waypoint_times_s=[0.5],
+        source_simulation_time_s=0.0,
+        lane_facts=[_fact(1608, lane=-3, junction=True)],
+    )
+
+    assert assessment.full_path_route_status is RouteStatus.MATCH
+    assert assessment.lane_change_detected is False
+    assert "junction_topology_overlap_canonicalized" in assessment.reason_codes
+
+
+def test_four_metre_previous_connector_overlap_is_canonicalized():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((4, 0, 0), 1608, 1, -1, True, "RIGHT"),
+            RoutePoint((8, 0, 0), 61, 0, -1, False, "LANEFOLLOW"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=0,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[(3.9, 0, 0)],
+        waypoint_times_s=[0.5],
+        source_simulation_time_s=0.0,
+        lane_facts=[_fact(1577, lane=-3, junction=True)],
+    )
+
+    assert assessment.full_path_route_status is RouteStatus.MATCH
+    assert "junction_topology_overlap_canonicalized" in assessment.reason_codes
+
+
 def test_future_connector_overlap_outside_route_corridor_is_deviation():
     route = build_route_plan(
         [
