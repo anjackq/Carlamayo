@@ -43,6 +43,38 @@ def test_natural_route_curvature_remains_authorized():
     assert assessment.last_authorized_waypoint_index == 3
 
 
+def test_exact_lane_identity_bridges_grp_transition_overlap():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 28, 0, 3, False, "LANEFOLLOW"),
+            RoutePoint((2, 0, 0), 1691, 0, 3, True, "LANEFOLLOW"),
+            RoutePoint((3, 0, 0), 1691, 0, 3, True, "LANEFOLLOW"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=0,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[
+            (1.1, 0, 0),
+            (1.9, 0, 0),
+            (2.1, 0, 0),
+            (3.0, 0, 0),
+        ],
+        waypoint_times_s=[0.5, 1.0, 1.5, 2.0],
+        source_simulation_time_s=0.0,
+        lane_facts=[
+            _fact(28, lane=3),
+            _fact(28, lane=3),
+            _fact(1691, lane=3, junction=True),
+            _fact(1691, lane=3, junction=True),
+        ],
+    )
+    assert assessment.near_term_route_status is RouteStatus.MATCH
+    assert assessment.full_path_route_status is RouteStatus.MATCH
+    assert assessment.last_authorized_waypoint_index == 3
+
+
 def test_wrong_junction_branch_is_deviation_and_prefix_is_bounded():
     assessment = assess_route_candidate(
         route=_route(),

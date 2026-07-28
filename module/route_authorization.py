@@ -9,7 +9,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .route_navigation import ROUTE_ASSOCIATION_MAX_DISTANCE_M, RoutePlan
+from .route_navigation import (
+    ROUTE_ASSOCIATION_MAX_DISTANCE_M,
+    RoutePlan,
+    associate_route_index,
+)
 
 
 ROUTE_EXECUTION_HORIZON_S = 1.5
@@ -130,31 +134,19 @@ def _aggregate_status(statuses: Sequence[RouteStatus]) -> RouteStatus:
 
 
 def _associate_monotonic(
-    route_xy: np.ndarray,
     point_xy: np.ndarray,
     start_index: int,
     *,
     route: RoutePlan,
     candidate_identity: tuple[int, int, int] | None,
 ) -> tuple[int, float]:
-    distances = np.linalg.norm(route_xy[start_index:] - point_xy[None, :], axis=1)
-    relative = int(np.argmin(distances))
-    minimum = float(distances[relative])
-    if candidate_identity is not None:
-        tied = np.flatnonzero(distances <= minimum + 0.25)
-        identity_matches = [
-            int(index)
-            for index in tied
-            if (
-                route.points[start_index + int(index)].road_id,
-                route.points[start_index + int(index)].section_id,
-                route.points[start_index + int(index)].lane_id,
-            )
-            == candidate_identity
-        ]
-        if identity_matches:
-            relative = identity_matches[0]
-    return start_index + relative, float(distances[relative])
+    association = associate_route_index(
+        route,
+        point_xy,
+        start_index=start_index,
+        lane_identity=candidate_identity,
+    )
+    return association.route_index, association.distance_m
 
 
 def assess_route_candidate(
@@ -184,7 +176,6 @@ def assess_route_candidate(
     ):
         raise ValueError("route candidate geometry/timing/lane facts are incompatible")
     route_index = min(max(0, int(current_route_index)), len(route.points) - 1)
-    route_xy = np.asarray([point.xyz[:2] for point in route.points], dtype=np.float64)
     cumulative_candidate = np.concatenate(
         [[0.0], np.cumsum(np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1))]
     )
@@ -215,7 +206,6 @@ def assess_route_candidate(
             reasons.add("map_query_unavailable")
         else:
             associated_index, cross_track = _associate_monotonic(
-                route_xy,
                 point[:2],
                 route_index,
                 route=route,

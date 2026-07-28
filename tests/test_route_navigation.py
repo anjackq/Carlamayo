@@ -145,6 +145,53 @@ def test_route_loss_is_fail_closed_without_epoch_change():
     assert update.context.conditioning_epoch == 0
 
 
+def test_exact_lane_identity_prevents_premature_connector_transition():
+    route = build_route_plan(
+        [
+            _point(0.0, road=28, lane=3),
+            _point(2.0, road=1691, lane=3, junction=True),
+            _point(3.0, road=1691, lane=3, junction=True),
+            _point(10.0, road=25, lane=3),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+
+    incoming = tracker.update(
+        (1.1, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+        ego_lane_identity=(28, 0, 3),
+        require_lane_identity=True,
+    )
+    assert incoming.context.tracker_status is RouteTrackerStatus.AVAILABLE
+    assert tracker.route_index == 0
+    assert incoming.route_distance_m == pytest.approx(1.1)
+
+    connector = tracker.update(
+        (1.9, 0.0, 0.0),
+        source_frame_id=2,
+        source_simulation_time_s=0.2,
+        ego_lane_identity=(1691, 0, 3),
+        require_lane_identity=True,
+    )
+    assert connector.context.tracker_status is RouteTrackerStatus.AVAILABLE
+    assert tracker.route_index == 1
+    assert connector.route_distance_m == pytest.approx(0.1)
+
+
+def test_required_lane_identity_mismatch_is_route_unavailable():
+    tracker = RouteNavigationTracker(_route())
+    update = tracker.update(
+        (0.1, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+        ego_lane_identity=(99, 0, -1),
+        require_lane_identity=True,
+    )
+    assert update.context.tracker_status is RouteTrackerStatus.ROUTE_UNAVAILABLE
+    assert tracker.route_index == 0
+
+
 def test_arrival_context_requests_destination_stop():
     tracker = RouteNavigationTracker(_route())
     update = tracker.update(

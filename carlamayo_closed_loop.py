@@ -943,6 +943,31 @@ def main():
                 print(f"Warning: runtime telemetry disabled after write failure: {exc}")
         return payload
 
+    def update_route_tracker(
+        ego_xyz,
+        *,
+        source_frame_id,
+        source_simulation_time_s,
+    ):
+        """Update route progress using exact CARLA lane identity at transitions."""
+
+        if route_tracker is None or route_carla_module is None:
+            raise RuntimeError("route tracker is unavailable")
+        ego_lane_fact = query_candidate_lane_facts(
+            carla_if.world.get_map(),
+            (ego_xyz,),
+            carla_module=route_carla_module,
+        )[0]
+        return route_tracker.update(
+            ego_xyz,
+            source_frame_id=source_frame_id,
+            source_simulation_time_s=source_simulation_time_s,
+            ego_lane_identity=(
+                ego_lane_fact.identity if ego_lane_fact.available else None
+            ),
+            require_lane_identity=True,
+        )
+
     def draw_pygame_ui(frame_rgb, telemetry):
         if pygame_ui is None:
             return
@@ -1022,7 +1047,7 @@ def main():
                 weight=args.navigation_weight,
             )
             ego_location = carla_if.ego_vehicle.get_transform().location
-            route_update = route_tracker.update(
+            route_update = update_route_tracker(
                 (ego_location.x, ego_location.y, ego_location.z),
                 source_frame_id=0,
                 source_simulation_time_s=0.0,
@@ -3467,7 +3492,7 @@ def main():
                     ),
                 )
                 ego_location = carla_if.ego_vehicle.get_transform().location
-                route_update = route_tracker.update(
+                route_update = update_route_tracker(
                     (ego_location.x, ego_location.y, ego_location.z),
                     source_frame_id=int(current_carla_frame_id or frame_count),
                     source_simulation_time_s=float(
@@ -4136,7 +4161,7 @@ def main():
                         dtype=np.float64,
                     )[:3, 3]
                 )
-                route_update = route_tracker.update(
+                route_update = update_route_tracker(
                     ego_xyz,
                     source_frame_id=int(current_carla_frame_id),
                     source_simulation_time_s=float(current_simulation_time_s),
@@ -4196,7 +4221,7 @@ def main():
                         else:
                             route_plan = replanned_route
                             route_tracker.replace_route(replanned_route)
-                            recovered_update = route_tracker.update(
+                            recovered_update = update_route_tracker(
                                 ego_xyz,
                                 source_frame_id=int(current_carla_frame_id),
                                 source_simulation_time_s=float(

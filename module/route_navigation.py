@@ -123,6 +123,83 @@ class RouteTrackingUpdate:
     route_distance_m: float
 
 
+@dataclass(frozen=True)
+class RouteAssociation:
+    """One monotonic geometric/lane association against an authorized route."""
+
+    route_index: int
+    distance_m: float
+    lane_identity_matched: bool | None
+
+
+def associate_route_index(
+    route: RoutePlan,
+    point_xyz: Sequence[float],
+    *,
+    start_index: int,
+    lane_identity: Sequence[int] | None = None,
+) -> RouteAssociation:
+    """Associate a point while preserving an exact lane through transitions.
+
+    CARLA's OpenDRIVE lane boundary and the one-metre GRP samples do not switch
+    road identity at exactly the same coordinate.  A purely nearest-point
+    association can therefore jump to the junction connector while the exact
+    map query still reports the incoming lane.  Prefer the nearest matching
+    identity anywhere inside the existing 3 m route corridor; identities not
+    present in that corridor remain unauthorized.
+    """
+
+    point = np.asarray(point_xyz, dtype=np.float64)
+    if point.shape not in {(2,), (3,)} or not np.isfinite(point).all():
+        raise ValueError("route association point must contain two or three finite values")
+    start = min(max(0, int(start_index)), len(route.points) - 1)
+    route_xy = np.asarray(
+        [route_point.xyz[:2] for route_point in route.points],
+        dtype=np.float64,
+    )
+    distances = np.linalg.norm(route_xy[start:] - point[None, :2], axis=1)
+    geometric_relative = int(np.argmin(distances))
+    geometric_index = start + geometric_relative
+    geometric_distance = float(distances[geometric_relative])
+
+    if lane_identity is None:
+        return RouteAssociation(
+            route_index=geometric_index,
+            distance_m=geometric_distance,
+            lane_identity_matched=None,
+        )
+    identity_values = tuple(int(value) for value in lane_identity)
+    if len(identity_values) != 3:
+        raise ValueError("lane_identity must contain road, section, and lane")
+    matching_indices = [
+        index
+        for index in range(start, len(route.points))
+        if (
+            route.points[index].road_id,
+            route.points[index].section_id,
+            route.points[index].lane_id,
+        )
+        == identity_values
+    ]
+    if matching_indices:
+        identity_index = min(
+            matching_indices,
+            key=lambda index: (float(np.linalg.norm(route_xy[index] - point[:2])), index),
+        )
+        identity_distance = float(np.linalg.norm(route_xy[identity_index] - point[:2]))
+        if identity_distance <= ROUTE_ASSOCIATION_MAX_DISTANCE_M:
+            return RouteAssociation(
+                route_index=identity_index,
+                distance_m=identity_distance,
+                lane_identity_matched=True,
+            )
+    return RouteAssociation(
+        route_index=geometric_index,
+        distance_m=geometric_distance,
+        lane_identity_matched=False,
+    )
+
+
 def _route_option_action(option: str) -> NavigationAction | None:
     option = str(option).strip().upper()
     return {
@@ -329,17 +406,31 @@ class RouteNavigationTracker:
         *,
         source_frame_id: int,
         source_simulation_time_s: float,
+        ego_lane_identity: Sequence[int] | None = None,
+        require_lane_identity: bool = False,
     ) -> RouteTrackingUpdate:
         ego = np.asarray(ego_xyz, dtype=np.float64)
         if ego.shape != (3,) or not np.isfinite(ego).all():
             raise ValueError("ego_xyz must contain three finite values")
-        points = np.asarray([point.xyz for point in self.route.points], dtype=np.float64)
-        distances = np.linalg.norm(points[self.route_index :, :2] - ego[None, :2], axis=1)
-        relative_index = int(np.argmin(distances))
-        associated_index = self.route_index + relative_index
-        route_distance = float(distances[relative_index])
+        association = associate_route_index(
+            self.route,
+            ego,
+            start_index=self.route_index,
+            lane_identity=ego_lane_identity,
+        )
+        associated_index = association.route_index
+        route_distance = association.distance_m
+        identity_unavailable = require_lane_identity and ego_lane_identity is None
+        identity_mismatch = (
+            require_lane_identity
+            and association.lane_identity_matched is not True
+        )
 
-        if route_distance > ROUTE_ASSOCIATION_MAX_DISTANCE_M:
+        if (
+            route_distance > ROUTE_ASSOCIATION_MAX_DISTANCE_M
+            or identity_unavailable
+            or identity_mismatch
+        ):
             context = NavigationContext(
                 source="route",
                 text="",
@@ -413,11 +504,13 @@ __all__ = [
     "ROUTE_ARRIVAL_DISTANCE_M",
     "ROUTE_ASSOCIATION_MAX_DISTANCE_M",
     "ROUTE_MANEUVER_COALESCE_DISTANCE_M",
+    "RouteAssociation",
     "RouteNavigationTracker",
     "RoutePlan",
     "RoutePoint",
     "RouteTrackerStatus",
     "RouteTrackingUpdate",
+    "associate_route_index",
     "build_route_plan",
     "format_navigation_prompt",
     "next_maneuver",

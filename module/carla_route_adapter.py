@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from .route_navigation import RoutePlan, RoutePoint, build_route_plan
+from .route_navigation import (
+    ROUTE_ASSOCIATION_MAX_DISTANCE_M,
+    RoutePlan,
+    RoutePoint,
+    associate_route_index,
+    build_route_plan,
+)
 from .route_authorization import CandidateLaneFact, RouteStatus
 
 
@@ -298,31 +304,17 @@ def assess_current_route_status(
     )[0]
     if not fact.available:
         return RouteStatus.UNKNOWN
-    start = min(max(0, int(route_index)), len(route.points) - 1)
-    ego_x, ego_y = float(ego_xyz[0]), float(ego_xyz[1])
-    distances = [
-        math.hypot(point.xyz[0] - ego_x, point.xyz[1] - ego_y)
-        for point in route.points[start:]
-    ]
-    minimum = min(distances)
-    if minimum > 3.0:
+    association = associate_route_index(
+        route,
+        ego_xyz,
+        start_index=route_index,
+        lane_identity=fact.identity,
+    )
+    if association.distance_m > ROUTE_ASSOCIATION_MAX_DISTANCE_M:
         return RouteStatus.UNKNOWN
-    candidate_indices = [
-        start + index
-        for index, distance in enumerate(distances)
-        if distance <= minimum + 0.25
-    ]
     return (
         RouteStatus.MATCH
-        if any(
-            fact.identity
-            == (
-                route.points[index].road_id,
-                route.points[index].section_id,
-                route.points[index].lane_id,
-            )
-            for index in candidate_indices
-        )
+        if association.lane_identity_matched is True
         else RouteStatus.DEVIATE
     )
 __all__ = [
