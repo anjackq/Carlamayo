@@ -13,6 +13,8 @@ set -euo pipefail
 CARLAMAYO_REPO_ROOT="/home/aqiu/Desktop/Carlamayo"
 CARLAMAYO_VENV="$CARLAMAYO_REPO_ROOT/a1_5_carla_venv"
 CARLAMAYO_CARLA_ROOT="/home/aqiu/carla"
+export CARLAMAYO_CARLA_ROOT
+export CARLAMAYO_CARLA_PYTHONAPI="$CARLAMAYO_CARLA_ROOT/PythonAPI/carla"
 
 cd "$CARLAMAYO_REPO_ROOT"
 

@@ -25,12 +25,35 @@ from module.carla_safety_adapter import (
     decide_plan_admission,
 )
 from module.camera_fixture import save_camera_fixture
+from module.carla_route_adapter import (
+    assess_current_route_status,
+    CarlaRouteError,
+    FIXED_TOWN03_DESTINATION_XYZ,
+    FIXED_TOWN03_ORIGIN_XYZ,
+    load_global_route_planner,
+    parse_destination_xyz,
+    query_candidate_lane_facts,
+    resolve_carla_python_api_path,
+    trace_carla_route,
+    validate_fixed_town03_route,
+)
+from module.carla_scene_truth import capture_scene_truth_snapshot
 from module.candidate_selector import (
     CandidateEvaluation,
     rank_candidate_evaluations,
 )
 from module.geometry import pose_matrix_from_state
 from module.navigation_control import NavigationControlState
+from module.coc_semantic_audit import audit_coc_semantics
+from module.route_navigation import (
+    RouteNavigationTracker,
+    RouteTrackerStatus,
+)
+from module.route_authorization import (
+    RouteStatus,
+    assess_route_candidate,
+    combine_execution_constraints,
+)
 from module.pid_controller import OfficialPIDFollower
 from module.plan_handoff import (
     PlanHandoffStatus,
@@ -505,6 +528,40 @@ def parse_args(argv=None):
         help="Navigation CFG weight. 1.0 uses normal nav conditioning; other values use CFG nav.",
     )
     parser.add_argument(
+        "--navigation-source",
+        choices=("manual", "route"),
+        default="manual",
+        help=(
+            "Navigation conditioning authority. Default: manual. Route mode "
+            "uses CARLA GlobalRoutePlanner facts and makes prompt text read-only."
+        ),
+    )
+    parser.add_argument(
+        "--route-destination",
+        default=None,
+        metavar="X,Y,Z",
+        help="Finite Driving-lane destination required by --navigation-source route.",
+    )
+    parser.add_argument(
+        "--carla-python-api-path",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Directory containing CARLA's agents package. Resolution order: "
+            "CLI, CARLAMAYO_CARLA_PYTHONAPI, CARLAMAYO_CARLA_ROOT."
+        ),
+    )
+    parser.add_argument(
+        "--no-coc-semantic-audit",
+        dest="coc_semantic_audit",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable source-synchronized diagnostic CoC auditing. This option "
+            "must not alter candidate selection or applied control."
+        ),
+    )
+    parser.add_argument(
         "--num-traj-samples",
         type=int,
         default=cfg.NUM_TRAJ_SAMPLES,
@@ -623,6 +680,30 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.oom_free and args.quantization:
         parser.error("--oom-free and --quantization are mutually exclusive.")
+    if args.navigation_source == "route":
+        if args.mode != "navigation":
+            parser.error("--navigation-source route requires --mode navigation.")
+        if args.navigation_text.strip():
+            parser.error(
+                "--navigation-source route cannot be combined with "
+                "--navigation-text."
+            )
+        if args.route_destination is None:
+            parser.error(
+                "--navigation-source route requires --route-destination X,Y,Z."
+            )
+        try:
+            args.route_destination = parse_destination_xyz(args.route_destination)
+        except ValueError as exc:
+            parser.error(str(exc))
+        try:
+            args.carla_python_api_path = str(
+                resolve_carla_python_api_path(args.carla_python_api_path)
+            )
+        except CarlaRouteError as exc:
+            parser.error(str(exc))
+    elif args.route_destination is not None:
+        parser.error("--route-destination requires --navigation-source route.")
     if args.max_episode_seconds is not None and (
         not math.isfinite(args.max_episode_seconds) or args.max_episode_seconds <= 0.0
     ):
@@ -682,7 +763,11 @@ def parse_args(argv=None):
             args.scenario_seed = cfg.EMPTY_ROAD_SCENARIO_SEED
         if args.ego_spawn_index is None:
             args.ego_spawn_index = cfg.EMPTY_ROAD_EGO_SPAWN_INDEX
-        if args.mode == "navigation" and not args.navigation_text.strip():
+        if (
+            args.mode == "navigation"
+            and args.navigation_source == "manual"
+            and not args.navigation_text.strip()
+        ):
             args.navigation_text = cfg.EMPTY_ROAD_NAVIGATION_TEXT
     args.start_paused = bool(args.pygame_ui)
     args.pygame_ui_video = derive_pygame_ui_video_path(cfg.OUTPUT_VIDEO) if args.pygame_ui else None
@@ -703,6 +788,11 @@ def main():
         print(f"Quantization: {'ON (4-bit)' if args.quantization else 'OFF (full-precision)'}")
     print(f"Execution: {'ASYNC' if args.async_mode else 'SYNC'}")
     print(f"Inference mode: {args.mode}")
+    print(f"Navigation source: {args.navigation_source}")
+    print(
+        "CoC semantic audit: "
+        f"{'ON (diagnostic-only)' if args.coc_semantic_audit else 'OFF'}"
+    )
     print(f"Pygame UI: {'ON' if args.pygame_ui else 'OFF'}")
     print(f"CARLA map: {cfg.CARLA_MAP}")
     print(f"Scenario: {'EMPTY ROAD' if args.empty_road else 'NORMAL TRAFFIC'}")
@@ -735,6 +825,7 @@ def main():
         args.navigation_weight,
         mode=args.mode,
         vqa_question=args.vqa_question,
+        navigation_source=args.navigation_source,
     )
     nav_state.paused = bool(args.start_paused)
     if args.mode == "navigation" and nav_state.navigation_text:
@@ -802,6 +893,15 @@ def main():
     empty_road_preflight = None
     safety_policy = build_safety_policy()
     safety_adapter = None
+    route_tracker = None
+    route_plan = None
+    initial_route_plan = None
+    route_startup_facts = None
+    route_planner_type = None
+    route_carla_module = None
+    current_navigation_context = None
+    route_unavailable_since_s = None
+    last_route_replan_attempt_s = None
 
     def apply_vehicle_control(command):
         """The single low-level gateway for all loop-owned vehicle commands."""
@@ -898,6 +998,51 @@ def main():
             spawn_index=args.ego_spawn_index,
             center_on_driving_lane=args.empty_road,
         )
+        if args.navigation_source == "route":
+            route_planner_type = load_global_route_planner(
+                args.carla_python_api_path,
+            )
+            route_carla_module = importlib.import_module("carla")
+            route_plan, route_startup_facts = trace_carla_route(
+                carla_if.world.get_map(),
+                origin_xyz=FIXED_TOWN03_ORIGIN_XYZ,
+                destination_xyz=args.route_destination,
+                planner_type=route_planner_type,
+                carla_module=route_carla_module,
+                sampling_resolution_m=1.0,
+            )
+            validate_fixed_town03_route(
+                route_plan,
+                route_startup_facts,
+                map_name=carla_if.world.get_map().name,
+            )
+            initial_route_plan = route_plan
+            route_tracker = RouteNavigationTracker(
+                route_plan,
+                weight=args.navigation_weight,
+            )
+            ego_location = carla_if.ego_vehicle.get_transform().location
+            route_update = route_tracker.update(
+                (ego_location.x, ego_location.y, ego_location.z),
+                source_frame_id=0,
+                source_simulation_time_s=0.0,
+            )
+            if (
+                route_update.context.tracker_status
+                is RouteTrackerStatus.ROUTE_UNAVAILABLE
+            ):
+                raise CarlaRouteError(
+                    "spawned ego does not associate with the fixed route: "
+                    f"{route_update.route_distance_m:.3f}m"
+                )
+            current_navigation_context = route_update.context
+            nav_state.apply_route_context(current_navigation_context)
+            print(
+                "Route initialized: "
+                f"id={route_plan.route_id}, points={len(route_plan.points)}, "
+                f"length={route_plan.length_m:.3f}m, "
+                f"prompt={nav_state.navigation_text!r}"
+            )
         carla_if.enable_synchronous_mode()
         fixed_delta_seconds = carla_if.world.get_settings().fixed_delta_seconds
         if fixed_delta_seconds is not None and float(fixed_delta_seconds) > 0.0:
@@ -990,6 +1135,7 @@ def main():
         prev_selected_trajectory = None
         current_selected_traj_idx = 0
         current_cot = ""
+        current_coc_semantic_audit = None
         current_inference_time = 0.0
         vlm_generate_timing = VlmGenerateTiming()
         respawn_monitor = RespawnMonitor(cooldown_frames=cfg.RESPAWN_COLLISION_COOLDOWN_FRAMES)
@@ -1016,6 +1162,7 @@ def main():
             ),
         )
         current_road_envelope = None
+        current_route_assessment = None
         latest_proposal_plan_id = None
         current_carla_frame_id = None
         current_simulation_time_s = None
@@ -1088,6 +1235,11 @@ def main():
                 result_processing_ms=result.get("result_processing_ms"),
                 prompt_revision=request["prompt_revision"],
                 respawn_revision=request["respawn_revision"],
+                navigation_context=(
+                    request["navigation_context"].to_json_dict()
+                    if request.get("navigation_context") is not None
+                    else None
+                ),
                 source_plan_id=result.get("accepted_plan_id"),
                 coc_sha256=result.get("coc_sha256"),
             )
@@ -1229,6 +1381,11 @@ def main():
                     camera_ids=list(result.get("camera_ids", tuple())),
                     prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
                     respawn_revision=int(result.get("respawn_revision", respawn_revision)),
+                    navigation_context=(
+                        result["navigation_context"].to_json_dict()
+                        if result.get("navigation_context") is not None
+                        else None
+                    ),
                     selected_candidate_index=None,
                     candidate_count=0,
                     candidate_similarity_scores=[],
@@ -1273,6 +1430,11 @@ def main():
                 camera_ids=list(result.get("camera_ids", tuple())),
                 prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
                 respawn_revision=int(result.get("respawn_revision", respawn_revision)),
+                navigation_context=(
+                    result["navigation_context"].to_json_dict()
+                    if result.get("navigation_context") is not None
+                    else None
+                ),
                 selected_candidate_index=int(selected_idx),
                 preselected_candidate_index=int(proposal["preselected_index"]),
                 candidate_count=int(len(proposal["trajectory_samples"])),
@@ -1325,6 +1487,11 @@ def main():
                 camera_ids=list(result.get("camera_ids", tuple())),
                 prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
                 respawn_revision=int(result.get("respawn_revision", respawn_revision)),
+                navigation_context=(
+                    result["navigation_context"].to_json_dict()
+                    if result.get("navigation_context") is not None
+                    else None
+                ),
                 selected_candidate_index=None,
                 candidate_count=None,
                 candidate_similarity_scores=None,
@@ -1346,6 +1513,7 @@ def main():
                 prompt_revision=int(result.get("prompt_revision", nav_state.revision)),
                 respawn_revision=int(result.get("respawn_revision", respawn_revision)),
                 selected_candidate_index=int(proposal["selected_index"]),
+                navigation_context=result.get("navigation_context"),
             )
             validity = validate_plan_for_execution(
                 plan,
@@ -1395,6 +1563,8 @@ def main():
             nonlocal current_plan_source_elapsed_proxy_s
             nonlocal current_road_envelope
             nonlocal current_plan_admission_status
+            nonlocal current_route_assessment
+            nonlocal current_coc_semantic_audit
             nonlocal active_plan_availability
 
             current_plan = None
@@ -1404,6 +1574,8 @@ def main():
             current_plan_source_elapsed_proxy_s = None
             current_road_envelope = None
             current_plan_admission_status = None
+            current_route_assessment = None
+            current_coc_semantic_audit = None
             active_plan_availability = decide_active_plan_availability(
                 active_plan_present=False,
                 standard_validity=None,
@@ -1511,6 +1683,7 @@ def main():
             candidate_envelope,
             active_envelope,
             admission_error,
+            candidate_route_assessment=None,
         ):
             nonlocal latest_candidate_admission_status, latest_proposal_plan_id
 
@@ -1542,6 +1715,11 @@ def main():
                     and active_envelope is not None
                     else None
                 ),
+                candidate_route_assessment=(
+                    candidate_route_assessment.to_json_dict()
+                    if candidate_route_assessment is not None
+                    else None
+                ),
             )
 
         def _candidate_path_features(points):
@@ -1562,6 +1740,43 @@ def main():
                 return False
             return actors is not None and len(actors) == 0
 
+        def _assess_plan_route(plan):
+            if (
+                route_tracker is None
+                or route_plan is None
+                or route_carla_module is None
+            ):
+                return None
+            ego_xyz = tuple(
+                float(value)
+                for value in np.asarray(
+                    state["pose_world"],
+                    dtype=np.float64,
+                )[:3, 3]
+            )
+            current_status = assess_current_route_status(
+                carla_if.world.get_map(),
+                ego_xyz,
+                route=route_plan,
+                route_index=route_tracker.route_index,
+                carla_module=route_carla_module,
+            )
+            lane_facts = query_candidate_lane_facts(
+                carla_if.world.get_map(),
+                plan.world_points,
+                carla_module=route_carla_module,
+            )
+            return assess_route_candidate(
+                route=route_plan,
+                current_route_index=route_tracker.route_index,
+                current_route_status=current_status,
+                trajectory_world_points=plan.world_points,
+                waypoint_times_s=plan.waypoint_times_s,
+                source_simulation_time_s=plan.source_simulation_time_s,
+                current_simulation_time_s=float(current_simulation_time_s),
+                lane_facts=lane_facts,
+            )
+
         def _select_road_aware_candidate(result, proposal):
             """Validate and road-rank every sample before choosing one."""
 
@@ -1569,6 +1784,25 @@ def main():
 
             selection_started_s = time.perf_counter()
             active_envelope = _active_plan_road_envelope()
+            active_route_assessment = None
+            if current_plan is not None and route_tracker is not None:
+                try:
+                    active_route_assessment = _assess_plan_route(current_plan)
+                except Exception:
+                    active_route_assessment = None
+            active_route_executable = (
+                route_tracker is None
+                or (
+                    active_route_assessment is not None
+                    and active_route_assessment.current_route_status
+                    is RouteStatus.MATCH
+                    and active_route_assessment.near_term_route_status
+                    is RouteStatus.MATCH
+                )
+            )
+            retain_active_allowed = (
+                active_envelope is not None and active_route_executable
+            )
             candidate_records = []
             candidate_count = len(proposal["trajectory_samples"])
             validation_started_s = time.perf_counter()
@@ -1628,6 +1862,11 @@ def main():
                         "evaluation": None,
                         "motion_profile": motion_profile,
                         "motion_profile_compute_ms": motion_profile_compute_ms,
+                        "route_assessment": None,
+                        "semantic_audit": None,
+                        "semantic_audit_error": result.get(
+                            "scene_truth_error"
+                        ),
                         "rejection_reason": rejection_reason,
                     }
                 )
@@ -1677,7 +1916,7 @@ def main():
                         record["admission_error"] = error
                         record["admission"] = (
                             PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
-                            if active_envelope is not None
+                            if retain_active_allowed
                             else PlanAdmissionStatus.REJECT_FALLBACK_STOP
                         )
                 else:
@@ -1710,10 +1949,45 @@ def main():
             ) * 1000.0
 
             for record in valid_records:
+                if route_tracker is not None:
+                    try:
+                        record["route_assessment"] = _assess_plan_route(
+                            record["plan"]
+                        )
+                    except Exception as exc:
+                        record["admission_error"] = (
+                            f"candidate_route_assessment_error:"
+                            f"{type(exc).__name__}"
+                        )
+                        record["admission"] = (
+                            PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+                            if retain_active_allowed
+                            else PlanAdmissionStatus.REJECT_FALLBACK_STOP
+                        )
                 if record["admission"] is None:
                     record["admission"] = decide_plan_admission(
                         record["envelope"],
                         active_envelope,
+                    )
+                route_assessment = record["route_assessment"]
+                if (
+                    route_assessment is not None
+                    and (
+                        route_assessment.current_route_status
+                        is not RouteStatus.MATCH
+                        or route_assessment.near_term_route_status
+                        is not RouteStatus.MATCH
+                    )
+                ):
+                    record["admission_error"] = (
+                        "route_admission:"
+                        f"{route_assessment.current_route_status.value}/"
+                        f"{route_assessment.near_term_route_status.value}"
+                    )
+                    record["admission"] = (
+                        PlanAdmissionStatus.REJECT_RETAIN_ACTIVE
+                        if retain_active_allowed
+                        else PlanAdmissionStatus.REJECT_FALLBACK_STOP
                     )
                 if record["admission"] not in (
                     PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
@@ -1722,6 +1996,20 @@ def main():
                 ):
                     record["rejection_reason"] = (
                         f"road_admission:{record['admission'].value}"
+                    )
+                if (
+                    args.coc_semantic_audit
+                    and result.get("scene_truth_snapshot") is not None
+                ):
+                    semantic_audit = audit_coc_semantics(
+                        record["candidate_proposal"]["coc_text"],
+                        result["scene_truth_snapshot"],
+                        route_assessment=record["route_assessment"],
+                        motion_profile=record["motion_profile"],
+                    )
+                    record["semantic_audit"] = semantic_audit
+                    record["semantic_audit_error"] = (
+                        semantic_audit.audit_error
                     )
 
             for candidate_index, record in enumerate(candidate_records):
@@ -1747,6 +2035,7 @@ def main():
                     if envelope is not None
                     else None
                 )
+                route_assessment = record["route_assessment"]
                 record["evaluation"] = CandidateEvaluation(
                     candidate_index=candidate_index,
                     plan_id=record["candidate_proposal"]["proposal_id"],
@@ -1780,6 +2069,24 @@ def main():
                     time_to_first_bad_s=(
                         envelope.time_to_first_bad_s
                         if envelope is not None
+                        else None
+                    ),
+                    full_path_route_status=(
+                        route_assessment.full_path_route_status.value
+                        if route_assessment is not None
+                        else None
+                    ),
+                    route_branch_match=(
+                        route_assessment.branch_match
+                        if route_assessment is not None
+                        else None
+                    ),
+                    route_cross_track_error_m=(
+                        route_assessment.maximum_cross_track_error_m
+                        if route_assessment is not None
+                        and math.isfinite(
+                            route_assessment.maximum_cross_track_error_m
+                        )
                         else None
                     ),
                 )
@@ -1879,6 +2186,24 @@ def main():
                         if record["envelope"] is not None
                         else None
                     ),
+                    candidate_route_assessment=(
+                        record["route_assessment"].to_json_dict()
+                        if record["route_assessment"] is not None
+                        else None
+                    ),
+                    coc_semantic_audit=(
+                        record["semantic_audit"].to_json_dict()
+                        if record["semantic_audit"] is not None
+                        else {
+                            "claims": [],
+                            "verdict_counts": {},
+                            "positive_hallucination_count": 0,
+                            "audit_error": record[
+                                "semantic_audit_error"
+                            ],
+                            "enabled": bool(args.coc_semantic_audit),
+                        }
+                    ),
                     admission_error=record["admission_error"],
                     trajectory_motion_profile=(
                         record["motion_profile"].to_json_dict()
@@ -1950,6 +2275,7 @@ def main():
                     selected_record["envelope"],
                     active_envelope,
                     selected_record["admission_error"],
+                    selected_record["route_assessment"],
                 )
             return {
                 "proposal": ranked_proposal,
@@ -1957,6 +2283,8 @@ def main():
                 "envelope": selected_record["envelope"],
                 "admission": selected_record["admission"],
                 "motion_profile": selected_record["motion_profile"],
+                "route_assessment": selected_record["route_assessment"],
+                "semantic_audit": selected_record["semantic_audit"],
                 "verified_empty_road": prefer_moving,
                 "active_envelope": active_envelope,
                 "rejection_reason": selected_record["evaluation"].rejection_reason,
@@ -2136,6 +2464,8 @@ def main():
             source_loop_tick_id,
             source_elapsed_proxy_s,
             activation_source,
+            candidate_route_assessment=None,
+            candidate_semantic_audit=None,
         ):
             nonlocal current_plan, current_trajectory, current_plan_id
             nonlocal current_selected_traj_idx, prev_selected_trajectory
@@ -2144,6 +2474,8 @@ def main():
             nonlocal current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s
             nonlocal current_plan_admission_status
+            nonlocal current_route_assessment
+            nonlocal current_coc_semantic_audit
 
             if (
                 activation_source == "inference_result"
@@ -2175,6 +2507,8 @@ def main():
             current_plan_source_loop_tick_id = int(source_loop_tick_id)
             current_plan_source_elapsed_proxy_s = float(source_elapsed_proxy_s)
             current_plan_admission_status = candidate_admission
+            current_route_assessment = candidate_route_assessment
+            current_coc_semantic_audit = candidate_semantic_audit
 
         def _evaluate_plan_handoff(
             *,
@@ -2198,6 +2532,17 @@ def main():
                 and _road_envelope_executable(active_envelope)
                 and active_effective_admission is not None
             )
+            if active_executable and route_tracker is not None:
+                try:
+                    active_route = _assess_plan_route(current_plan)
+                except Exception:
+                    active_executable = False
+                else:
+                    active_executable = bool(
+                        active_route.current_route_status is RouteStatus.MATCH
+                        and active_route.near_term_route_status
+                        is RouteStatus.MATCH
+                    )
             if active_executable:
                 try:
                     active_motion = compute_trajectory_motion_profile(
@@ -2372,6 +2717,7 @@ def main():
             alignment = None
             motion = None
             candidate_envelope = None
+            candidate_route_assessment = None
             admission = None
             handoff = None
 
@@ -2406,6 +2752,11 @@ def main():
                     "road_envelope": (
                         candidate_envelope.to_json_dict()
                         if candidate_envelope is not None
+                        else None
+                    ),
+                    "route_assessment": (
+                        candidate_route_assessment.to_json_dict()
+                        if candidate_route_assessment is not None
                         else None
                     ),
                     "handoff": (
@@ -2453,6 +2804,11 @@ def main():
                     float(current_simulation_time_s),
                 )
                 candidate_envelope = _assess_plan_road_envelope(standby.plan)
+                candidate_route_assessment = (
+                    _assess_plan_route(standby.plan)
+                    if route_tracker is not None
+                    else None
+                )
             except Exception as exc:
                 return _discard(
                     f"standby_assessment_error:{type(exc).__name__}"
@@ -2462,6 +2818,16 @@ def main():
                 candidate_envelope,
                 active_envelope,
             )
+            if (
+                candidate_route_assessment is not None
+                and (
+                    candidate_route_assessment.current_route_status
+                    is not RouteStatus.MATCH
+                    or candidate_route_assessment.near_term_route_status
+                    is not RouteStatus.MATCH
+                )
+            ):
+                return _discard("standby_route_admission_failed")
             if not _is_accepted_admission(admission):
                 return _discard(f"standby_admission:{admission.value}")
 
@@ -2500,6 +2866,8 @@ def main():
                 source_loop_tick_id=standby.source_loop_tick_id,
                 source_elapsed_proxy_s=standby.source_elapsed_proxy_s,
                 activation_source="standby_reassessment",
+                candidate_route_assessment=candidate_route_assessment,
+                candidate_semantic_audit=None,
             )
             active_plan_availability = decide_active_plan_availability(
                 active_plan_present=True,
@@ -2594,6 +2962,10 @@ def main():
                 source_loop_tick_id=source_loop_tick_id,
                 source_elapsed_proxy_s=source_elapsed_proxy_s,
                 activation_source="inference_result",
+                candidate_route_assessment=outcome.get(
+                    "route_assessment"
+                ),
+                candidate_semantic_audit=outcome.get("semantic_audit"),
             )
             return {
                 "status": "accepted_plan",
@@ -3066,10 +3438,16 @@ def main():
             nonlocal current_plan_id, current_plan_source_loop_tick_id
             nonlocal current_plan_source_elapsed_proxy_s, respawn_count
             nonlocal current_plan_admission_status, current_road_envelope
+            nonlocal current_route_assessment
+            nonlocal current_coc_semantic_audit
             nonlocal latest_proposal_plan_id, latest_candidate_admission_status
             nonlocal latest_handoff_status
             nonlocal last_applied_control_echo
             nonlocal active_plan_availability
+            nonlocal route_tracker, route_plan
+            nonlocal current_navigation_context
+            nonlocal route_unavailable_since_s
+            nonlocal last_route_replan_attempt_s
 
             print(f"[Frame {frame_count}] Auto-respawn: {reason}")
             _clear_retained_standby("respawn")
@@ -3077,6 +3455,29 @@ def main():
                 spawn_index=args.ego_spawn_index,
                 center_on_driving_lane=args.empty_road,
             )
+            if initial_route_plan is not None:
+                route_plan = initial_route_plan
+                route_tracker = RouteNavigationTracker(
+                    initial_route_plan,
+                    weight=args.navigation_weight,
+                    epoch=(
+                        int(current_navigation_context.conditioning_epoch) + 1
+                        if current_navigation_context is not None
+                        else 1
+                    ),
+                )
+                ego_location = carla_if.ego_vehicle.get_transform().location
+                route_update = route_tracker.update(
+                    (ego_location.x, ego_location.y, ego_location.z),
+                    source_frame_id=int(current_carla_frame_id or frame_count),
+                    source_simulation_time_s=float(
+                        current_simulation_time_s or 0.0
+                    ),
+                )
+                current_navigation_context = route_update.context
+                nav_state.apply_route_context(current_navigation_context)
+                route_unavailable_since_s = None
+                last_route_replan_attempt_s = None
             respawn_count += 1
             pid_follower = OfficialPIDFollower(carla_if.world, carla_if.ego_vehicle)
             safety_shield.reset()
@@ -3095,6 +3496,8 @@ def main():
             current_plan_source_elapsed_proxy_s = None
             current_plan_admission_status = None
             current_road_envelope = None
+            current_route_assessment = None
+            current_coc_semantic_audit = None
             latest_proposal_plan_id = None
             latest_candidate_admission_status = None
             latest_handoff_status = None
@@ -3229,6 +3632,35 @@ def main():
                 source_entry,
             )
 
+        def _capture_source_scene_truth(source_entry):
+            if not args.coc_semantic_audit:
+                return None, None
+            try:
+                snapshot = capture_scene_truth_snapshot(
+                    world=carla_if.world,
+                    ego_vehicle=carla_if.ego_vehicle,
+                    source_frame_id=int(source_entry["frame_id"]),
+                    source_simulation_time_s=float(
+                        source_entry["simulation_time_s"]
+                    ),
+                    navigation_context=current_navigation_context,
+                    route_plan=route_plan,
+                    route_index=(
+                        route_tracker.route_index
+                        if route_tracker is not None
+                        else 0
+                    ),
+                    carla_module=(
+                        route_carla_module
+                        if route_carla_module is not None
+                        else importlib.import_module("carla")
+                    ),
+                    strict_lane_policy_enabled=True,
+                )
+            except Exception as exc:
+                return None, f"{type(exc).__name__}:{exc}"
+            return snapshot, None
+
         if args.async_mode:
             inference_request_q = queue.Queue(maxsize=1)
             inference_result_q = queue.Queue(maxsize=1)
@@ -3243,6 +3675,9 @@ def main():
                     source_entry,
                 ) = _current_input_arrays()
                 request_sequence += 1
+                scene_truth_snapshot, scene_truth_error = (
+                    _capture_source_scene_truth(source_entry)
+                )
                 return {
                     "request_id": request_sequence,
                     "mode": args.mode,
@@ -3255,6 +3690,9 @@ def main():
                     ).copy(),
                     "navigation_text": nav_state.navigation_text,
                     "navigation_weight": nav_state.navigation_weight,
+                    "navigation_context": current_navigation_context,
+                    "scene_truth_snapshot": scene_truth_snapshot,
+                    "scene_truth_error": scene_truth_error,
                     "vqa_question": nav_state.vqa_question,
                     "prompt_revision": nav_state.revision,
                     "respawn_revision": respawn_revision,
@@ -3337,6 +3775,15 @@ def main():
                                 "result_ts": time.monotonic(),
                                 "navigation_text": navigation_text,
                                 "navigation_weight": navigation_weight,
+                                "navigation_context": req.get(
+                                    "navigation_context"
+                                ),
+                                "scene_truth_snapshot": req.get(
+                                    "scene_truth_snapshot"
+                                ),
+                                "scene_truth_error": req.get(
+                                    "scene_truth_error"
+                                ),
                                 "prompt_revision": req["prompt_revision"],
                                 "respawn_revision": req["respawn_revision"],
                                 "request_id": req["request_id"],
@@ -3372,6 +3819,10 @@ def main():
                             "submission_monotonic_s": req.get("submission_monotonic_s"),
                             "prompt_revision": req.get("prompt_revision"),
                             "respawn_revision": req.get("respawn_revision"),
+                            "scene_truth_snapshot": req.get(
+                                "scene_truth_snapshot"
+                            ),
+                            "scene_truth_error": req.get("scene_truth_error"),
                         }
 
                     superseded_request_ids = []
@@ -3400,6 +3851,81 @@ def main():
         if pygame_ui_recorder is not None:
             print(f"Recording Pygame UI to: {args.pygame_ui_video}")
         print("-" * 60)
+
+        def _apply_conditioning_transition(reason):
+            """Invalidate plan state when maneuver/prompt authority changes."""
+
+            nonlocal prev_selected_trajectory, current_plan
+            nonlocal current_trajectory, current_pred_xyz
+            nonlocal current_trajectory_ts, current_plan_id
+            nonlocal current_plan_source_loop_tick_id
+            nonlocal current_plan_source_elapsed_proxy_s
+            nonlocal current_plan_admission_status, current_road_envelope
+            nonlocal current_route_assessment
+            nonlocal current_coc_semantic_audit
+            nonlocal latest_proposal_plan_id
+            nonlocal latest_candidate_admission_status
+            nonlocal latest_handoff_status
+            nonlocal active_plan_availability
+            nonlocal pending_inference, pending_request_id
+            nonlocal last_seen_nav_revision
+
+            _clear_retained_standby(reason)
+            prev_selected_trajectory = None
+            current_plan = None
+            current_trajectory = None
+            current_pred_xyz = None
+            current_trajectory_ts = None
+            current_plan_id = None
+            current_plan_source_loop_tick_id = None
+            current_plan_source_elapsed_proxy_s = None
+            current_plan_admission_status = None
+            current_road_envelope = None
+            current_route_assessment = None
+            current_coc_semantic_audit = None
+            latest_proposal_plan_id = None
+            latest_candidate_admission_status = None
+            latest_handoff_status = None
+            active_plan_availability = decide_active_plan_availability(
+                active_plan_present=False,
+                standard_validity=None,
+                bridge_validity=None,
+                alignment_validity=None,
+                road_envelope=None,
+                bridge_deadline_age_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
+                ),
+                bridge_min_remaining_horizon_s=float(
+                    cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
+                ),
+            )
+            pending_inference = False
+            pending_request_id = None
+            if safety_adapter is not None:
+                clear_plan_caches = getattr(
+                    safety_adapter,
+                    "clear_plan_caches",
+                    None,
+                )
+                if callable(clear_plan_caches):
+                    clear_plan_caches()
+                else:
+                    safety_adapter.reset(carla_if.ego_vehicle)
+            _clear_async_queues(reason)
+            emit_runtime_event(
+                "prompt_revision_changed",
+                loop_tick_id=int(frame_count),
+                prompt_revision=nav_state.revision,
+                mode=args.mode,
+                navigation_source=args.navigation_source,
+                navigation_context=(
+                    current_navigation_context.to_json_dict()
+                    if current_navigation_context is not None
+                    else None
+                ),
+                reason=reason,
+            )
+            last_seen_nav_revision = nav_state.revision
 
         last_seen_nav_revision = nav_state.revision
         last_vqa_submitted_revision = None
@@ -3441,8 +3967,15 @@ def main():
             diffusion_temperature=args.diffusion_temperature,
             road_assessment_backend=args.road_assessment_backend,
             road_assessment_workers=args.road_assessment_workers,
+            navigation_source=args.navigation_source,
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
+            navigation_context=(
+                current_navigation_context.to_json_dict()
+                if current_navigation_context is not None
+                else None
+            ),
+            route_startup_facts=route_startup_facts,
             camera_alignment=camera_alignment_metadata(),
             frame_id_quality=(
                 "exact_carla_snapshot"
@@ -3488,7 +4021,6 @@ def main():
                     stop_reason = "pygame_shutdown"
                     break
                 if nav_state.revision != last_seen_nav_revision:
-                    _clear_retained_standby("prompt_revision_changed")
                     if args.mode == "navigation":
                         print(
                             f"Navigation updated: {nav_state.navigation_text or '(none)'} "
@@ -3496,52 +4028,7 @@ def main():
                         )
                     elif args.mode == "vqa":
                         print(f"VQA question updated: {nav_state.vqa_question or '(none)'}")
-                    prev_selected_trajectory = None
-                    current_plan = None
-                    current_trajectory = None
-                    current_pred_xyz = None
-                    current_trajectory_ts = None
-                    current_plan_id = None
-                    current_plan_source_loop_tick_id = None
-                    current_plan_source_elapsed_proxy_s = None
-                    current_plan_admission_status = None
-                    current_road_envelope = None
-                    latest_proposal_plan_id = None
-                    latest_candidate_admission_status = None
-                    latest_handoff_status = None
-                    active_plan_availability = decide_active_plan_availability(
-                        active_plan_present=False,
-                        standard_validity=None,
-                        bridge_validity=None,
-                        alignment_validity=None,
-                        road_envelope=None,
-                        bridge_deadline_age_s=float(
-                            cfg.TRAJECTORY_ACTIVE_BRIDGE_MAX_PLAN_AGE_S
-                        ),
-                        bridge_min_remaining_horizon_s=float(
-                            cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
-                        ),
-                    )
-                    pending_inference = False
-                    pending_request_id = None
-                    safety_shield.reset()
-                    if safety_adapter is not None:
-                        clear_plan_caches = getattr(
-                            safety_adapter,
-                            "clear_plan_caches",
-                            None,
-                        )
-                        if callable(clear_plan_caches):
-                            clear_plan_caches()
-                        else:
-                            safety_adapter.reset(carla_if.ego_vehicle)
-                    emit_runtime_event(
-                        "prompt_revision_changed",
-                        loop_tick_id=int(frame_count),
-                        prompt_revision=nav_state.revision,
-                        mode=args.mode,
-                    )
-                    last_seen_nav_revision = nav_state.revision
+                    _apply_conditioning_transition("manual_prompt_revision_changed")
                 if nav_state.paused:
                     if not pause_brake_active:
                         _apply_arbitrated_control(
@@ -3641,6 +4128,108 @@ def main():
             current_carla_frame_id = observation_entry["frame_id"]
             current_simulation_time_s = observation_entry["simulation_time_s"]
             current_frame_id_quality = observation_entry["frame_id_quality"]
+            if route_tracker is not None:
+                ego_xyz = tuple(
+                    float(value)
+                    for value in np.asarray(
+                        state["pose_world"],
+                        dtype=np.float64,
+                    )[:3, 3]
+                )
+                route_update = route_tracker.update(
+                    ego_xyz,
+                    source_frame_id=int(current_carla_frame_id),
+                    source_simulation_time_s=float(current_simulation_time_s),
+                )
+                current_navigation_context = route_update.context
+                nav_state.apply_route_context(current_navigation_context)
+                if route_update.epoch_changed:
+                    print(
+                        f"[Frame {frame_count}] Route maneuver changed: "
+                        f"{current_navigation_context.action.value} | "
+                        f"{current_navigation_context.text}"
+                    )
+                    _apply_conditioning_transition("route_maneuver_changed")
+                if (
+                    current_navigation_context.tracker_status
+                    is RouteTrackerStatus.ROUTE_UNAVAILABLE
+                ):
+                    if route_unavailable_since_s is None:
+                        route_unavailable_since_s = float(
+                            current_simulation_time_s
+                        )
+                        emit_runtime_event(
+                            "route_unavailable",
+                            loop_tick_id=int(frame_count),
+                            route_id=route_plan.route_id,
+                            route_distance_m=route_update.route_distance_m,
+                            navigation_context=(
+                                current_navigation_context.to_json_dict()
+                            ),
+                        )
+                    replan_due = (
+                        last_route_replan_attempt_s is None
+                        or float(current_simulation_time_s)
+                        - float(last_route_replan_attempt_s)
+                        >= 1.0
+                    )
+                    if replan_due:
+                        last_route_replan_attempt_s = float(
+                            current_simulation_time_s
+                        )
+                        try:
+                            replanned_route, replan_facts = trace_carla_route(
+                                carla_if.world.get_map(),
+                                origin_xyz=ego_xyz,
+                                destination_xyz=args.route_destination,
+                                planner_type=route_planner_type,
+                                carla_module=route_carla_module,
+                                sampling_resolution_m=1.0,
+                            )
+                        except Exception as exc:
+                            emit_runtime_event(
+                                "route_replan",
+                                loop_tick_id=int(frame_count),
+                                status="failed",
+                                reason=f"{type(exc).__name__}:{exc}",
+                            )
+                        else:
+                            route_plan = replanned_route
+                            route_tracker.replace_route(replanned_route)
+                            recovered_update = route_tracker.update(
+                                ego_xyz,
+                                source_frame_id=int(current_carla_frame_id),
+                                source_simulation_time_s=float(
+                                    current_simulation_time_s
+                                ),
+                            )
+                            if (
+                                recovered_update.context.tracker_status
+                                is not RouteTrackerStatus.ROUTE_UNAVAILABLE
+                            ):
+                                current_navigation_context = (
+                                    recovered_update.context
+                                )
+                                nav_state.apply_route_context(
+                                    current_navigation_context
+                                )
+                                route_unavailable_since_s = None
+                                _apply_conditioning_transition(
+                                    "route_replan_recovered"
+                                )
+                                emit_runtime_event(
+                                    "route_replan",
+                                    loop_tick_id=int(frame_count),
+                                    status="recovered",
+                                    route_id=route_plan.route_id,
+                                    route_facts=replan_facts,
+                                    navigation_context=(
+                                        current_navigation_context.to_json_dict()
+                                    ),
+                                )
+                else:
+                    route_unavailable_since_s = None
+                    last_route_replan_attempt_s = None
             if current_frame_id_quality == "exact_carla_snapshot":
                 exact_observation_count += 1
             if len(images) > 1:
@@ -3772,6 +4361,12 @@ def main():
             camera_capture_gate_open = (
                 not args.capture_inference_fixture or fixture_capture_complete
             )
+            if (
+                current_navigation_context is not None
+                and current_navigation_context.tracker_status
+                is RouteTrackerStatus.ROUTE_UNAVAILABLE
+            ):
+                camera_capture_gate_open = False
             if args.async_mode:
                 if args.mode == "vqa":
                     should_submit_inference = (
@@ -3823,6 +4418,7 @@ def main():
                             "submission_monotonic_s",
                             "prompt_revision",
                             "respawn_revision",
+                            "navigation_context",
                         )
                     }
                     last_inference_submit_simulation_time_s = float(current_simulation_time_s)
@@ -3837,6 +4433,17 @@ def main():
                         frame_id_quality=req["frame_id_quality"],
                         prompt_revision=req["prompt_revision"],
                         respawn_revision=req["respawn_revision"],
+                        navigation_context=(
+                            req["navigation_context"].to_json_dict()
+                            if req.get("navigation_context") is not None
+                            else None
+                        ),
+                        scene_truth_snapshot=(
+                            req["scene_truth_snapshot"].to_json_dict()
+                            if req.get("scene_truth_snapshot") is not None
+                            else None
+                        ),
+                        scene_truth_error=req.get("scene_truth_error"),
                     )
                     if args.mode == "vqa":
                         last_vqa_submitted_revision = nav_state.revision
@@ -4134,6 +4741,9 @@ def main():
                         navigation_weight = (
                             nav_state.navigation_weight if args.mode == "navigation" else 1.0
                         )
+                        scene_truth_snapshot, scene_truth_error = (
+                            _capture_source_scene_truth(source_entry)
+                        )
                         request_sequence += 1
                         request_id = request_sequence
                         last_inference_submit_simulation_time_s = float(current_simulation_time_s)
@@ -4158,6 +4768,17 @@ def main():
                             frame_id_quality=source_entry["frame_id_quality"],
                             prompt_revision=nav_state.revision,
                             respawn_revision=respawn_revision,
+                            navigation_context=(
+                                current_navigation_context.to_json_dict()
+                                if current_navigation_context is not None
+                                else None
+                            ),
+                            scene_truth_snapshot=(
+                                scene_truth_snapshot.to_json_dict()
+                                if scene_truth_snapshot is not None
+                                else None
+                            ),
+                            scene_truth_error=scene_truth_error,
                         )
                         model_start_time = time.monotonic()
                         stage = "model_inference"
@@ -4189,6 +4810,9 @@ def main():
                                 "camera_ids": source_entry["camera_ids"],
                                 "navigation_text": navigation_text,
                                 "navigation_weight": navigation_weight,
+                                "navigation_context": current_navigation_context,
+                                "scene_truth_snapshot": scene_truth_snapshot,
+                                "scene_truth_error": scene_truth_error,
                                 "prompt_revision": nav_state.revision,
                                 "respawn_revision": respawn_revision,
                             }
@@ -4336,7 +4960,62 @@ def main():
                         cfg.TRAJECTORY_ACTIVE_BRIDGE_MIN_REMAINING_HORIZON_S
                     ),
                 )
-            if current_plan is not None:
+            route_policy_stop_status = (
+                current_navigation_context.tracker_status
+                if current_navigation_context is not None
+                else None
+            )
+            if route_policy_stop_status in {
+                RouteTrackerStatus.ROUTE_UNAVAILABLE,
+                RouteTrackerStatus.ARRIVED,
+            }:
+                route_stop_reason = (
+                    "route_unavailable"
+                    if route_policy_stop_status
+                    is RouteTrackerStatus.ROUTE_UNAVAILABLE
+                    else "route_destination_arrived"
+                )
+                safety_decision = _apply_arbitrated_control(
+                    state=state,
+                    tick_context=tick_context,
+                    plan=None,
+                    controller_state=route_policy_stop_status.value,
+                    requested_control=None,
+                    nominal_control=ControlCommand.full_brake(),
+                    fallback_state=route_policy_stop_status.value,
+                    fallback_reason=route_stop_reason,
+                    control_origin="route_policy_stop",
+                )
+                steering, throttle, brake = (
+                    safety_decision.applied_control.as_tuple()
+                )
+                latest_telemetry = {
+                    "frame": frame_count,
+                    "speed_kmh": state["speed"] * 3.6,
+                    "steering": steering,
+                    "throttle": throttle,
+                    "brake": brake,
+                    "inference_time": current_inference_time,
+                    "controller_state": route_policy_stop_status.value,
+                    "navigation_context": (
+                        current_navigation_context.to_json_dict()
+                    ),
+                    "coc_semantic_audit": (
+                        current_coc_semantic_audit.to_json_dict()
+                        if current_coc_semantic_audit is not None
+                        else None
+                    ),
+                    "applied_control_source": (
+                        safety_decision.applied_control_source
+                    ),
+                    "safety_override_applied": (
+                        safety_decision.safety_override_applied
+                    ),
+                    "safety_override_reason": safety_decision.primary_reason,
+                }
+                if pygame_ui is not None:
+                    draw_pygame_ui(latest_ui_frame, latest_telemetry)
+            elif current_plan is not None:
                 (
                     execution_validity,
                     bridge_validity,
@@ -4432,12 +5111,18 @@ def main():
                     _clear_active_plan_state()
                     active_plan_availability = denied_availability
 
-            (
-                standby_trigger,
-                standby_active_envelope,
-            ) = _standby_activation_trigger(
-                active_envelope_hint=bridge_road_envelope,
-            )
+            standby_trigger = None
+            standby_active_envelope = None
+            if route_policy_stop_status not in {
+                RouteTrackerStatus.ROUTE_UNAVAILABLE,
+                RouteTrackerStatus.ARRIVED,
+            }:
+                (
+                    standby_trigger,
+                    standby_active_envelope,
+                ) = _standby_activation_trigger(
+                    active_envelope_hint=bridge_road_envelope,
+                )
             if standby_trigger is not None:
                 activated_standby = _try_activate_retained_standby(
                     standby_trigger,
@@ -4451,10 +5136,18 @@ def main():
                         f"{current_plan_id}: {standby_trigger}"
                     )
 
-            if current_plan is not None:
+            if route_policy_stop_status in {
+                RouteTrackerStatus.ROUTE_UNAVAILABLE,
+                RouteTrackerStatus.ARRIVED,
+            }:
+                pass
+            elif current_plan is not None:
                 adapter_assessment = bridge_adapter_assessment
                 road_speed_cap_mps = None
                 maximum_authorized_waypoint_index = None
+                route_speed_cap_mps = None
+                route_authorized_waypoint_index = None
+                route_constraint_requires_stop = False
                 if adapter_assessment is not None:
                     current_road_envelope = getattr(
                         adapter_assessment,
@@ -4489,9 +5182,64 @@ def main():
                     except Exception:
                         adapter_assessment = None
                         current_road_envelope = None
+                if route_tracker is not None:
+                    try:
+                        current_route_assessment = _assess_plan_route(
+                            current_plan
+                        )
+                    except Exception:
+                        current_route_assessment = None
+                        route_constraint_requires_stop = True
+                    else:
+                        route_speed_cap_mps = (
+                            current_route_assessment.route_speed_cap_mps
+                        )
+                        route_authorized_waypoint_index = (
+                            current_route_assessment.last_authorized_waypoint_index
+                        )
+                        route_constraint_requires_stop = bool(
+                            current_route_assessment.current_route_status
+                            is not RouteStatus.MATCH
+                            or (
+                                current_route_assessment.near_term_route_status
+                                is not RouteStatus.MATCH
+                                and route_authorized_waypoint_index is None
+                            )
+                        )
+                (
+                    controller_speed_cap_mps,
+                    controller_authorized_waypoint_index,
+                ) = combine_execution_constraints(
+                    road_speed_cap_mps=road_speed_cap_mps,
+                    route_speed_cap_mps=route_speed_cap_mps,
+                    road_last_authorized_index=(
+                        maximum_authorized_waypoint_index
+                    ),
+                    route_last_authorized_index=(
+                        route_authorized_waypoint_index
+                    ),
+                )
                 try:
-                    steering_raw, throttle_raw, brake_raw, ctrl_debug = (
-                        pid_follower.compute_world_control(
+                    if route_constraint_requires_stop:
+                        steering_raw, throttle_raw, brake_raw = (
+                            ControlCommand.full_brake().as_tuple()
+                        )
+                        ctrl_debug = {
+                            "controller_state": "ROUTE_POLICY_CONSTRAINT",
+                            "route_constraint_reason": (
+                                "route_assessment_unavailable"
+                                if current_route_assessment is None
+                                else (
+                                    current_route_assessment.current_route_status.value
+                                    + "/"
+                                    + current_route_assessment.near_term_route_status.value
+                                )
+                            ),
+                            "bypass_smoothing": True,
+                        }
+                    else:
+                        steering_raw, throttle_raw, brake_raw, ctrl_debug = (
+                            pid_follower.compute_world_control(
                             plan_id=current_plan.plan_id,
                             wp_world=current_plan.world_points,
                             waypoint_times_s=current_plan.waypoint_times_s,
@@ -4500,11 +5248,37 @@ def main():
                             stop_requested=bool(current_plan.stop_requested),
                             terminal_stop_index=current_plan.terminal_stop_index,
                             capture_origin_world=current_plan.capture_pose_world[:3, 3],
-                            target_speed_cap_mps=road_speed_cap_mps,
+                            target_speed_cap_mps=controller_speed_cap_mps,
                             maximum_authorized_waypoint_index=(
-                                maximum_authorized_waypoint_index
+                                controller_authorized_waypoint_index
                             ),
                         )
+                        )
+                        route_cap_is_binding = (
+                            route_speed_cap_mps is not None
+                            and (
+                                road_speed_cap_mps is None
+                                or route_speed_cap_mps
+                                <= road_speed_cap_mps + 1e-9
+                            )
+                        )
+                        if (
+                            route_cap_is_binding
+                            and current_route_assessment is not None
+                            and current_route_assessment.full_path_route_status
+                            is not RouteStatus.MATCH
+                        ):
+                            ctrl_debug["controller_state"] = (
+                                "ROUTE_POLICY_CONSTRAINT"
+                            )
+                    ctrl_debug["route_candidate_assessment"] = (
+                        current_route_assessment.to_json_dict()
+                        if current_route_assessment is not None
+                        else None
+                    )
+                    ctrl_debug["route_speed_cap_mps"] = route_speed_cap_mps
+                    ctrl_debug["maximum_route_authorized_waypoint_index"] = (
+                        route_authorized_waypoint_index
                     )
                     requested_control = {
                         "steering": float(steering_raw),
@@ -4522,7 +5296,10 @@ def main():
                         bypass_smoothing=emergency_stop_requested,
                         constrained_deceleration=(
                             ctrl_debug.get("controller_state")
-                            == "ROAD_CONSTRAINED_DECELERATING"
+                            in {
+                                "ROAD_CONSTRAINED_DECELERATING",
+                                "ROUTE_POLICY_CONSTRAINT",
+                            }
                         ),
                     )
                 except Exception as exc:
@@ -4575,14 +5352,45 @@ def main():
                         )
                     )
                     relative_last_safe_index = None
+                    authorized_relative_indices = []
                     if current_road_envelope is not None:
                         if current_road_envelope.last_safe_waypoint_index is None:
-                            relative_last_safe_index = -1
+                            authorized_relative_indices.append(-1)
                         else:
-                            relative_last_safe_index = (
+                            authorized_relative_indices.append(
                                 int(current_road_envelope.last_safe_waypoint_index)
                                 - first_future_index
                             )
+                    if current_route_assessment is not None:
+                        if (
+                            current_route_assessment.last_authorized_waypoint_index
+                            is None
+                        ):
+                            authorized_relative_indices.append(-1)
+                        else:
+                            authorized_relative_indices.append(
+                                int(
+                                    current_route_assessment.last_authorized_waypoint_index
+                                )
+                                - first_future_index
+                            )
+                    if authorized_relative_indices:
+                        relative_last_safe_index = min(
+                            authorized_relative_indices
+                        )
+                    coc_issue_count = 0
+                    if current_coc_semantic_audit is not None:
+                        audit_counts = current_coc_semantic_audit.to_json_dict()[
+                            "verdict_counts"
+                        ]
+                        coc_issue_count = sum(
+                            int(audit_counts.get(name, 0))
+                            for name in (
+                                "CONTRADICTED",
+                                "POLICY_CONFLICT",
+                                "TRAJECTORY_MISMATCH",
+                            )
+                        )
                     vis_frame = create_visualization_frame(
                         cam_img,
                         current_pred_xyz,
@@ -4636,6 +5444,18 @@ def main():
                             if current_road_envelope is not None
                             else None
                         ),
+                        near_term_route_status=(
+                            current_route_assessment.near_term_route_status.value
+                            if current_route_assessment is not None
+                            else None
+                        ),
+                        full_path_route_status=(
+                            current_route_assessment.full_path_route_status.value
+                            if current_route_assessment is not None
+                            else None
+                        ),
+                        route_speed_cap_mps=route_speed_cap_mps,
+                        coc_issue_count=coc_issue_count,
                         last_safe_waypoint_index=relative_last_safe_index,
                         camera_alignment_mode=args.camera_alignment,
                     )
@@ -4688,6 +5508,22 @@ def main():
                     "road_speed_cap_mps": (
                         current_road_envelope.target_speed_cap_mps
                         if current_road_envelope is not None
+                        else None
+                    ),
+                    "route_assessment": (
+                        current_route_assessment.to_json_dict()
+                        if current_route_assessment is not None
+                        else None
+                    ),
+                    "route_speed_cap_mps": route_speed_cap_mps,
+                    "navigation_context": (
+                        current_navigation_context.to_json_dict()
+                        if current_navigation_context is not None
+                        else None
+                    ),
+                    "coc_semantic_audit": (
+                        current_coc_semantic_audit.to_json_dict()
+                        if current_coc_semantic_audit is not None
                         else None
                     ),
                     "applied_control_source": (safety_decision.applied_control_source),

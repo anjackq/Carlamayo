@@ -260,6 +260,10 @@ def create_visualization_frame(
     near_term_road_status=None,
     full_path_road_status=None,
     road_speed_cap_mps=None,
+    near_term_route_status=None,
+    full_path_route_status=None,
+    route_speed_cap_mps=None,
+    coc_issue_count=0,
     last_safe_waypoint_index=None,
     camera_alignment_mode="baseline",
 ):
@@ -333,7 +337,9 @@ def create_visualization_frame(
             f"ALPAMAYO PROPOSAL | source frame {source_text} | age {age_text} | "
             f"admission={plan_admission_status or 'unknown'} | "
             f"road={near_term_road_status or 'unknown'}/"
-            f"{full_path_road_status or 'unknown'}",
+            f"{full_path_road_status or 'unknown'} | "
+            f"route={near_term_route_status or 'n/a'}/"
+            f"{full_path_route_status or 'n/a'} | CoC issues={int(coc_issue_count)}",
             (255, 255, 0),
         ),
         (
@@ -343,7 +349,9 @@ def create_visualization_frame(
             f"{requested.get('throttle', 0.0):.2f}/"
             f"{requested.get('brake', 0.0):.2f} | "
             f"road cap="
-            f"{'none' if road_speed_cap_mps is None else f'{road_speed_cap_mps:.2f}m/s'}",
+            f"{'none' if road_speed_cap_mps is None else f'{road_speed_cap_mps:.2f}m/s'}"
+            f" | route cap="
+            f"{'none' if route_speed_cap_mps is None else f'{route_speed_cap_mps:.2f}m/s'}",
             (80, 255, 120),
         ),
         (
