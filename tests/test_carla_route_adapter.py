@@ -41,6 +41,20 @@ class _TransitionMap:
         return _Waypoint()
 
 
+class _OverlapWaypoint:
+    road_id = 1608
+    section_id = 0
+    lane_id = -3
+    is_junction = True
+
+
+class _OverlapMap:
+    def get_waypoint(self, location, *, project_to_road, lane_type):
+        assert project_to_road is False
+        assert lane_type == "Driving"
+        return _OverlapWaypoint()
+
+
 def test_parse_destination_xyz():
     assert parse_destination_xyz("-43.0,-2.0,0") == (-43.0, -2.0, 0.0)
     assert parse_destination_xyz(FIXED_TOWN03_DESTINATION_XYZ) == (
@@ -89,6 +103,27 @@ def test_current_route_status_prefers_exact_lane_at_connector_overlap():
     status = assess_current_route_status(
         _TransitionMap(),
         (1.1, 0.0, 0.0),
+        route=route,
+        route_index=0,
+        carla_module=_Carla,
+    )
+
+    assert status is RouteStatus.MATCH
+
+
+def test_current_route_status_canonicalizes_future_junction_connector():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((1, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((10, 0, 0), 1608, 1, -1, True, "RIGHT"),
+            RoutePoint((20, 0, 0), 61, 0, -1, False, "LANEFOLLOW"),
+        ]
+    )
+
+    status = assess_current_route_status(
+        _OverlapMap(),
+        (0.2, 0.0, 0.0),
         route=route,
         route_index=0,
         carla_module=_Carla,

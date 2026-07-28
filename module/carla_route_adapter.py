@@ -309,6 +309,7 @@ def assess_current_route_status(
         ego_xyz,
         start_index=route_index,
         lane_identity=fact.identity,
+        lane_is_junction=fact.is_junction,
     )
     if association.distance_m > ROUTE_ASSOCIATION_MAX_DISTANCE_M:
         return RouteStatus.UNKNOWN

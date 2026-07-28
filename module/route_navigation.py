@@ -20,6 +20,8 @@ ROUTE_ASSOCIATION_MAX_DISTANCE_M = 3.0
 ROUTE_ARRIVAL_DISTANCE_M = 1.5
 ROUTE_PROMPT_DISTANCE_OMIT_M = 15.0
 ROUTE_MANEUVER_COALESCE_DISTANCE_M = 18.0
+ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M = 1.25
+ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M = 18.0
 
 
 class NavigationAction(str, Enum):
@@ -130,6 +132,7 @@ class RouteAssociation:
     route_index: int
     distance_m: float
     lane_identity_matched: bool | None
+    junction_topology_overlap: bool = False
 
 
 def associate_route_index(
@@ -138,6 +141,7 @@ def associate_route_index(
     *,
     start_index: int,
     lane_identity: Sequence[int] | None = None,
+    lane_is_junction: bool | None = None,
 ) -> RouteAssociation:
     """Associate a point while preserving an exact lane through transitions.
 
@@ -145,8 +149,14 @@ def associate_route_index(
     road identity at exactly the same coordinate.  A purely nearest-point
     association can therefore jump to the junction connector while the exact
     map query still reports the incoming lane.  Prefer the nearest matching
-    identity anywhere inside the existing 3 m route corridor; identities not
-    present in that corridor remain unauthorized.
+    identity anywhere inside the existing 3 m route corridor.
+
+    Complex junctions can also return a downstream authorized connector for a
+    point that is still geometrically on the current connector.  Canonicalize
+    only that bounded overlap: both samples must be junction samples, the point
+    must remain within 1.25 m of the route, and its road ID must occur in the
+    next 18 m of the authorized junction sequence.  Unrelated branches,
+    adjacent lanes, and geometric divergence remain unauthorized.
     """
 
     point = np.asarray(point_xyz, dtype=np.float64)
@@ -167,6 +177,7 @@ def associate_route_index(
             route_index=geometric_index,
             distance_m=geometric_distance,
             lane_identity_matched=None,
+            junction_topology_overlap=False,
         )
     identity_values = tuple(int(value) for value in lane_identity)
     if len(identity_values) != 3:
@@ -192,11 +203,39 @@ def associate_route_index(
                 route_index=identity_index,
                 distance_m=identity_distance,
                 lane_identity_matched=True,
+                junction_topology_overlap=False,
             )
+    geometric_point = route.points[geometric_index]
+    if (
+        lane_is_junction is True
+        and geometric_point.is_junction
+        and identity_values[0] != geometric_point.road_id
+        and geometric_distance
+        <= ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M
+    ):
+        geometric_progress = route.cumulative_distance_m[geometric_index]
+        for index in range(geometric_index, len(route.points)):
+            route_point = route.points[index]
+            route_delta = (
+                route.cumulative_distance_m[index] - geometric_progress
+            )
+            if route_delta > ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M:
+                break
+            if (
+                route_point.is_junction
+                and route_point.road_id == identity_values[0]
+            ):
+                return RouteAssociation(
+                    route_index=geometric_index,
+                    distance_m=geometric_distance,
+                    lane_identity_matched=True,
+                    junction_topology_overlap=True,
+                )
     return RouteAssociation(
         route_index=geometric_index,
         distance_m=geometric_distance,
         lane_identity_matched=False,
+        junction_topology_overlap=False,
     )
 
 
@@ -407,6 +446,7 @@ class RouteNavigationTracker:
         source_frame_id: int,
         source_simulation_time_s: float,
         ego_lane_identity: Sequence[int] | None = None,
+        ego_lane_is_junction: bool | None = None,
         require_lane_identity: bool = False,
     ) -> RouteTrackingUpdate:
         ego = np.asarray(ego_xyz, dtype=np.float64)
@@ -417,6 +457,7 @@ class RouteNavigationTracker:
             ego,
             start_index=self.route_index,
             lane_identity=ego_lane_identity,
+            lane_is_junction=ego_lane_is_junction,
         )
         associated_index = association.route_index
         route_distance = association.distance_m
@@ -503,6 +544,8 @@ __all__ = [
     "NavigationContext",
     "ROUTE_ARRIVAL_DISTANCE_M",
     "ROUTE_ASSOCIATION_MAX_DISTANCE_M",
+    "ROUTE_JUNCTION_TOPOLOGY_LOOKAHEAD_M",
+    "ROUTE_JUNCTION_TOPOLOGY_OVERLAP_MAX_DISTANCE_M",
     "ROUTE_MANEUVER_COALESCE_DISTANCE_M",
     "RouteAssociation",
     "RouteNavigationTracker",

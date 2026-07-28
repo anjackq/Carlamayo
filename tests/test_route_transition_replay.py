@@ -120,3 +120,81 @@ def test_job_22921097_wrong_connector_remains_unauthorized():
         "wrong_branch_status"
     ]
     assert "unauthorized_junction_branch" in assessment.reason_codes
+
+
+def test_job_22922863_bounded_junction_topology_overlap_is_authorized():
+    replay, route, _ = _load_replay()
+    case = replay["junction_topology_overlap_case"]
+    lane_facts = tuple(
+        CandidateLaneFact(
+            fact["road_id"],
+            fact["section_id"],
+            fact["lane_id"],
+            fact["is_junction"],
+        )
+        for fact in case["candidate_lane_facts"]
+    )
+    overlap_index = case["first_overlap_waypoint_index"]
+    overlap_fact = lane_facts[overlap_index]
+    tracker = RouteNavigationTracker(route)
+    tracker.route_index = case["current_route_index"]
+    update = tracker.update(
+        case["selected_trajectory_world"][overlap_index],
+        source_frame_id=case["source_loop_tick_id"],
+        source_simulation_time_s=case["source_simulation_time_s"],
+        ego_lane_identity=overlap_fact.identity,
+        ego_lane_is_junction=overlap_fact.is_junction,
+        require_lane_identity=True,
+    )
+    assert update.context.tracker_status is RouteTrackerStatus.AVAILABLE
+
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=case["current_route_index"],
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=case["selected_trajectory_world"],
+        waypoint_times_s=case["waypoint_times_s"],
+        source_simulation_time_s=case["source_simulation_time_s"],
+        current_simulation_time_s=case["source_simulation_time_s"],
+        lane_facts=lane_facts,
+    )
+    assert assessment.near_term_route_status.value == case["expected"][
+        "near_term_route_status"
+    ]
+    assert assessment.full_path_route_status.value == case["expected"][
+        "full_path_route_status"
+    ]
+    assert case["expected"]["reason_code"] in assessment.reason_codes
+
+
+def test_job_22922863_unrelated_junction_branch_stays_unauthorized():
+    replay, route, _ = _load_replay()
+    case = replay["junction_topology_overlap_case"]
+    lane_facts = [
+        CandidateLaneFact(
+            fact["road_id"],
+            fact["section_id"],
+            fact["lane_id"],
+            fact["is_junction"],
+        )
+        for fact in case["candidate_lane_facts"]
+    ]
+    overlap_index = case["first_overlap_waypoint_index"]
+    lane_facts[overlap_index] = replace(
+        lane_facts[overlap_index],
+        road_id=999999,
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=case["current_route_index"],
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=case["selected_trajectory_world"],
+        waypoint_times_s=case["waypoint_times_s"],
+        source_simulation_time_s=case["source_simulation_time_s"],
+        current_simulation_time_s=case["source_simulation_time_s"],
+        lane_facts=lane_facts,
+    )
+    assert assessment.full_path_route_status.value == case["expected"][
+        "unrelated_branch_status"
+    ]
+    assert "unauthorized_junction_branch" in assessment.reason_codes

@@ -139,14 +139,20 @@ def _associate_monotonic(
     *,
     route: RoutePlan,
     candidate_identity: tuple[int, int, int] | None,
-) -> tuple[int, float]:
+    candidate_is_junction: bool | None,
+) -> tuple[int, float, bool]:
     association = associate_route_index(
         route,
         point_xy,
         start_index=start_index,
         lane_identity=candidate_identity,
+        lane_is_junction=candidate_is_junction,
     )
-    return association.route_index, association.distance_m
+    return (
+        association.route_index,
+        association.distance_m,
+        association.junction_topology_overlap,
+    )
 
 
 def assess_route_candidate(
@@ -205,11 +211,16 @@ def assess_route_candidate(
             cross_track = math.inf
             reasons.add("map_query_unavailable")
         else:
-            associated_index, cross_track = _associate_monotonic(
+            (
+                associated_index,
+                cross_track,
+                junction_topology_overlap,
+            ) = _associate_monotonic(
                 point[:2],
                 route_index,
                 route=route,
                 candidate_identity=lane_fact.identity,
+                candidate_is_junction=lane_fact.is_junction,
             )
             route_index = max(route_index, associated_index)
             route_point = route.points[associated_index]
@@ -221,6 +232,9 @@ def assess_route_candidate(
             if cross_track > ROUTE_ASSOCIATION_MAX_DISTANCE_M:
                 status = RouteStatus.DEVIATE
                 reasons.add("route_cross_track_exceeded")
+            elif junction_topology_overlap:
+                status = RouteStatus.MATCH
+                reasons.add("junction_topology_overlap_canonicalized")
             elif lane_fact.identity != route_identity:
                 status = RouteStatus.DEVIATE
                 if lane_fact.road_id == route_point.road_id:

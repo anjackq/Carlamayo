@@ -75,6 +75,60 @@ def test_exact_lane_identity_bridges_grp_transition_overlap():
     assert assessment.last_authorized_waypoint_index == 3
 
 
+def test_bounded_future_connector_overlap_is_canonicalized():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((1, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((10, 0, 0), 1608, 1, -1, True, "RIGHT"),
+            RoutePoint((20, 0, 0), 61, 0, -1, False, "LANEFOLLOW"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=0,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[
+            (0.2, 0, 0),
+            (0.8, 0, 0),
+            (1.2, 0, 0),
+        ],
+        waypoint_times_s=[0.5, 1.0, 1.5],
+        source_simulation_time_s=0.0,
+        lane_facts=[
+            _fact(1608, lane=-3, junction=True),
+            _fact(1608, lane=-3, junction=True),
+            _fact(1608, lane=-3, junction=True),
+        ],
+    )
+
+    assert assessment.near_term_route_status is RouteStatus.MATCH
+    assert assessment.full_path_route_status is RouteStatus.MATCH
+    assert "junction_topology_overlap_canonicalized" in assessment.reason_codes
+
+
+def test_future_connector_overlap_outside_route_corridor_is_deviation():
+    route = build_route_plan(
+        [
+            RoutePoint((0, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((1, 0, 0), 1577, 0, -3, True, "RIGHT"),
+            RoutePoint((10, 0, 0), 1608, 1, -1, True, "RIGHT"),
+        ]
+    )
+    assessment = assess_route_candidate(
+        route=route,
+        current_route_index=0,
+        current_route_status=RouteStatus.MATCH,
+        trajectory_world_points=[(0.2, 1.5, 0)],
+        waypoint_times_s=[0.5],
+        source_simulation_time_s=0.0,
+        lane_facts=[_fact(1608, lane=-3, junction=True)],
+    )
+
+    assert assessment.near_term_route_status is RouteStatus.DEVIATE
+    assert "unauthorized_junction_branch" in assessment.reason_codes
+
+
 def test_wrong_junction_branch_is_deviation_and_prefix_is_bounded():
     assessment = assess_route_candidate(
         route=_route(),

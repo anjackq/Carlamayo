@@ -192,6 +192,51 @@ def test_required_lane_identity_mismatch_is_route_unavailable():
     assert tracker.route_index == 0
 
 
+def test_authorized_junction_topology_overlap_keeps_tracker_available():
+    route = build_route_plan(
+        [
+            _point(0.0, road=1577, lane=-3, junction=True),
+            _point(1.0, road=1577, lane=-3, junction=True),
+            _point(10.0, road=1608, lane=-1, junction=True),
+            _point(20.0, road=61, lane=-1),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+    update = tracker.update(
+        (0.2, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+        ego_lane_identity=(1608, 0, -3),
+        ego_lane_is_junction=True,
+        require_lane_identity=True,
+    )
+
+    assert update.context.tracker_status is RouteTrackerStatus.AVAILABLE
+    assert tracker.route_index == 0
+
+
+def test_junction_topology_overlap_outside_lookahead_is_unavailable():
+    route = build_route_plan(
+        [
+            _point(0.0, road=1577, lane=-3, junction=True),
+            _point(1.0, road=1577, lane=-3, junction=True),
+            _point(20.0, road=1608, lane=-1, junction=True),
+            _point(30.0, road=61, lane=-1),
+        ]
+    )
+    tracker = RouteNavigationTracker(route)
+    update = tracker.update(
+        (0.2, 0.0, 0.0),
+        source_frame_id=1,
+        source_simulation_time_s=0.1,
+        ego_lane_identity=(1608, 0, -3),
+        ego_lane_is_junction=True,
+        require_lane_identity=True,
+    )
+
+    assert update.context.tracker_status is RouteTrackerStatus.ROUTE_UNAVAILABLE
+
+
 def test_arrival_context_requests_destination_stop():
     tracker = RouteNavigationTracker(_route())
     update = tracker.update(

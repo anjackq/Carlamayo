@@ -965,6 +965,11 @@ def main():
             ego_lane_identity=(
                 ego_lane_fact.identity if ego_lane_fact.available else None
             ),
+            ego_lane_is_junction=(
+                ego_lane_fact.is_junction
+                if ego_lane_fact.available
+                else None
+            ),
             require_lane_identity=True,
         )
 
