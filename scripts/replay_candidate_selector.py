@@ -75,6 +75,18 @@ def _motion_fields(candidate: dict[str, Any]) -> tuple[str | None, float | None]
     )
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite diagnostic floats without changing ranking inputs."""
+
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _evaluation(candidate: dict[str, Any]) -> CandidateEvaluation:
     route_status, branch_match, cross_track = _route_fields(candidate)
     motion_class, initial_speed = _motion_fields(candidate)
@@ -122,6 +134,9 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
     candidates = list(event.get("candidate_audits") or ())
     if not candidates:
         raise ValueError("policy audit batch has no candidates")
+    route_evaluable = any(
+        _route_fields(candidate)[0] is not None for candidate in candidates
+    )
     current = rank_candidate_evaluations(
         [_evaluation(candidate) for candidate in candidates],
         navigation_text=event.get("navigation_text"),
@@ -153,13 +168,14 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         "model_first_selected_index": min(
             int(candidate["candidate_index"]) for candidate in candidates
         ),
+        "route_evaluable": route_evaluable,
         "route_first_unambiguous": ties == 1,
         "current_matches_route_first": int(current.selected_index) == route_first,
         "route_match_candidate_indices": match_candidates,
         "current_selected_wrong_when_match_available": bool(
             match_candidates and int(current.selected_index) not in match_candidates
         ),
-        "current_selection": current.to_json_dict(),
+        "current_selection": _json_safe(current.to_json_dict()),
         "route_first_ranking": [
             {
                 "candidate_index": int(candidate["candidate_index"]),
@@ -174,7 +190,12 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def summarize(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    unambiguous = [record for record in records if record["route_first_unambiguous"]]
+    route_evaluable = [record for record in records if record["route_evaluable"]]
+    unambiguous = [
+        record
+        for record in route_evaluable
+        if record["route_first_unambiguous"]
+    ]
     wrong = sum(
         record["current_selected_wrong_when_match_available"] for record in records
     )
@@ -182,6 +203,7 @@ def summarize(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {
         "batches": len(records),
         "fixture_batch_counts": dict(sorted(fixture_counts.items())),
+        "route_evaluable_batches": len(route_evaluable),
         "route_first_unambiguous_batches": len(unambiguous),
         "current_route_first_accuracy": (
             sum(record["current_matches_route_first"] for record in unambiguous)

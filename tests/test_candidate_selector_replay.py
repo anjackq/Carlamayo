@@ -1,3 +1,5 @@
+import json
+
 from scripts.replay_candidate_selector import replay_batch, summarize
 
 
@@ -81,5 +83,66 @@ def test_selector_replay_summary_reports_conditional_accuracy():
     summary = summarize(records)
 
     assert summary["batches"] == 3
+    assert summary["route_evaluable_batches"] == 3
     assert summary["current_route_first_accuracy"] == 1.0
     assert summary["current_wrong_when_route_match_available"] == 0
+
+
+def test_selector_replay_serializes_invalid_candidate_diagnostics():
+    event = {
+        "fixture_label": "invalid",
+        "fixture_id": "fixture",
+        "seed": 0,
+        "navigation_text": "Continue in the current lane.",
+        "actual_speed_mps": 1.0,
+        "candidate_audits": [
+            _candidate(
+                0,
+                motion="MOVING",
+                route="MATCH",
+                branch=True,
+                cross_track=0.1,
+            ),
+            {
+                "candidate_index": 1,
+                "valid": False,
+                "error": "invalid trajectory",
+                "stop_intent": False,
+                "forward_progress_m": 0.0,
+                "representative_lateral_m": 0.0,
+                "motion_profile": None,
+                "route_assessment": None,
+            },
+        ],
+    }
+
+    replay = replay_batch(event)
+
+    invalid = replay["current_selection"]["candidate_evaluations"][1]
+    assert invalid["speed_continuity_rank_mps"] is None
+    json.dumps(replay, allow_nan=False)
+
+
+def test_selector_replay_does_not_claim_route_accuracy_without_route_truth():
+    candidate = _candidate(
+        0,
+        motion="MOVING",
+        route=None,
+        branch=None,
+        cross_track=None,
+    )
+    event = {
+        "fixture_label": "synthetic-history",
+        "fixture_id": "fixture",
+        "seed": 0,
+        "navigation_text": "Continue in the current lane.",
+        "actual_speed_mps": 1.0,
+        "candidate_audits": [candidate],
+    }
+
+    replay = replay_batch(event)
+    summary = summarize([replay])
+
+    assert replay["route_evaluable"] is False
+    assert summary["route_evaluable_batches"] == 0
+    assert summary["current_route_first_accuracy"] is None
