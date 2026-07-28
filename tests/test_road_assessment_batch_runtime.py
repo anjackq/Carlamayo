@@ -74,6 +74,12 @@ class _BatchStats:
             "chunk_count": 1,
             "profile_cache_hits": 0,
             "backend_status": "serial",
+            "commissioning_batch": True,
+            "query_deadline_ms": 500.0,
+            "process_attempt_ms": 37.5,
+            "shadow_serial_ms": 12.5,
+            "shadow_serial_query_count": 960,
+            "shadow_parity_ms": 13.0,
         }
 
 
@@ -236,6 +242,16 @@ def test_k3_candidate_selection_uses_one_ordered_batch_and_emits_additive_stats(
     assert selection["worker_count"] == 1
     assert selection["chunk_count"] == 1
     assert selection["profile_cache_hits"] == 0
+    assert selection["commissioning_batch"] is True
+    assert selection["query_deadline_ms"] == pytest.approx(500.0)
+    assert selection["process_attempt_ms"] == pytest.approx(37.5)
+    assert selection["shadow_serial_ms"] == pytest.approx(12.5)
+    assert selection["shadow_serial_query_count"] == 960
+    assert selection["shadow_parity_ms"] == pytest.approx(13.0)
+    # Deadlines are configuration telemetry, never substituted for observed
+    # promotion metrics.
+    assert selection["road_batch_wall_ms"] != selection["query_deadline_ms"]
+    assert selection["map_query_ms"] != selection["query_deadline_ms"]
     for field in (
         "selection_compute_ms",
         "selection_latency_ms",

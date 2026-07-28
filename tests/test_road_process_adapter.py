@@ -97,6 +97,7 @@ class _FakeProcessBackend:
     def query(self, queries):
         queries = tuple(queries)
         self.query_calls.append(queries)
+        commissioning_batch = len(self.query_calls) == 1
         action = (
             self.script.popleft()
             if self.script
@@ -117,6 +118,10 @@ class _FakeProcessBackend:
             map_query_count=5 * len(results),
             worker_count=2,
             chunk_count=max(1, (len(results) + 15) // 16),
+            commissioning_batch=commissioning_batch,
+            query_deadline_ms=(
+                500.0 if commissioning_batch else 250.0
+            ),
         )
 
     def close(self):
@@ -199,6 +204,25 @@ def test_first_batch_shadow_pass_then_process_only_preserves_exact_semantics():
     assert _semantic_payload(first[0]) == _semantic_payload(expected)
     assert adapter.last_road_batch_stats.backend_status == "process_shadow_pass"
     assert adapter.last_road_batch_stats.shadow_parity_status == "pass"
+    assert adapter.last_road_batch_stats.commissioning_batch is True
+    assert adapter.last_road_batch_stats.query_deadline_ms == pytest.approx(
+        500.0
+    )
+    assert adapter.last_road_batch_stats.process_attempt_ms >= 0.0
+    assert adapter.last_road_batch_stats.shadow_serial_ms > 0.0
+    assert adapter.last_road_batch_stats.shadow_serial_query_count > 0
+    assert (
+        adapter.last_road_batch_stats.shadow_parity_ms
+        >= adapter.last_road_batch_stats.shadow_serial_ms
+    )
+    assert (
+        adapter.last_road_batch_stats.map_query_ms
+        < adapter.last_road_batch_stats.query_deadline_ms
+    )
+    assert (
+        adapter.last_road_batch_stats.map_query_ms
+        != adapter.last_road_batch_stats.query_deadline_ms
+    )
     assert len(factory.instances[0].query_calls) == 1
 
     carla_map.calls.clear()
@@ -219,6 +243,12 @@ def test_first_batch_shadow_pass_then_process_only_preserves_exact_semantics():
     assert second[0].current_ego_road.status is AssessmentStatus.SAFE
     assert adapter.last_road_batch_stats.backend_status == "process"
     assert adapter.last_road_batch_stats.shadow_parity_status == "not_run"
+    assert adapter.last_road_batch_stats.commissioning_batch is False
+    assert adapter.last_road_batch_stats.query_deadline_ms == pytest.approx(
+        250.0
+    )
+    assert adapter.last_road_batch_stats.shadow_serial_ms == 0.0
+    assert adapter.last_road_batch_stats.shadow_serial_query_count == 0
     assert len(factory.instances[0].query_calls) == 2
     # The second profile is process-backed; only current ego uses parent map.
     assert len(carla_map.calls) == 5
@@ -315,6 +345,9 @@ def test_process_failure_uses_exact_serial_fallback_until_reset(
     assert stats.fallback_reason == expected_reason
     assert stats.serial_fallback_ms >= 0.0
     assert factory.instances[0].close_count == 1
+    assert stats.commissioning_batch is True
+    assert stats.query_deadline_ms == pytest.approx(500.0)
+    assert stats.process_attempt_ms >= 0.0
 
     adapter.assess_plans_road(
         tick_context=_tick_context(ego, frame=51, simulation_time_s=5.1),
@@ -343,6 +376,43 @@ def test_process_failure_uses_exact_serial_fallback_until_reset(
     )
     assert recovered[0].current_ego_road.status is AssessmentStatus.SAFE
     assert adapter.last_road_batch_stats.backend_status == "process_shadow_pass"
+
+
+def test_steady_timeout_reports_steady_deadline_after_successful_commissioning():
+    factory = _ProcessBackendFactory(
+        ("match", RoadProcessBackendTimeout("steady timeout")),
+    )
+    adapter, _world, ego = _process_adapter(
+        _OpenDriveRecordingMap(),
+        factory,
+    )
+    first_plan = _long_plan(
+        plan_id="commissioning-success",
+        start_time_s=5.0,
+    )
+    adapter.assess_plans_road(
+        tick_context=_tick_context(ego, frame=50, simulation_time_s=5.0),
+        plans=(first_plan,),
+    )
+    assert adapter.last_road_batch_stats.backend_status == "process_shadow_pass"
+
+    second_plan = _long_plan(
+        plan_id="steady-timeout",
+        start_time_s=5.1,
+        step_m=0.11,
+    )
+    adapter.assess_plans_road(
+        tick_context=_tick_context(ego, frame=51, simulation_time_s=5.1),
+        plans=(second_plan,),
+    )
+
+    stats = adapter.last_road_batch_stats
+    assert stats.backend_status == "process_serial_fallback_timeout"
+    assert stats.fallback_reason == "timeout"
+    assert stats.commissioning_batch is False
+    assert stats.query_deadline_ms == pytest.approx(250.0)
+    assert stats.serial_fallback_ms >= 0.0
+    assert factory.instances[0].close_count == 1
 
 
 def test_process_failure_falls_back_to_exact_serial_for_the_whole_batch():

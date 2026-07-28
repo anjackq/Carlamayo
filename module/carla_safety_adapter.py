@@ -121,7 +121,12 @@ class RoadTickFacts:
 
 @dataclass(frozen=True)
 class RoadAssessmentBatchStats:
-    """Timing and exact-query workload for one ordered road-assessment batch."""
+    """Timing and exact-query workload for one ordered road-assessment batch.
+
+    ``map_query_ms`` and ``map_query_count`` describe the primary backend plus
+    the current-ego query.  First-batch exact serial shadow work is reported
+    separately so process performance remains directly observable.
+    """
 
     backend_status: str = "serial"
     road_batch_wall_ms: float = 0.0
@@ -141,6 +146,12 @@ class RoadAssessmentBatchStats:
     fallback_reason: str | None = None
     serial_fallback_ms: float = 0.0
     worker_query_sum_ms: float = 0.0
+    commissioning_batch: bool = False
+    query_deadline_ms: float = 0.0
+    process_attempt_ms: float = 0.0
+    shadow_serial_ms: float = 0.0
+    shadow_serial_query_count: int = 0
+    shadow_parity_ms: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +173,12 @@ class RoadAssessmentBatchStats:
             "fallback_reason": self.fallback_reason,
             "serial_fallback_ms": self.serial_fallback_ms,
             "worker_query_sum_ms": self.worker_query_sum_ms,
+            "commissioning_batch": bool(self.commissioning_batch),
+            "query_deadline_ms": self.query_deadline_ms,
+            "process_attempt_ms": self.process_attempt_ms,
+            "shadow_serial_ms": self.shadow_serial_ms,
+            "shadow_serial_query_count": self.shadow_serial_query_count,
+            "shadow_parity_ms": self.shadow_parity_ms,
         }
 
 
@@ -352,6 +369,12 @@ class _RoadBatchAccumulator:
     shadow_parity_status: str = "not_run"
     fallback_reason: str | None = None
     serial_fallback_s: float = 0.0
+    commissioning_batch: bool = False
+    query_deadline_ms: float = 0.0
+    process_attempt_s: float = 0.0
+    shadow_serial_s: float = 0.0
+    shadow_serial_query_count: int = 0
+    shadow_parity_s: float = 0.0
     backend_status: str | None = None
 
 
@@ -1307,6 +1330,9 @@ class CarlaGroundTruthSafetyAdapter:
             ),
             startup_timeout_s=float(
                 cfg.ROAD_ASSESSMENT_PROCESS_STARTUP_TIMEOUT_S
+            ),
+            commissioning_timeout_s=float(
+                cfg.ROAD_ASSESSMENT_PROCESS_COMMISSIONING_TIMEOUT_S
             ),
             batch_timeout_s=float(
                 cfg.ROAD_ASSESSMENT_PROCESS_BATCH_TIMEOUT_S
@@ -2599,6 +2625,18 @@ class CarlaGroundTruthSafetyAdapter:
                 for prepared in prepared_by_index.values()
                 for query in prepared.queries
             )
+            batch_accumulator.commissioning_batch = bool(
+                self._process_shadow_pending
+            )
+            batch_accumulator.query_deadline_ms = (
+                float(
+                    cfg.ROAD_ASSESSMENT_PROCESS_COMMISSIONING_TIMEOUT_S
+                    if self._process_shadow_pending
+                    else cfg.ROAD_ASSESSMENT_PROCESS_BATCH_TIMEOUT_S
+                )
+                * 1000.0
+            )
+            process_attempt_started_s = time.perf_counter()
             try:
                 process_results, process_stats = backend.query(
                     ordered_queries
@@ -2634,6 +2672,12 @@ class CarlaGroundTruthSafetyAdapter:
                 )
                 batch_accumulator.worker_count = process_stats.worker_count
                 batch_accumulator.chunk_count = process_stats.chunk_count
+                batch_accumulator.commissioning_batch = bool(
+                    getattr(process_stats, "commissioning_batch", False)
+                )
+                batch_accumulator.query_deadline_ms = float(
+                    getattr(process_stats, "query_deadline_ms", 0.0)
+                )
             except RoadProcessBackendTimeout:
                 batch_accumulator.fallback_reason = "timeout"
                 self._process_generation_disabled_reason = "timeout"
@@ -2649,6 +2693,10 @@ class CarlaGroundTruthSafetyAdapter:
                 )
                 self._process_generation_disabled_reason = (
                     "protocol_error"
+                )
+            finally:
+                batch_accumulator.process_attempt_s += (
+                    time.perf_counter() - process_attempt_started_s
                 )
             if process_profiles is None:
                 self._close_process_backend()
@@ -2689,6 +2737,10 @@ class CarlaGroundTruthSafetyAdapter:
                 batch_accumulator=shadow_accumulator,
             )
             shadow_duration_s = time.perf_counter() - shadow_started_s
+            batch_accumulator.shadow_serial_s += shadow_duration_s
+            batch_accumulator.shadow_serial_query_count += (
+                shadow_accumulator.map_query_count
+            )
             parity_ok = all(
                 self._profiles_semantically_equal(
                     process_profiles[plan_index],
@@ -2707,6 +2759,9 @@ class CarlaGroundTruthSafetyAdapter:
                     ),
                 )
                 for plan_index in prepared_by_index
+            )
+            batch_accumulator.shadow_parity_s += (
+                time.perf_counter() - shadow_started_s
             )
             self._process_shadow_pending = False
             if parity_ok:
@@ -2787,6 +2842,22 @@ class CarlaGroundTruthSafetyAdapter:
             ),
             worker_query_sum_ms=(
                 batch_accumulator.worker_query_sum_s * 1000.0
+            ),
+            commissioning_batch=bool(
+                batch_accumulator.commissioning_batch
+            ),
+            query_deadline_ms=batch_accumulator.query_deadline_ms,
+            process_attempt_ms=(
+                batch_accumulator.process_attempt_s * 1000.0
+            ),
+            shadow_serial_ms=(
+                batch_accumulator.shadow_serial_s * 1000.0
+            ),
+            shadow_serial_query_count=int(
+                batch_accumulator.shadow_serial_query_count
+            ),
+            shadow_parity_ms=(
+                batch_accumulator.shadow_parity_s * 1000.0
             ),
         )
 

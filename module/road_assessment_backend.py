@@ -104,6 +104,8 @@ class ProcessRoadBatchStats:
     map_query_count: int
     worker_count: int
     chunk_count: int
+    commissioning_batch: bool = False
+    query_deadline_ms: float = 0.0
 
 
 def validate_footprint_query_result(
@@ -321,16 +323,25 @@ class ExactRoadProcessBackend:
         worker_count: int,
         chunk_pose_count: int = 16,
         startup_timeout_s: float = 10.0,
-        batch_timeout_s: float = 0.15,
+        commissioning_timeout_s: float = 0.5,
+        batch_timeout_s: float = 0.25,
         context_factory: Callable[[str], Any] = multiprocessing.get_context,
     ) -> None:
         self.worker_count = int(worker_count)
         self.chunk_pose_count = int(chunk_pose_count)
+        self.commissioning_timeout_s = float(commissioning_timeout_s)
         self.batch_timeout_s = float(batch_timeout_s)
         if self.worker_count < 1:
             raise ValueError("worker_count must be positive")
         if self.chunk_pose_count < 1:
             raise ValueError("chunk_pose_count must be positive")
+        if (
+            not math.isfinite(self.commissioning_timeout_s)
+            or self.commissioning_timeout_s <= 0.0
+        ):
+            raise ValueError(
+                "commissioning_timeout_s must be finite and positive"
+            )
         if (
             not math.isfinite(self.batch_timeout_s)
             or self.batch_timeout_s <= 0.0
@@ -351,6 +362,9 @@ class ExactRoadProcessBackend:
             )
 
         self._closed = False
+        self._commissioning_pending = True
+        self.last_query_commissioning_batch = False
+        self.last_query_deadline_ms = 0.0
         self._context = context_factory("spawn")
         self._ready_queue = self._context.Queue()
         self._pool = None
@@ -406,12 +420,16 @@ class ExactRoadProcessBackend:
         if len(set(expected_ids)) != len(expected_ids):
             raise ValueError("footprint query IDs must be unique")
         if not ordered_queries:
+            self.last_query_commissioning_batch = False
+            self.last_query_deadline_ms = 0.0
             return (), ProcessRoadBatchStats(
                 map_query_wall_ms=0.0,
                 worker_query_sum_ms=0.0,
                 map_query_count=0,
                 worker_count=self.worker_count,
                 chunk_count=0,
+                commissioning_batch=False,
+                query_deadline_ms=0.0,
             )
 
         chunks = tuple(
@@ -424,7 +442,15 @@ class ExactRoadProcessBackend:
             )
         )
         batch_started_s = time.perf_counter()
-        deadline = time.monotonic() + self.batch_timeout_s
+        commissioning_batch = bool(self._commissioning_pending)
+        query_timeout_s = (
+            self.commissioning_timeout_s
+            if commissioning_batch
+            else self.batch_timeout_s
+        )
+        self.last_query_commissioning_batch = commissioning_batch
+        self.last_query_deadline_ms = query_timeout_s * 1000.0
+        deadline = time.monotonic() + query_timeout_s
         chunk_results = {}
         failure_phase = "dispatch"
         try:
@@ -522,6 +548,7 @@ class ExactRoadProcessBackend:
         except BaseException:
             self._terminate_pool()
             raise
+        self._commissioning_pending = False
         return ordered_results, ProcessRoadBatchStats(
             map_query_wall_ms=(
                 time.perf_counter() - batch_started_s
@@ -535,6 +562,8 @@ class ExactRoadProcessBackend:
             ),
             worker_count=self.worker_count,
             chunk_count=len(chunks),
+            commissioning_batch=commissioning_batch,
+            query_deadline_ms=query_timeout_s * 1000.0,
         )
 
     def _terminate_pool(self) -> None:

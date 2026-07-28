@@ -1820,6 +1820,12 @@ def main():
                 "serial_fallback_ms": None,
                 "worker_query_sum_ms": None,
                 "worker_restart_count": None,
+                "commissioning_batch": None,
+                "query_deadline_ms": None,
+                "process_attempt_ms": None,
+                "shadow_serial_ms": None,
+                "shadow_serial_query_count": None,
+                "shadow_parity_ms": None,
                 "backend_status": (
                     "batch_error"
                     if batch_failed

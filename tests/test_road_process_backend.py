@@ -134,6 +134,7 @@ class _FakePool:
     def __init__(self, responses):
         self.responses = deque(responses)
         self.apply_calls = []
+        self.async_results = []
         self.close_count = 0
         self.terminate_count = 0
         self.join_count = 0
@@ -144,8 +145,11 @@ class _FakePool:
         if isinstance(response, _ApplyAsyncFailure):
             raise response.exception
         if isinstance(response, BaseException):
-            return _FakeAsyncResult(exception=response)
-        return _FakeAsyncResult(value=response)
+            result = _FakeAsyncResult(exception=response)
+        else:
+            result = _FakeAsyncResult(value=response)
+        self.async_results.append(result)
+        return result
 
     def close(self):
         self.close_count += 1
@@ -187,6 +191,8 @@ def _backend_with_fake_context(
     responses=(),
     readiness=None,
     chunk_pose_count=2,
+    commissioning_timeout_s=0.5,
+    batch_timeout_s=0.25,
 ):
     context = _FakeContext(
         worker_count=worker_count,
@@ -206,7 +212,8 @@ def _backend_with_fake_context(
         worker_count=worker_count,
         chunk_pose_count=chunk_pose_count,
         startup_timeout_s=1.0,
-        batch_timeout_s=1.0,
+        commissioning_timeout_s=commissioning_timeout_s,
+        batch_timeout_s=batch_timeout_s,
         context_factory=context_factory,
     )
     return backend, context, requested_start_methods
@@ -319,6 +326,44 @@ def test_reverse_chunk_completion_is_reassembled_in_query_input_order():
     assert len(context.pool.apply_calls) == 3
 
 
+def test_empty_query_does_not_consume_commissioning_and_first_success_switches_deadline():
+    backend, context, _requested_methods = _backend_with_fake_context(
+        worker_count=1,
+        responses=(
+            _chunk_result(0, (1,)),
+            _chunk_result(0, (2,)),
+        ),
+        chunk_pose_count=16,
+        commissioning_timeout_s=0.5,
+        batch_timeout_s=0.25,
+    )
+
+    empty_results, empty_stats = backend.query(())
+    first_results, first_stats = backend.query((_query(1),))
+    second_results, second_stats = backend.query((_query(2),))
+
+    assert empty_results == ()
+    assert empty_stats.commissioning_batch is False
+    assert empty_stats.query_deadline_ms == 0.0
+    assert [result.query_id for result in first_results] == [1]
+    assert first_stats.commissioning_batch is True
+    assert first_stats.query_deadline_ms == pytest.approx(500.0)
+    assert [result.query_id for result in second_results] == [2]
+    assert second_stats.commissioning_batch is False
+    assert second_stats.query_deadline_ms == pytest.approx(250.0)
+
+    first_wait = context.pool.async_results[0].timeouts[0]
+    second_wait = context.pool.async_results[1].timeouts[0]
+    assert 0.45 < first_wait <= 0.5
+    assert 0.20 < second_wait <= 0.25
+    # Promotion observes actual wall time. The configured deadline is a
+    # separate diagnostic field and must never overwrite the measurement.
+    assert first_stats.map_query_wall_ms < first_stats.query_deadline_ms
+    assert second_stats.map_query_wall_ms < second_stats.query_deadline_ms
+    assert first_stats.map_query_wall_ms != first_stats.query_deadline_ms
+    assert second_stats.map_query_wall_ms != second_stats.query_deadline_ms
+
+
 @pytest.mark.parametrize(
     "responses",
     [
@@ -383,6 +428,27 @@ def test_timeout_or_worker_crash_terminates_pool(
     assert context.pool.terminate_count == 1
     assert context.pool.join_count == 1
     assert context.ready_queue.closed_count == 1
+
+
+def test_first_commissioning_timeout_uses_500ms_and_closes_backend():
+    backend, context, _requested_methods = _backend_with_fake_context(
+        worker_count=1,
+        responses=(multiprocessing.TimeoutError(),),
+        chunk_pose_count=1,
+        commissioning_timeout_s=0.5,
+        batch_timeout_s=0.25,
+    )
+
+    with pytest.raises(RoadProcessBackendTimeout):
+        backend.query((_query(1),))
+
+    wait_timeout = context.pool.async_results[0].timeouts[0]
+    assert 0.45 < wait_timeout <= 0.5
+    assert context.pool.terminate_count == 1
+    assert context.pool.join_count == 1
+    assert context.ready_queue.closed_count == 1
+    with pytest.raises(RoadProcessBackendCrashed, match="closed"):
+        backend.query((_query(2),))
 
 
 @pytest.mark.parametrize(
