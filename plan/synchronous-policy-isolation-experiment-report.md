@@ -181,6 +181,71 @@ while the paired trajectory stops, starts late, or follows the wrong geometry.
 This is a `CoC / trajectory mismatch`, not evidence that CoC should receive
 control authority.
 
+## Follow-up — Low-speed longitudinal governor
+
+Code `6ab94bc` adds an opt-in governor for non-safety tracking with a
+0.5–2.0 m/s target. It:
+
+- limits raw propulsion to 0.25 throttle;
+- bypasses longitudinal EMA while continuing to smooth steering;
+- replaces low-speed non-safety PID brake with coast while actual speed is at
+  most 3 m/s;
+- remains inactive for terminal-stop trajectories, binding road/route speed
+  caps, target speeds outside the calibrated range, and explicit fail-closed
+  control.
+
+The matched A/B experiment used the same Town03 route, seed 0, 20 seconds, and
+synchronous model-free oracle trajectory. The only experimental difference was
+the governor flag.
+
+| Target | Strict control job | Governor job | Stop-go strict → governor | Settled MAE strict → governor | Hard brake strict → governor |
+|---:|---:|---:|---:|---:|---:|
+| 0.5 m/s | `22942206` | `22942213` | 20 → 0 | 0.355 → 0.125 m/s | 39 → 0 |
+| 1.0 m/s | `22942207` | `22942214` | 12 → 0 | 0.676 → 0.091 m/s | 67 → 0 |
+| 2.0 m/s | `22942208` | `22942215` | 9 → 0 | 1.114 → 0.092 m/s | 69 → 0 |
+
+All six runs completed 200 ticks with zero collision and zero safety override.
+Every current-ego road assessment was SAFE and every near-term route assessment
+was MATCH. The governor runs had no post-launch stationary tick.
+
+The initial governor trial (`22942202–05`) showed that CARLA's Model 3 can lock
+its wheels from 1–2 m/s even with brake 0.08, and that a floating value such as
+`2.00000000000014` must not fall outside the 2 m/s activation boundary. Those
+observations produced the epsilon-safe, coast-only v2 policy above.
+
+The repaired oracle harness permits natural authorized route curvature after
+the 1.5-second execution horizon while retaining exact road and route gates.
+The resulting 5 m/s negative control completed all 200 ticks:
+
+| 5 m/s run | Job | Distance | Settled MAE | Governor activity |
+|---|---:|---:|---:|---|
+| Strict | `22942484` | 88.556 m | 0.084 m/s | disabled |
+| Governor flag | `22942483` | 88.530 m | 0.085 m/s | INACTIVE 200/200 |
+
+Both runs had zero collision, zero override, 200/200 current-road SAFE, and
+200/200 near-route MATCH. The governor therefore does not alter this
+out-of-range negative control.
+
+The synchronous Alpamayo strict-route smoke test used Town03 seed 0,
+projection-only cameras, `K=3`, temperature 1.0, and the exact serial road
+backend. It did not enable lateral safe-prefix execution.
+
+| Job | Route progress | Distance | Longest stationary / final suffix | Safety |
+|---:|---:|---:|---:|---|
+| `22942485` | 63.29 m (65.19%) | 63.99 m | 106 / 107 ticks | 0 collision, 0 ego-road UNSAFE, 0 direct override |
+
+The governor was active on 47/450 ticks (`39 THROTTLE_LIMITED`, `8 COAST`) and
+inactive on the remaining 375 ticks. Initial low-speed control and restarts did
+not reproduce the oracle wheel-lock loop. Nevertheless, Alpamayo later emitted
+explicit-stop, creep, and delayed-start trajectories at the junction. The run
+ended with an absorbing stop and 21 selected-candidate
+`TRAJECTORY_MISMATCH` audit verdicts.
+
+The low-speed controller patch therefore passes its isolated oracle gate and
+does not introduce a safety regression in the smoke test, but it does not pass
+the route-completion gate. Keep it opt-in until a multi-seed closed-loop test
+shows a material behavior improvement.
+
 ## Gate decisions
 
 ### Promote
@@ -195,6 +260,7 @@ control authority.
 
 - `K=3`.
 - `--route-lateral-safe-prefix`.
+- `--low-speed-longitudinal-governor`.
 - Frozen policy audit and oracle route runner.
 
 ### Do not promote
@@ -205,17 +271,14 @@ control authority.
 
 ## Next synchronous patches
 
-1. Calibrate low-speed longitudinal control against the oracle suite at
-   0.5/1/2/5 m/s. Promotion requires monotonic speed tracking without changing
-   road or route semantics.
-2. Add a frozen junction metric that compares predicted arc length and terminal
+1. Add a frozen junction metric that compares predicted arc length and terminal
    displacement against the source-speed reachable envelope. Keep it
    diagnostic first; do not spatially snap Alpamayo output to the route.
-3. Test whether selector ranking can reject `EXPLICIT_STOP` and
+2. Test whether selector ranking can reject `EXPLICIT_STOP` and
    `DELAYED_START` only when a route-matching moving candidate exists. It must
    never invent motion when every candidate stops or when scene truth requires
    stopping.
-4. If Alpamayo continues to provide no route-matching candidate at active
+3. If Alpamayo continues to provide no route-matching candidate at active
    junction positions, evaluate a separate architecture in which CARLA route
    geometry owns lateral control and Alpamayo supplies longitudinal/behavioral
    intent. Report this as a change in Alpamayo's control role, not as a
