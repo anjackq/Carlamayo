@@ -235,6 +235,46 @@ def test_low_speed_governor_coasts_instead_of_wheel_locking_brake(follower):
     assert debug["low_speed_longitudinal_governor"]["mode"] == "COAST"
 
 
+def test_low_speed_governor_preserves_large_high_speed_deceleration(follower):
+    points = _straight_path(0.1)
+    follower.pid.run_step = lambda *_args: types.SimpleNamespace(
+        steer=0.1,
+        throttle=0.0,
+        brake=0.8,
+    )
+
+    _, throttle, brake, debug = follower.compute_world_control(
+        plan_id="low-target-high-actual-speed",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=3.2,
+        enable_low_speed_longitudinal_governor=True,
+    )
+
+    assert (throttle, brake) == pytest.approx((0.0, 0.8))
+    assert (
+        debug["low_speed_longitudinal_governor"]["mode"]
+        == "PASSTHROUGH_HIGH_SPEED"
+    )
+
+
+def test_low_speed_governor_accepts_floating_point_upper_boundary(follower):
+    points = _straight_path(0.2 + 1e-14)
+
+    *_, debug = follower.compute_world_control(
+        plan_id="low-speed-floating-boundary",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+        enable_low_speed_longitudinal_governor=True,
+    )
+
+    assert debug["target_speed_mps"] == pytest.approx(2.0)
+    assert debug["low_speed_longitudinal_governor"]["active"] is True
+
+
 def test_low_speed_governor_never_weakens_terminal_or_road_braking(follower):
     points = _straight_path(0.1)
     points[40:] = points[39]

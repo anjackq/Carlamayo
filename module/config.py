@@ -249,13 +249,12 @@ PID_LAUNCH_HORIZON_S = 1.5  # near-horizon window used to judge plan launch inte
 # Opt-in low-speed longitudinal governor. CARLA's official longitudinal PID
 # operates on km/h error; below roughly 2 m/s it otherwise alternates maximum
 # throttle and wheel-locking brake commands. The governor limits propulsion,
-# coasts through small overspeed, and bounds moderate corrective braking.
+# coasts through low-speed overshoot without weakening higher-speed braking.
 PID_LOW_SPEED_GOVERNOR_MIN_TARGET_MPS = 0.5
 PID_LOW_SPEED_GOVERNOR_MAX_TARGET_MPS = 2.0
 PID_LOW_SPEED_GOVERNOR_MAX_THROTTLE = 0.25
-PID_LOW_SPEED_GOVERNOR_COAST_OVERSPEED_MPS = 0.5
-PID_LOW_SPEED_GOVERNOR_SOFT_BRAKE_OVERSPEED_MPS = 1.0
-PID_LOW_SPEED_GOVERNOR_MAX_BRAKE = 0.08
+# Even brake=0.08 locked the Model 3 wheels from 1-2 m/s in oracle v1.
+PID_LOW_SPEED_GOVERNOR_BRAKE_PASSTHROUGH_SPEED_MPS = 3.0
 PID_LAT_KP = 1.1
 PID_LAT_KI = 0.02
 PID_LAT_KD = 0.15

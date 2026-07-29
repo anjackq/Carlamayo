@@ -204,9 +204,9 @@ class OfficialPIDFollower:
             or road_speed_limited
             or terminal_stop_index is not None
             or target_speed_mps
-            < float(cfg.PID_LOW_SPEED_GOVERNOR_MIN_TARGET_MPS)
+            < float(cfg.PID_LOW_SPEED_GOVERNOR_MIN_TARGET_MPS) - 1e-6
             or target_speed_mps
-            > float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_TARGET_MPS)
+            > float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_TARGET_MPS) + 1e-6
         ):
             return raw_throttle, raw_brake, inactive
 
@@ -220,21 +220,13 @@ class OfficialPIDFollower:
 
         if raw_brake > 0.0:
             throttle_out = 0.0
-            if overspeed_mps <= float(
-                cfg.PID_LOW_SPEED_GOVERNOR_COAST_OVERSPEED_MPS
+            if current_speed_mps <= float(
+                cfg.PID_LOW_SPEED_GOVERNOR_BRAKE_PASSTHROUGH_SPEED_MPS
             ):
                 brake_out = 0.0
                 mode = "COAST"
-            elif overspeed_mps <= float(
-                cfg.PID_LOW_SPEED_GOVERNOR_SOFT_BRAKE_OVERSPEED_MPS
-            ):
-                brake_out = min(
-                    raw_brake,
-                    float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_BRAKE),
-                )
-                mode = "SOFT_BRAKE"
             else:
-                mode = "PASSTHROUGH_LARGE_OVERSPEED"
+                mode = "PASSTHROUGH_HIGH_SPEED"
 
         return throttle_out, brake_out, {
             "active": True,
