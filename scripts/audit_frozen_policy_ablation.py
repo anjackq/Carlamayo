@@ -20,6 +20,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from module.camera_fixture import load_camera_fixture  # noqa: E402
+from module import config as cfg  # noqa: E402
 from module.carla_route_adapter import (  # noqa: E402
     assess_current_route_status,
     query_candidate_lane_facts,
@@ -30,6 +31,9 @@ from module.trajectory_runtime import (  # noqa: E402
     TrajectoryValidationError,
     build_fixed_world_trajectory,
     compute_trajectory_motion_profile,
+)
+from module.trajectory_reachability import (  # noqa: E402
+    compute_trajectory_reachability_profile,
 )
 
 
@@ -107,6 +111,16 @@ def audit_candidate(
     motion = None
     route_assessment = None
     error = None
+    reachability = None
+    reachability_error = None
+    try:
+        reachability = compute_trajectory_reachability_profile(
+            candidate.get("trajectory"),
+            fixture["ego_history_xyz"],
+            source_speed_mps=metadata.get("actual_speed_mps"),
+        )
+    except (ValueError, TypeError) as exc:
+        reachability_error = f"{type(exc).__name__}:{exc}"
     try:
         plan = build_fixed_world_trajectory(
             plan_id=f"frozen-{candidate_index}",
@@ -193,6 +207,10 @@ def audit_candidate(
         "navigation_action": action,
         "navigation_direction_match": direction_match,
         "motion_profile": motion.to_json_dict() if motion is not None else None,
+        "reachability_profile": (
+            reachability.to_json_dict() if reachability is not None else None
+        ),
+        "reachability_error": reachability_error,
         "first_lateral_limit_violation_index": (
             plan.first_lateral_limit_violation_index
             if plan is not None
@@ -218,9 +236,17 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         request_moving: dict[int, bool] = defaultdict(bool)
         request_near_route_match: dict[int, bool] = defaultdict(bool)
         request_route_match: dict[int, bool] = defaultdict(bool)
+        request_physically_reachable: dict[int, bool] = defaultdict(bool)
+        request_source_speed_consistent: dict[int, bool] = defaultdict(bool)
         direction_evaluable = 0
         direction_mismatch = 0
         valid = 0
+        physical_counts: Counter[str] = Counter()
+        near_physical_counts: Counter[str] = Counter()
+        speed_prior_counts: Counter[str] = Counter()
+        near_speed_prior_counts: Counter[str] = Counter()
+        required_accelerations: list[float] = []
+        near_required_accelerations: list[float] = []
         for record in group:
             request_seed = int(record["seed"])
             for candidate in record["candidate_audits"]:
@@ -232,6 +258,61 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                     motion_counts[motion_class] += 1
                     if motion_class == "MOVING":
                         request_moving[request_seed] = True
+                reachability = candidate.get("reachability_profile")
+                if isinstance(reachability, dict):
+                    physical_status = str(reachability.get("physical_status"))
+                    near_physical_status = str(
+                        reachability.get("near_physical_status")
+                    )
+                    prior_status = str(
+                        reachability.get("source_speed_prior_status")
+                    )
+                    near_prior_status = str(
+                        reachability.get("near_source_speed_prior_status")
+                    )
+                    physical_counts[physical_status] += 1
+                    near_physical_counts[near_physical_status] += 1
+                    speed_prior_counts[prior_status] += 1
+                    near_speed_prior_counts[near_prior_status] += 1
+                    request_physically_reachable[request_seed] |= (
+                        physical_status == "REACHABLE"
+                        and near_physical_status == "REACHABLE"
+                    )
+                    source_speed = float(reachability["source_speed_mps"])
+                    full_prior_matches_source = (
+                        prior_status == "CONSISTENT"
+                        or (
+                            prior_status == "STOP_PRIOR"
+                            and source_speed
+                            <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS)
+                        )
+                    )
+                    near_prior_matches_source = (
+                        near_prior_status == "CONSISTENT"
+                        or (
+                            near_prior_status == "STOP_PRIOR"
+                            and source_speed
+                            <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS)
+                        )
+                    )
+                    request_source_speed_consistent[request_seed] |= (
+                        full_prior_matches_source
+                        and near_prior_matches_source
+                    )
+                    required_accelerations.append(
+                        float(
+                            reachability[
+                                "required_constant_acceleration_mps2"
+                            ]
+                        )
+                    )
+                    near_required_accelerations.append(
+                        float(
+                            reachability[
+                                "near_required_constant_acceleration_mps2"
+                            ]
+                        )
+                    )
                 route = candidate.get("route_assessment")
                 if isinstance(route, dict):
                     status = str(route.get("near_term_route_status"))
@@ -254,6 +335,38 @@ def summarize_audits(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "moving_candidate_coverage_at_k": (
                 sum(request_moving.values()) / request_count
                 if request_count
+                else None
+            ),
+            "physical_reachability_counts": dict(
+                sorted(physical_counts.items())
+            ),
+            "near_physical_reachability_counts": dict(
+                sorted(near_physical_counts.items())
+            ),
+            "source_speed_prior_counts": dict(
+                sorted(speed_prior_counts.items())
+            ),
+            "near_source_speed_prior_counts": dict(
+                sorted(near_speed_prior_counts.items())
+            ),
+            "physically_reachable_coverage_at_k": (
+                sum(request_physically_reachable.values()) / request_count
+                if request_count and physical_counts
+                else None
+            ),
+            "source_speed_consistent_coverage_at_k": (
+                sum(request_source_speed_consistent.values()) / request_count
+                if request_count and speed_prior_counts
+                else None
+            ),
+            "mean_required_constant_acceleration_mps2": (
+                float(np.mean(required_accelerations))
+                if required_accelerations
+                else None
+            ),
+            "mean_near_required_constant_acceleration_mps2": (
+                float(np.mean(near_required_accelerations))
+                if near_required_accelerations
                 else None
             ),
             "near_term_route_status_counts": dict(sorted(route_counts.items())),
