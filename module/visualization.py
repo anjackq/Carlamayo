@@ -7,7 +7,179 @@ import textwrap
 
 import cv2
 import numpy as np
-import torch
+
+
+def project_world_points_to_camera(
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+    *,
+    minimum_depth_m=0.5,
+):
+    """Project CARLA world points using an exact sensor pose and calibration.
+
+    CARLA camera coordinates are ``x`` forward, ``y`` right, ``z`` up.  The
+    returned boolean mask identifies finite points in front of the camera.
+    """
+
+    points = np.asarray(world_points, dtype=np.float64)
+    camera_pose = np.asarray(camera_pose_world, dtype=np.float64)
+    projection_model = (
+        camera_intrinsic
+        if callable(getattr(camera_intrinsic, "ray_to_pixel", None))
+        else None
+    )
+    intrinsic = (
+        None
+        if projection_model is not None
+        else np.asarray(camera_intrinsic, dtype=np.float64)
+    )
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"world_points must have shape (N, >=3), got {points.shape}")
+    if camera_pose.shape != (4, 4):
+        raise ValueError("camera pose matrix must be 4x4")
+    if projection_model is None and intrinsic.shape != (3, 3):
+        raise ValueError("camera intrinsic matrix must be 3x3")
+    if not (
+        np.isfinite(points[:, :3]).all()
+        and np.isfinite(camera_pose).all()
+        and (projection_model is not None or np.isfinite(intrinsic).all())
+    ):
+        raise ValueError("projection inputs must be finite")
+
+    homogeneous = np.column_stack([points[:, :3], np.ones(len(points))])
+    camera_points = (np.linalg.inv(camera_pose) @ homogeneous.T).T[:, :3]
+    depth = camera_points[:, 0]
+    valid = depth > float(minimum_depth_m)
+    pixels = np.full((len(points), 2), np.nan, dtype=np.float64)
+    if projection_model is not None:
+        # CARLA camera x-forward/y-right/z-up -> OpenCV
+        # x-right/y-down/z-forward.
+        optical_rays = np.column_stack(
+            [camera_points[:, 1], -camera_points[:, 2], camera_points[:, 0]]
+        )
+        projected, projection_valid = projection_model.ray_to_pixel(optical_rays)
+        pixels[:] = projected
+        valid &= np.asarray(projection_valid, dtype=bool)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pixels[valid, 0] = (
+                intrinsic[0, 0] * camera_points[valid, 1] / depth[valid]
+                + intrinsic[0, 2]
+            )
+            pixels[valid, 1] = (
+                intrinsic[1, 2]
+                - intrinsic[1, 1] * camera_points[valid, 2] / depth[valid]
+            )
+    valid &= np.isfinite(pixels).all(axis=1)
+    return pixels, valid
+
+
+def project_world_trajectory_to_image(
+    cam_img,
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+    *,
+    last_safe_waypoint_index=None,
+):
+    """Draw an authorized prefix and advisory future path on the current image."""
+
+    result = np.asarray(cam_img).copy()
+    pixels, valid = project_world_points_to_camera(
+        world_points,
+        camera_pose_world,
+        camera_intrinsic,
+    )
+    height, width = result.shape[:2]
+    inside = (
+        valid
+        & (pixels[:, 0] >= 0.0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0.0)
+        & (pixels[:, 1] < height)
+    )
+    for index in range(len(pixels) - 1):
+        if inside[index] and inside[index + 1]:
+            start = tuple(np.rint(pixels[index]).astype(np.int32))
+            end = tuple(np.rint(pixels[index + 1]).astype(np.int32))
+            segment_is_safe = (
+                last_safe_waypoint_index is None
+                or index + 1 <= int(last_safe_waypoint_index)
+            )
+            color = (0, 255, 80) if segment_is_safe else (255, 210, 0)
+            cv2.line(result, start, end, color, 8, cv2.LINE_AA)
+    for index, pixel in enumerate(pixels):
+        if not inside[index]:
+            continue
+        point_is_safe = (
+            last_safe_waypoint_index is None
+            or index <= int(last_safe_waypoint_index)
+        )
+        cv2.circle(
+            result,
+            tuple(np.rint(pixel).astype(np.int32)),
+            5,
+            (80, 255, 120) if point_is_safe else (255, 225, 40),
+            -1,
+            cv2.LINE_AA,
+        )
+    if last_safe_waypoint_index is not None:
+        first_bad_index = int(last_safe_waypoint_index) + 1
+        if 0 <= first_bad_index < len(pixels) and inside[first_bad_index]:
+            cv2.circle(
+                result,
+                tuple(np.rint(pixels[first_bad_index]).astype(np.int32)),
+                10,
+                (255, 0, 0),
+                -1,
+                cv2.LINE_AA,
+            )
+    return result
+
+
+def project_world_polyline_to_image(
+    cam_img,
+    world_points,
+    camera_pose_world,
+    camera_intrinsic,
+    *,
+    color,
+    thickness=4,
+    dashed=False,
+):
+    """Draw one diagnostic world polyline without implying control authority."""
+
+    result = np.asarray(cam_img).copy()
+    points = np.asarray(world_points, dtype=np.float64)
+    if len(points) < 2:
+        return result
+    pixels, valid = project_world_points_to_camera(
+        points,
+        camera_pose_world,
+        camera_intrinsic,
+    )
+    height, width = result.shape[:2]
+    inside = (
+        valid
+        & (pixels[:, 0] >= 0.0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0.0)
+        & (pixels[:, 1] < height)
+    )
+    for index in range(len(pixels) - 1):
+        if dashed and index % 2:
+            continue
+        if inside[index] and inside[index + 1]:
+            cv2.line(
+                result,
+                tuple(np.rint(pixels[index]).astype(np.int32)),
+                tuple(np.rint(pixels[index + 1]).astype(np.int32)),
+                tuple(int(channel) for channel in color),
+                int(thickness),
+                cv2.LINE_AA,
+            )
+    return result
 
 
 def _project_one_trajectory(
@@ -55,8 +227,13 @@ def project_trajectory_to_image(cam_img, pred_xyz, selected_idx=0, camera_height
     focal_length_px = img_width / (2 * np.tan(np.radians(fov / 2)))
 
     result = cam_img.copy()
-    if isinstance(pred_xyz, torch.Tensor):
-        arr = pred_xyz.detach().cpu().numpy()
+    detach = getattr(pred_xyz, "detach", None)
+    if callable(detach):
+        detached = detach()
+        cpu = getattr(detached, "cpu", None)
+        host_value = cpu() if callable(cpu) else detached
+        to_numpy = getattr(host_value, "numpy", None)
+        arr = to_numpy() if callable(to_numpy) else np.asarray(host_value)
     else:
         arr = np.asarray(pred_xyz)
 
@@ -112,9 +289,94 @@ def create_visualization_frame(
     navigation_text="",
     navigation_weight=1.0,
     paused=False,
+    world_trajectory=None,
+    camera_pose_world=None,
+    camera_intrinsic=None,
+    source_frame_id=None,
+    source_age_s=None,
+    controller_state="WAITING",
+    requested_control=None,
+    applied_control=None,
+    applied_control_source="FALLBACK",
+    safety_override_applied=False,
+    safety_override_reason=None,
+    plan_admission_status=None,
+    near_term_road_status=None,
+    full_path_road_status=None,
+    road_speed_cap_mps=None,
+    near_term_route_status=None,
+    full_path_route_status=None,
+    route_speed_cap_mps=None,
+    coc_issue_count=0,
+    last_safe_waypoint_index=None,
+    camera_alignment_mode="baseline",
+    proposal_world_trajectory=None,
+    proposal_source_frame_id=None,
+    proposal_source_age_s=None,
+    proposal_plan_id=None,
+    proposal_admission_status=None,
+    proposal_near_term_route_status=None,
+    proposal_full_path_route_status=None,
+    proposal_handoff_status=None,
+    active_plan_id=None,
+    route_reference_world=None,
+    actual_history_world=None,
+    candidate_ranking_policy="current",
 ):
-    """Create a single visualization frame with all overlays."""
-    vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
+    """Create a frame that distinguishes prediction, policy, and execution."""
+    calibrated_overlay_available = (
+        camera_pose_world is not None
+        and camera_intrinsic is not None
+        and any(
+            path is not None
+            for path in (
+                world_trajectory,
+                proposal_world_trajectory,
+                route_reference_world,
+                actual_history_world,
+            )
+        )
+    )
+    if calibrated_overlay_available:
+        vis_img = np.asarray(cam_img).copy()
+        if route_reference_world is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                route_reference_world,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(0, 220, 255),
+                thickness=4,
+                dashed=True,
+            )
+        if actual_history_world is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                actual_history_world,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(255, 140, 0),
+                thickness=4,
+            )
+        if proposal_world_trajectory is not None:
+            vis_img = project_world_polyline_to_image(
+                vis_img,
+                proposal_world_trajectory,
+                camera_pose_world,
+                camera_intrinsic,
+                color=(255, 80, 255),
+                thickness=5,
+            )
+        if world_trajectory is not None:
+            vis_img = project_world_trajectory_to_image(
+                vis_img,
+                world_trajectory,
+                camera_pose_world,
+                camera_intrinsic,
+                last_safe_waypoint_index=last_safe_waypoint_index,
+            )
+    else:
+        vis_img = project_trajectory_to_image(cam_img, pred_xyz, selected_idx=selected_idx)
     vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
     h, w = vis_img.shape[:2]
 
@@ -122,9 +384,21 @@ def create_visualization_frame(
     cv2.rectangle(overlay, (10, h - 190), (w - 10, h - 10), (0, 0, 0), -1)
     vis_img = cv2.addWeighted(overlay, 0.6, vis_img, 0.4, 0)
 
+    alignment_labels = {
+        "baseline": "BASELINE PINHOLE",
+        "pose-only": "POSE ONLY",
+        "projection-only": "FTHETA ONLY",
+        "pose-projection": "POSE + FTHETA",
+    }
+    camera_input_label = alignment_labels.get(
+        camera_alignment_mode,
+        str(camera_alignment_mode).upper(),
+    )
     info_text = (
         f"Frame: {frame_count} | Inference: {inference_time:.2f}s | "
-        f"Speed: {speed_kmh:.1f} km/h | Steer: {steering:.2f}"
+        f"Speed: {speed_kmh:.1f} km/h | Steer: {steering:.2f} | "
+        f"CAMERA INPUT: {camera_input_label} | "
+        f"RANKING: {str(candidate_ranking_policy).upper()}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 1.0
@@ -147,6 +421,99 @@ def create_visualization_frame(
         font_scale,
         (255, 255, 255),
         thickness,
+        cv2.LINE_AA,
+    )
+
+    active_source_text = "unknown" if source_frame_id is None else str(source_frame_id)
+    active_age_text = "unknown" if source_age_s is None else f"{source_age_s:.2f}s"
+    proposal_source_text = (
+        "unknown"
+        if proposal_source_frame_id is None
+        else str(proposal_source_frame_id)
+    )
+    proposal_age_text = (
+        "unknown"
+        if proposal_source_age_s is None
+        else f"{proposal_source_age_s:.2f}s"
+    )
+    def _compact_plan_id(value):
+        text = str(value or "none")
+        return text if len(text) <= 28 else "..." + text[-25:]
+
+    requested = requested_control or {}
+    applied = applied_control or {}
+    layer_lines = (
+        (
+            f"LATEST ALPAMAYO PROPOSAL [MAGENTA] | "
+            f"id={_compact_plan_id(proposal_plan_id)} | "
+            f"source={proposal_source_text} | "
+            f"age={proposal_age_text} | "
+            f"admission={proposal_admission_status or 'unknown'} | "
+            f"route={proposal_near_term_route_status or 'n/a'}/"
+            f"{proposal_full_path_route_status or 'n/a'} | "
+            f"handoff={proposal_handoff_status or 'n/a'}",
+            (255, 80, 255),
+        ),
+        (
+            f"ACTIVE EXECUTION PLAN [GREEN/YELLOW] | "
+            f"id={_compact_plan_id(active_plan_id)} | "
+            f"source={active_source_text} | "
+            f"age={active_age_text} | admission={plan_admission_status or 'unknown'} | "
+            f"road={near_term_road_status or 'unknown'}/"
+            f"{full_path_road_status or 'unknown'} | "
+            f"route={near_term_route_status or 'n/a'}/"
+            f"{full_path_route_status or 'n/a'} | CoC issues={int(coc_issue_count)}",
+            (80, 255, 120),
+        ),
+        (
+            "CONTROLLER EXECUTION | "
+            f"{controller_state} | request "
+            f"S/T/B={requested.get('steering', 0.0):.2f}/"
+            f"{requested.get('throttle', 0.0):.2f}/"
+            f"{requested.get('brake', 0.0):.2f} | "
+            f"road cap="
+            f"{'none' if road_speed_cap_mps is None else f'{road_speed_cap_mps:.2f}m/s'}"
+            f" | route cap="
+            f"{'none' if route_speed_cap_mps is None else f'{route_speed_cap_mps:.2f}m/s'}",
+            (80, 255, 120),
+        ),
+        (
+            "SAFETY OVERRIDE | "
+            f"{'ACTIVE' if safety_override_applied else 'INACTIVE'} | "
+            f"source={applied_control_source} | "
+            f"applied S/T/B={applied.get('steering', 0.0):.2f}/"
+            f"{applied.get('throttle', 0.0):.2f}/"
+            f"{applied.get('brake', 0.0):.2f} | "
+            f"reason={safety_override_reason or 'none'}",
+            (0, 80, 255) if safety_override_applied else (180, 180, 180),
+        ),
+    )
+    overlay = vis_img.copy()
+    cv2.rectangle(overlay, (10, 72), (w - 10, 216), (0, 0, 0), -1)
+    vis_img = cv2.addWeighted(overlay, 0.65, vis_img, 0.35, 0)
+    for line_index, (line, color) in enumerate(layer_lines):
+        cv2.putText(
+            vis_img,
+            line,
+            (20, 100 + line_index * 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        vis_img,
+        (
+            "ROUTE: CYAN DASHED | ACTUAL: ORANGE | "
+            "LATEST PROPOSAL: MAGENTA | ACTIVE: GREEN/YELLOW"
+        ),
+        (20, 236),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        2,
         cv2.LINE_AA,
     )
 
@@ -309,15 +676,42 @@ def transcode_video_for_browser_compat(source_path, output_path):
 
 
 class VideoRecorder:
-    """Records frames and saves to video file."""
+    """Stream RGB frames to disk and optionally publish a live JPEG preview."""
 
-    def __init__(self, output_path, fps=10):
-        self.output_path = output_path
+    def __init__(self, output_path, fps=10, preview_path=None, preview_interval_frames=1):
+        self.output_path = os.fspath(output_path)
         self.fps = fps
-        self.frames = []
+        self.preview_path = os.fspath(preview_path) if preview_path is not None else None
+        self.preview_interval_frames = max(1, int(preview_interval_frames))
+        self.frame_count = 0
+        self.width = None
+        self.height = None
+        self._writer = None
+        self._selected_codec = None
+        self._temp_path = None
 
     def add_frame(self, frame):
-        self.frames.append(frame)
+        frame = np.asarray(frame)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected RGB frame with shape HxWx3, got {frame.shape}")
+
+        height, width = frame.shape[:2]
+        if self._writer is None:
+            self._initialize_writer(width, height)
+        elif (width, height) != (self.width, self.height):
+            raise ValueError(
+                f"Video frame size changed from {self.width}x{self.height} "
+                f"to {width}x{height}"
+            )
+
+        self._writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.frame_count += 1
+
+        if (
+            self.preview_path is not None
+            and (self.frame_count - 1) % self.preview_interval_frames == 0
+        ):
+            self._publish_preview(frame)
 
     def _create_writer(self, width, height, output_path):
         for codec in ("mp4v", "avc1", "H264"):
@@ -328,44 +722,58 @@ class VideoRecorder:
             writer.release()
         return None, None
 
-    def save(self):
-        if not self.frames:
-            print("No frames to save.")
-            return
-
-        print(f"\nSaving video with {len(self.frames)} frames...")
-        h, w = self.frames[0].shape[:2]
+    def _initialize_writer(self, width, height):
         output_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
         os.makedirs(output_dir, exist_ok=True)
-        temp_path = os.path.join(
+        self._temp_path = os.path.join(
             output_dir,
             f".{os.path.basename(self.output_path)}.opencv-tmp.mp4",
         )
-
-        writer, selected_codec = self._create_writer(w, h, temp_path)
+        writer, selected_codec = self._create_writer(width, height, self._temp_path)
         if writer is None:
-            print("Failed to initialize video writer.")
-            return
+            raise RuntimeError("Failed to initialize video writer.")
         if hasattr(cv2, "VIDEOWRITER_PROP_QUALITY"):
             writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)
 
-        for frame in self.frames:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.width = width
+        self.height = height
+        self._writer = writer
+        self._selected_codec = selected_codec
 
-        writer.release()
+    def _publish_preview(self, frame):
+        preview_dir = os.path.dirname(os.path.abspath(self.preview_path)) or "."
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_name = os.path.basename(self.preview_path)
+        preview_temp = os.path.join(preview_dir, f".{preview_name}.tmp.jpg")
+        if not cv2.imwrite(preview_temp, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)):
+            raise RuntimeError(f"Failed to write live preview image: {self.preview_path}")
+        os.replace(preview_temp, self.preview_path)
 
-        transcoded, transcode_msg = transcode_video_for_browser_compat(temp_path, self.output_path)
+    def save(self):
+        if self.frame_count == 0:
+            print("No frames to save.")
+            return
+
+        print(f"\nFinalizing video with {self.frame_count} frames...")
+        self._writer.release()
+        self._writer = None
+
+        transcoded, transcode_msg = transcode_video_for_browser_compat(
+            self._temp_path,
+            self.output_path,
+        )
         if not transcoded:
-            shutil.move(temp_path, self.output_path)
+            shutil.move(self._temp_path, self.output_path)
             print(
                 f"Warning: H.264 transcode skipped ({transcode_msg}); "
-                f"saved OpenCV {selected_codec} output."
+                f"saved OpenCV {self._selected_codec} output."
             )
         else:
-            os.remove(temp_path)
+            os.remove(self._temp_path)
 
         print(f"Video saved: {self.output_path}")
         print(
-            f"  Codec: {transcode_msg if transcoded else selected_codec}, "
-            f"Resolution: {w}x{h}, FPS: {self.fps}, Frames: {len(self.frames)}"
+            f"  Codec: {transcode_msg if transcoded else self._selected_codec}, "
+            f"Resolution: {self.width}x{self.height}, FPS: {self.fps}, "
+            f"Frames: {self.frame_count}"
         )

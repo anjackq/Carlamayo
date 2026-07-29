@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "fixture_id": "job_22863131_plan16_candidate2_narrow_junction_gap",
+  "source_job_id": "22863131",
+  "source_plan_id": "proposal-16/candidate-2",
+  "source_loop_tick_id": 154,
+  "first_segment_length_m": 0.5173334298335511,
+  "unsafe_progress_interval_m": [
+    0.145,
+    0.186
+  ],
+  "legacy_spacing_m": 0.5,
+  "required_spacing_m": 0.25,
+  "expected_fine_sample_progress_m": 0.1724444766111837,
+  "failure_tick": 157,
+  "failure_ego_progress_m": 0.18479623334095502,
+  "failure_reason": "footprint_corner_off_driving_lane"
+}

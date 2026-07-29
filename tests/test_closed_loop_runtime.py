@@ -1,0 +1,1695 @@
+import importlib
+import json
+import queue as stdlib_queue
+import sys
+import threading
+import types
+from collections import Counter
+
+import pytest
+
+from module.carla_safety_adapter import (
+    RoadExecutionEnvelope,
+    StoppingReserveProfile,
+    StoppingReserveStatus,
+)
+from module.safety_shield import ObstacleAssessment, RoadContainmentAssessment
+
+
+sys.modules.setdefault(
+    "carla",
+    types.SimpleNamespace(
+        command=types.SimpleNamespace(DestroyActor=lambda actor_id: ("destroy", actor_id)),
+        VehicleControl=lambda: types.SimpleNamespace(steer=0.0, throttle=0.0, brake=0.0),
+        Vector3D=lambda: types.SimpleNamespace(),
+    ),
+)
+closed_loop = importlib.import_module("carlamayo_closed_loop")
+
+
+class _FakeWorld:
+    def __init__(self, fixed_delta_seconds):
+        self._settings = types.SimpleNamespace(fixed_delta_seconds=float(fixed_delta_seconds))
+
+    def get_settings(self):
+        return self._settings
+
+
+class _FakeEgoVehicle:
+    def __init__(self):
+        self.transform = object()
+
+    def get_transform(self):
+        return self.transform
+
+
+class _FakeCarlaInterface:
+    def __init__(self, *, fixed_delta_seconds=0.1, on_tick=None, fail_on_tick=None):
+        self.world = _FakeWorld(fixed_delta_seconds)
+        self.ego_vehicle = _FakeEgoVehicle()
+        self.tick_count = 0
+        self.cleanup_count = 0
+        self.applied_controls = []
+        self.loaded_maps = []
+        self.scenario_seeds = []
+        self.ego_spawn_requests = []
+        self.npc_spawn_requests = []
+        self.setup_cameras_count = 0
+        self.setup_collision_sensor_count = 0
+        self.history_buffer = []
+        self._on_tick = on_tick
+        self._fail_on_tick = fail_on_tick
+
+    def connect(self):
+        pass
+
+    def load_map(self, map_name, *, force_reload=False):
+        self.loaded_maps.append((map_name, force_reload))
+
+    def set_scenario_seed(self, seed):
+        self.scenario_seeds.append(seed)
+
+    def spawn_ego_vehicle(
+        self,
+        *,
+        spawn_index=None,
+        center_on_driving_lane=False,
+    ):
+        self.ego_spawn_requests.append(
+            {
+                "spawn_index": spawn_index,
+                "center_on_driving_lane": center_on_driving_lane,
+            }
+        )
+
+    def enable_synchronous_mode(self):
+        pass
+
+    def spawn_npcs(self, **kwargs):
+        self.npc_spawn_requests.append(dict(kwargs))
+
+    def get_non_ego_dynamic_actor_census(self):
+        return {
+            "non_ego_vehicle_count": 0,
+            "walker_count": 0,
+            "walker_controller_count": 0,
+        }
+
+    def setup_cameras(self):
+        self.setup_cameras_count += 1
+
+    def setup_collision_sensor(self):
+        self.setup_collision_sensor_count += 1
+
+    def tick(self):
+        next_tick = self.tick_count + 1
+        if self._fail_on_tick == next_tick:
+            raise RuntimeError(f"synthetic tick failure {next_tick}")
+        self.tick_count = next_tick
+        if self._on_tick is not None:
+            self._on_tick(self.tick_count)
+        return types.SimpleNamespace()
+
+    def get_ego_state(self):
+        return {"speed": 0.0}
+
+    def update_history(self, state):
+        self.history_buffer.append(dict(state))
+        self.history_buffer = self.history_buffer[-16:]
+
+    def get_collision_count(self):
+        return 0
+
+    def get_episode_collision_count(self):
+        return 0
+
+    def get_last_collision_event(self):
+        return None
+
+    def get_camera_images(self):
+        return [closed_loop.np.zeros((1, 1, 3), dtype=closed_loop.np.uint8)]
+
+    def get_history_in_local_frame(self):
+        return (
+            closed_loop.np.zeros((16, 3), dtype=closed_loop.np.float32),
+            closed_loop.np.zeros(
+                (16, 3, 3),
+                dtype=closed_loop.np.float32,
+            ),
+        )
+
+    def apply_control(self, steering, throttle, brake):
+        self.applied_controls.append((steering, throttle, brake))
+
+    def get_applied_control(self):
+        if not self.applied_controls:
+            return None
+        steer, throttle, brake = self.applied_controls[-1]
+        return {
+            "echoed_steer": float(steer),
+            "echoed_throttle": float(throttle),
+            "echoed_brake": float(brake),
+            "gear": 1 if throttle > 0.0 else 0,
+        }
+
+    def cleanup(self):
+        self.cleanup_count += 1
+
+
+def _read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _assert_stream_summary_invariants(records):
+    assert records
+    assert records[-1]["event_type"] == "episode_summary"
+    assert sum(record["event_type"] == "episode_summary" for record in records) == 1
+
+    run_ids = {record["run_id"] for record in records}
+    assert len(run_ids) == 1
+    for record in records:
+        assert record["schema_version"] == closed_loop.RUNTIME_SCHEMA_VERSION
+        assert isinstance(record["event_type"], str)
+        json.dumps(record, allow_nan=False)
+
+    events = records[:-1]
+    summary = records[-1]
+    expected_counts = Counter(record["event_type"] for record in events)
+    assert summary["total_events"] == len(events)
+    assert summary["event_counts"] == dict(sorted(expected_counts.items()))
+
+
+def _install_common_fakes(monkeypatch, args, carla_if, *, num_frames):
+    monkeypatch.setattr(closed_loop, "parse_args", lambda: args)
+    monkeypatch.setattr(closed_loop, "configure_cuda_linalg_library", lambda _name: None)
+    monkeypatch.setattr(
+        closed_loop,
+        "load_model",
+        lambda _quantization, device_map: (object(), object()),
+    )
+    monkeypatch.setattr(closed_loop, "CARLAInterface", lambda: carla_if)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: object())
+    monkeypatch.setattr(
+        closed_loop,
+        "prepare_model_input",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(closed_loop, "run_vqa", lambda *_args, **_kwargs: {"answer": "ok"})
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_answer_text",
+        lambda extra: extra.get("answer", "") if isinstance(extra, dict) else "",
+    )
+    monkeypatch.setattr(closed_loop.torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(closed_loop.time, "sleep", lambda _seconds: None)
+
+    monkeypatch.setattr(closed_loop.cfg, "SAVE_VIDEO", False)
+    monkeypatch.setattr(closed_loop.cfg, "CONTROL_DT", 0.1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_FRAMES", num_frames)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 1)
+    monkeypatch.setattr(closed_loop.cfg, "IMG_HEIGHT", 1)
+    monkeypatch.setattr(closed_loop.cfg, "IMG_WIDTH", 1)
+    monkeypatch.setattr(closed_loop.cfg, "IMG_CHANNELS", 3)
+    monkeypatch.setattr(closed_loop.cfg, "NPC_VEHICLE_COUNT", 0)
+    monkeypatch.setattr(closed_loop.cfg, "NPC_WALKER_COUNT", 0)
+
+
+@pytest.mark.parametrize(
+    ("episode_limit_s", "expected_ticks", "expected_duration_s"),
+    [
+        (0.05, 1, 0.1),
+        (0.2, 2, 0.2),
+        (0.25, 3, 0.3),
+    ],
+)
+def test_episode_limit_stops_on_first_successful_tick_boundary(
+    monkeypatch,
+    tmp_path,
+    episode_limit_s,
+    expected_ticks,
+    expected_duration_s,
+):
+    telemetry_path = tmp_path / "episode.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            str(episode_limit_s),
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    summary = records[-1]
+    assert carla_if.tick_count == expected_ticks
+    assert carla_if.cleanup_count == 1
+    assert summary["stop_reason"] == "max_episode_seconds"
+    assert summary["loop_tick_count"] == expected_ticks
+    assert summary["simulation_duration_proxy_s"] == pytest.approx(expected_duration_s)
+    assert summary["event_counts"]["tick"] == expected_ticks
+    _assert_stream_summary_invariants(records)
+
+
+def test_process_adapter_receives_cli_settings_and_closes_before_carla_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "process-backend-lifecycle.jsonl"
+    monkeypatch.setattr(
+        closed_loop.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(8)),
+    )
+    args = closed_loop.parse_args(
+        [
+            "--road-assessment-backend",
+            "process",
+            "--road-assessment-workers",
+            "2",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    lifecycle = []
+    constructor_calls = []
+
+    class _ClosingAdapter:
+        def __init__(self, *args, **kwargs):
+            constructor_calls.append((args, dict(kwargs)))
+
+        def close(self):
+            lifecycle.append("adapter.close")
+
+    original_cleanup = carla_if.cleanup
+
+    def recording_cleanup():
+        lifecycle.append("carla.cleanup")
+        original_cleanup()
+
+    carla_if.cleanup = recording_cleanup
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _ClosingAdapter,
+    )
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 0
+    assert len(constructor_calls) == 1
+    positional, keyword = constructor_calls[0]
+    assert positional[:2] == (carla_if.world, carla_if.ego_vehicle)
+    assert keyword == {
+        "road_assessment_backend": "process",
+        "road_assessment_workers": 2,
+    }
+    assert lifecycle == ["adapter.close", "carla.cleanup"]
+    assert carla_if.cleanup_count == 1
+    summary = _read_jsonl(telemetry_path)[-1]
+    assert summary["safety_adapter_close_error"] is None
+    assert summary["cleanup_error"] is None
+
+
+def test_empty_road_setup_forces_fresh_map_fixed_spawn_and_zero_npcs(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "empty-road.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    rng_events = []
+    monkeypatch.setattr(
+        closed_loop,
+        "seed_runtime_randomness",
+        lambda seed: rng_events.append(("seed", seed)),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "load_model",
+        lambda _quantization, device_map: (
+            rng_events.append(("load_model", device_map)) or object(),
+            object(),
+        ),
+    )
+    preflight = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.42,
+        quality="carla_ground_truth_spawn_preflight",
+    )
+    preflight_transforms = []
+    safety_adapter = types.SimpleNamespace(
+        assess_ego_transform=lambda transform: (
+            preflight_transforms.append(transform) or preflight
+        )
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        lambda world, ego_vehicle, policy, **_kwargs: safety_adapter,
+    )
+
+    closed_loop.main()
+
+    assert rng_events == [
+        ("seed", closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED),
+        ("load_model", "auto"),
+        ("seed", closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED),
+    ]
+    assert carla_if.loaded_maps == [(closed_loop.cfg.CARLA_MAP, True)]
+    assert carla_if.scenario_seeds == [closed_loop.cfg.EMPTY_ROAD_SCENARIO_SEED]
+    assert carla_if.ego_spawn_requests == [
+        {
+            "spawn_index": closed_loop.cfg.EMPTY_ROAD_EGO_SPAWN_INDEX,
+            "center_on_driving_lane": True,
+        }
+    ]
+    assert carla_if.npc_spawn_requests == [
+        {"num_vehicles": 0, "num_walkers": 0}
+    ]
+    assert preflight_transforms == [carla_if.ego_vehicle.transform]
+
+    records = _read_jsonl(telemetry_path)
+    episode_start = next(
+        record for record in records if record["event_type"] == "episode_start"
+    )
+    assert episode_start["scenario"] == "empty_road"
+    assert episode_start["scenario_seed"] == 0
+    assert episode_start["ego_spawn_index"] == 0
+    assert episode_start["requested_npc_vehicle_count"] == 0
+    assert episode_start["requested_npc_walker_count"] == 0
+    assert episode_start["empty_road_footprint_preflight"] == preflight.to_json_dict()
+    _assert_stream_summary_invariants(records)
+
+
+def test_unsafe_empty_road_footprint_aborts_before_oom_free_model_load(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "unsafe-empty-road.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--oom-free",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+    preflight = RoadContainmentAssessment.unsafe(
+        (
+            "road_not_contained",
+            "footprint_corner_off_driving_lane",
+        ),
+        sample_count=5,
+        min_margin_m=-0.52,
+        first_bad_sample_index=2,
+        quality="carla_ground_truth_spawn_preflight",
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        lambda world, ego_vehicle, policy, **_kwargs: types.SimpleNamespace(
+            assess_ego_transform=lambda transform: preflight
+        ),
+    )
+    model_loads = []
+    monkeypatch.setitem(
+        sys.modules,
+        "module.oom_offload",
+        types.SimpleNamespace(
+            load_offloaded_model=lambda **_kwargs: (
+                model_loads.append("loaded") or object(),
+                object(),
+            )
+        ),
+    )
+
+    closed_loop.main()
+
+    assert model_loads == []
+    assert carla_if.setup_cameras_count == 0
+    assert carla_if.setup_collision_sensor_count == 0
+    assert carla_if.tick_count == 0
+    assert carla_if.cleanup_count == 1
+    assert carla_if.applied_controls[-1] == (0.0, 0.0, 1.0)
+
+    records = _read_jsonl(telemetry_path)
+    runtime_error = next(
+        record for record in records if record["event_type"] == "runtime_error"
+    )
+    assert "empty-road ego footprint is not safely contained" in runtime_error["error"]
+    assert not any(record["event_type"] == "episode_start" for record in records)
+    summary = records[-1]
+    assert summary["stop_reason"] == "error"
+    assert "empty-road ego footprint is not safely contained" in summary["error"]
+    _assert_stream_summary_invariants(records)
+
+
+def test_async_request_has_one_correlated_terminal_result_and_valid_jsonl(
+    monkeypatch,
+    tmp_path,
+):
+    result_enqueued = threading.Event()
+    original_queue_class = stdlib_queue.Queue
+    queue_number = 0
+
+    class _ResultQueue(original_queue_class):
+        def put_nowait(self, item):
+            result = super().put_nowait(item)
+            if isinstance(item, dict) and item.get("request_id") is not None:
+                result_enqueued.set()
+            return result
+
+    def queue_factory(*args, **kwargs):
+        nonlocal queue_number
+        queue_number += 1
+        queue_class = _ResultQueue if queue_number == 2 else original_queue_class
+        return queue_class(*args, **kwargs)
+
+    def wait_for_result_on_second_tick(tick_count):
+        if tick_count == 2:
+            assert result_enqueued.wait(timeout=2.0), "async worker did not enqueue a result"
+
+    telemetry_path = tmp_path / "async.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--async",
+            "--mode",
+            "vqa",
+            "--vqa-question",
+            "What is ahead?",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(
+        fixed_delta_seconds=0.1,
+        on_tick=wait_for_result_on_second_tick,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.queue, "Queue", queue_factory)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [record for record in records if record["event_type"] == "inference_result"]
+    assert Counter(record["request_id"] for record in submitted) == Counter(
+        record["request_id"] for record in terminal
+    )
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["status"] == "completed_vqa"
+    assert terminal[0]["rejected"] is False
+    assert terminal[0]["source_loop_tick_id"] == submitted[0]["source_loop_tick_id"]
+    assert terminal[0]["arrival_loop_tick_id"] >= terminal[0]["source_loop_tick_id"]
+    assert terminal[0]["inference_wall_latency_s"] >= 0.0
+
+    ticks = [record for record in records if record["event_type"] == "tick"]
+    assert len(ticks) == 2
+    for tick in ticks:
+        assert {
+            "loop_tick_id",
+            "controller_state",
+            "requested_control",
+            "applied_control",
+            "collision_count",
+        } <= tick.keys()
+
+    summary = records[-1]
+    assert summary["event_status_counts"] == {"inference_result.completed_vqa": 1}
+    assert summary["inference_latency_s"]["count"] == 1
+    _assert_stream_summary_invariants(records)
+
+
+def test_episode_end_terminalizes_a_queued_async_request_once(monkeypatch, tmp_path):
+    class _DormantThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+    telemetry_path = tmp_path / "cancelled.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--async",
+            "--mode",
+            "vqa",
+            "--vqa-question",
+            "What is ahead?",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.threading, "Thread", _DormantThread)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["request_id"] == submitted[0]["request_id"]
+    assert terminal[0]["status"] == "cancelled"
+    assert terminal[0]["rejection_reason"] == "request_queue_cleared:episode_end"
+    assert terminal[0]["inference_wall_latency_s"] is None
+    assert terminal[0]["request_lifetime_s"] >= 0.0
+
+    summary = records[-1]
+    assert summary["event_status_counts"] == {"inference_result.cancelled": 1}
+    assert summary["rejections"] == {
+        "total": 1,
+        "reasons": {"request_queue_cleared:episode_end": 1},
+    }
+    assert summary["inference_latency_s"]["count"] == 0
+    _assert_stream_summary_invariants(records)
+
+
+def test_runtime_error_is_recorded_before_the_final_summary(monkeypatch, tmp_path):
+    telemetry_path = tmp_path / "error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1, fail_on_tick=1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=100)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    assert [record["event_type"] for record in records] == [
+        "episode_start",
+        "runtime_error",
+        "episode_summary",
+    ]
+    summary = records[-1]
+    assert summary["stop_reason"] == "error"
+    assert summary["error"] == "synthetic tick failure 1"
+    assert summary["loop_tick_count"] == 0
+    assert carla_if.cleanup_count == 1
+    _assert_stream_summary_invariants(records)
+
+
+def test_runtime_error_after_nominal_throttle_applies_final_brake_and_returns_one(
+    monkeypatch,
+    tmp_path,
+):
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.6, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 5.0,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _SafeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def assess(self, **_kwargs):
+            return types.SimpleNamespace(
+                road=RoadContainmentAssessment.safe(sample_count=5),
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "post-throttle-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.3",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1, fail_on_tick=2)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(
+        closed_loop,
+        "OfficialPIDFollower",
+        lambda *_args: _TrackingFollower(),
+    )
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _SafeAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    assert len(carla_if.applied_controls) == 2
+    assert carla_if.applied_controls[0][1] > 0.0
+    assert carla_if.applied_controls[0][2] == 0.0
+    assert carla_if.applied_controls[-1] == (0.0, 0.0, 1.0)
+
+    records = _read_jsonl(telemetry_path)
+    runtime_error = next(
+        record for record in records if record["event_type"] == "runtime_error"
+    )
+    assert runtime_error["error"] == "synthetic tick failure 2"
+    assert runtime_error["fail_closed_brake_applied"] is True
+    assert records[-1]["stop_reason"] == "error"
+    assert records[-1]["error"] == "synthetic tick failure 2"
+    _assert_stream_summary_invariants(records)
+
+
+def test_sync_keyboard_interrupt_terminalizes_request_and_returns_130(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "sync-keyboard-interrupt.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    def interrupt_inference(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(closed_loop, "run_inference", interrupt_inference)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 130
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)]
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["request_id"] == submitted[0]["request_id"]
+    assert terminal[0]["status"] == "interrupted"
+    assert terminal[0]["rejected"] is True
+    assert (
+        terminal[0]["rejection_reason"]
+        == "keyboard_interrupt_during_sync_inference"
+    )
+    stop_event = next(
+        record
+        for record in records
+        if record["event_type"] == "episode_stop_requested"
+    )
+    assert stop_event["emergency_brake_applied"] is True
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "keyboard_interrupt"
+    _assert_stream_summary_invariants(records)
+
+
+def test_sync_vqa_failure_is_not_retried_on_each_tick(monkeypatch, tmp_path):
+    telemetry_path = tmp_path / "sync-vqa-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--mode",
+            "vqa",
+            "--vqa-question",
+            "What is ahead?",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.5",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    vqa_calls = 0
+
+    def fail_vqa(*_args, **_kwargs):
+        nonlocal vqa_calls
+        vqa_calls += 1
+        raise RuntimeError("synthetic VQA failure")
+
+    monkeypatch.setattr(closed_loop, "run_vqa", fail_vqa)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 0
+    assert vqa_calls == 1
+    assert carla_if.tick_count == 5
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)] * 5
+
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["request_id"] == submitted[0]["request_id"]
+    assert terminal[0]["status"] == "error"
+    assert terminal[0]["rejection_reason"].startswith("model_inference_error:")
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "max_episode_seconds"
+    _assert_stream_summary_invariants(records)
+
+
+def test_startup_model_load_error_emits_runtime_error_and_summary(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "startup-model-load-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.ego_vehicle = None
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    def fail_model_load(*_args, **_kwargs):
+        raise RuntimeError("synthetic model load failure")
+
+    monkeypatch.setattr(closed_loop, "load_model", fail_model_load)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    assert carla_if.tick_count == 0
+    assert carla_if.cleanup_count == 1
+    assert carla_if.applied_controls == []
+    records = _read_jsonl(telemetry_path)
+    assert [record["event_type"] for record in records] == [
+        "runtime_error",
+        "episode_summary",
+    ]
+    runtime_error, summary = records
+    assert runtime_error["error"] == "synthetic model load failure"
+    assert runtime_error["emergency_brake_attempted"] is False
+    assert runtime_error["fail_closed_brake_applied"] is False
+    assert summary["stop_reason"] == "error"
+    assert summary["error"] == "synthetic model load failure"
+    assert summary["loop_tick_count"] == 0
+    _assert_stream_summary_invariants(records)
+
+
+def test_summary_exact_timing_flags_are_false_without_exact_observations(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "zero-exact-observations.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1, fail_on_tick=1)
+
+    def unexpected_synchronized_observation(*_args, **_kwargs):
+        raise AssertionError("tick failure should prevent observation capture")
+
+    carla_if.get_synchronized_observation = unexpected_synchronized_observation
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    exit_code = closed_loop.main()
+
+    assert exit_code == 1
+    records = _read_jsonl(telemetry_path)
+    episode_start = next(
+        record for record in records if record["event_type"] == "episode_start"
+    )
+    summary = records[-1]
+    assert episode_start["exact_sensor_frame_ids_available"] is True
+    assert summary["loop_tick_count"] == 0
+    assert summary["exact_source_frame_ids_available"] is False
+    assert summary["exact_plan_age_available"] is False
+    assert summary["source_age_s"]["count"] == 0
+    _assert_stream_summary_invariants(records)
+
+
+def test_sync_normal_inference_failure_keeps_episode_running_and_brakes(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "sync-inference-error.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.3",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+
+    def fail_inference(*_args, **_kwargs):
+        raise RuntimeError("synthetic inference failure")
+
+    monkeypatch.setattr(closed_loop, "run_inference", fail_inference)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "max_episode_seconds"
+    assert records[-1]["loop_tick_count"] == 3
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)] * 3
+
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    terminal = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert len(submitted) == len(terminal) == 1
+    assert terminal[0]["status"] == "error"
+    assert terminal[0]["rejection_reason"].startswith("model_inference_error:")
+
+    ticks = [record for record in records if record["event_type"] == "tick"]
+    full_brake = {"steering": 0.0, "throttle": 0.0, "brake": 1.0}
+    assert len(ticks) == 3
+    assert all(tick["controller_state"] == "WAITING_FOR_PLAN" for tick in ticks)
+    assert all(tick["applied_control_source"] == "FALLBACK" for tick in ticks)
+    assert all(tick["applied_control"] == full_brake for tick in ticks)
+
+
+def test_invalid_pid_output_fails_closed_without_runtime_error(monkeypatch, tmp_path):
+    class _NaNFollower:
+        def compute_world_control(self, **_kwargs):
+            return float("nan"), 0.6, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 5.0,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _SafeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def assess(self, **_kwargs):
+            return types.SimpleNamespace(
+                road=RoadContainmentAssessment.safe(sample_count=5),
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "invalid-pid.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(
+        closed_loop,
+        "OfficialPIDFollower",
+        lambda *_args: _NaNFollower(),
+    )
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _SafeAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "max_episode_seconds"
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)]
+
+    tick = next(record for record in records if record["event_type"] == "tick")
+    assert tick["controller_state"] == "INVALID_CONTROLLER_OUTPUT"
+    assert tick["fallback_state"] == "INVALID_CONTROLLER_OUTPUT"
+    assert tick["control_origin"] == "fail_closed_controller_validation"
+    assert tick["requested_control"] is None
+    assert tick["nominal_control"] is None
+    assert tick["applied_control"] == {
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 1.0,
+    }
+    assert tick["applied_control_source"] == "SAFETY_OVERRIDE"
+    assert tick["safety_override_applied"] is True
+    assert tick["safety_override_reason"] == "nominal_control_unavailable"
+    assert tick["safety_assessment"]["arbitration_errors"]
+
+
+def test_sync_normal_inference_uses_one_second_simulation_time_cadence(
+    monkeypatch,
+    tmp_path,
+):
+    telemetry_path = tmp_path / "sync-cadence.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "2.05",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    inference_calls = 0
+
+    def fail_inference(*_args, **_kwargs):
+        nonlocal inference_calls
+        inference_calls += 1
+        raise RuntimeError("synthetic inference failure")
+
+    monkeypatch.setattr(closed_loop, "run_inference", fail_inference)
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    submitted = [
+        record for record in records if record["event_type"] == "inference_submitted"
+    ]
+    source_times = [record["source_simulation_time_s"] for record in submitted]
+
+    assert inference_calls == len(submitted) == 3
+    assert source_times == pytest.approx([0.1, 1.1, 2.1])
+    assert all(
+        later - earlier >= 1.0 - 1e-9
+        for earlier, later in zip(source_times, source_times[1:])
+    )
+    assert not [record for record in records if record["event_type"] == "runtime_error"]
+    assert records[-1]["stop_reason"] == "max_episode_seconds"
+
+
+@pytest.mark.parametrize("replacement_arrives", [True, False])
+def test_full_safe_active_plan_bridge_is_bounded(
+    monkeypatch,
+    tmp_path,
+    replacement_arrives,
+):
+    safe_road = RoadContainmentAssessment.safe(sample_count=5, min_margin_m=0.5)
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _FullSafeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def _envelope():
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                current_ego_clearance_road=safe_road,
+                near_term_path_road=safe_road,
+                full_path_road=safe_road,
+                last_safe_waypoint_index=63,
+                time_to_first_bad_s=None,
+                distance_to_first_bad_m=None,
+                target_speed_cap_mps=None,
+                emergency_required=False,
+                stopping_reserve_profile=StoppingReserveProfile(
+                    raw_physical_stopping_cap_mps=None,
+                    target_speed_cap_mps=None,
+                    guard_speed_mps=2.5,
+                    required_stopping_distance_m=None,
+                    stopping_reserve_m=None,
+                    status=StoppingReserveStatus.UNBOUNDED,
+                ),
+            )
+
+        def assess_plan_road(self, **_kwargs):
+            return self._envelope()
+
+        def assess(self, **_kwargs):
+            envelope = self._envelope()
+            return types.SimpleNamespace(
+                road=safe_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=safe_road,
+                proposed_path_road=safe_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "active-availability-bridge.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "5.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(
+        closed_loop,
+        "OfficialPIDFollower",
+        lambda *_args: _TrackingFollower(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _FullSafeAdapter,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    valid = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    valid[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    extraction_count = 0
+
+    def extract_with_four_invalid_updates(_prediction):
+        nonlocal extraction_count
+        extraction_count += 1
+        if extraction_count in {2, 3, 4, 5} or (
+            extraction_count >= 6 and not replacement_arrives
+        ):
+            invalid = valid.copy()
+            invalid[:, :, 1] = 100.0
+            return invalid
+        return valid.copy()
+
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        extract_with_four_invalid_updates,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    bridge_ticks = [
+        record
+        for record in records
+        if record["event_type"] == "tick"
+        and record["availability_bridge_active"]
+    ]
+    assert [record["source_age_s"] for record in bridge_ticks] == pytest.approx(
+        [4.5, 4.6, 4.7, 4.8, 4.9]
+    )
+    assert all(
+        record["active_plan_availability_status"] == "BRIDGED_FULL_SAFE"
+        for record in bridge_ticks
+    )
+    assert all(record["fallback_state"] == "NONE" for record in bridge_ticks)
+    assert all(
+        record["applied_control_source"] == "CONTROLLER_EXECUTION"
+        for record in bridge_ticks
+    )
+    assert len({record["active_plan_id"] for record in bridge_ticks}) == 1
+    post_bridge_tick = next(
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] == 51
+    )
+    assert post_bridge_tick["availability_bridge_active"] is False
+    if replacement_arrives:
+        assert post_bridge_tick["active_plan_id"] != bridge_ticks[-1]["active_plan_id"]
+        assert not [
+            record
+            for record in records
+            if record["event_type"] == "tick"
+            and record["fallback_state"] == "WAITING_FOR_PLAN"
+        ]
+    else:
+        assert post_bridge_tick["active_plan_id"] is None
+        assert post_bridge_tick["fallback_state"] == "WAITING_FOR_PLAN"
+        assert post_bridge_tick["fallback_reason"] == "plan_source_age_exceeded"
+        assert (
+            post_bridge_tick["active_plan_availability_status"]
+            == "BRIDGE_DENIED"
+        )
+        assert (
+            post_bridge_tick["active_plan_availability"]["denial_reason"]
+            == "plan_source_age_exceeded"
+        )
+    bridged_validation = [
+        record
+        for record in records
+        if record["event_type"] == "plan_validation"
+        and record.get("execution_allowed_by_bridge")
+    ]
+    assert len(bridged_validation) == 5
+    assert all(record["valid"] is False for record in bridged_validation)
+
+
+def test_near_term_unsafe_candidate_does_not_replace_active_safe_plan(
+    monkeypatch,
+    tmp_path,
+):
+    safe_road = RoadContainmentAssessment.safe(sample_count=5)
+    unsafe_road = RoadContainmentAssessment.unsafe(
+        ("road_not_contained",),
+        sample_count=5,
+        first_bad_sample_index=0,
+    )
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _AdmissionAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def _envelope(plan):
+            candidate_is_unsafe = str(plan.plan_id).endswith(":2")
+            path_road = unsafe_road if candidate_is_unsafe else safe_road
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                near_term_path_road=path_road,
+                full_path_road=path_road,
+                last_safe_waypoint_index=(5 if candidate_is_unsafe else 63),
+                time_to_first_bad_s=(0.8 if candidate_is_unsafe else None),
+                distance_to_first_bad_m=(1.0 if candidate_is_unsafe else None),
+                target_speed_cap_mps=(0.0 if candidate_is_unsafe else None),
+                emergency_required=False,
+            )
+
+        def assess_plan_road(self, *, plan, **_kwargs):
+            return self._envelope(plan)
+
+        def assess(self, *, plan, **_kwargs):
+            envelope = self._envelope(plan)
+            return types.SimpleNamespace(
+                road=safe_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=safe_road,
+                proposed_path_road=envelope.full_path_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "road-admission.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "1.2",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: _TrackingFollower())
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _AdmissionAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Follow the lane."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    records = _read_jsonl(telemetry_path)
+    admissions = [
+        record for record in records if record["event_type"] == "plan_admission"
+    ]
+    assert [record["admission_status"] for record in admissions] == [
+        "ACCEPT_FULLY_SAFE",
+        "REJECT_RETAIN_ACTIVE",
+    ]
+    inference_results = [
+        record for record in records if record["event_type"] == "inference_result"
+    ]
+    assert [record["status"] for record in inference_results] == [
+        "accepted_plan",
+        "rejected_plan",
+    ]
+    ticks_after_rejection = [
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] >= 11
+    ]
+    assert ticks_after_rejection
+    assert all(
+        str(record["active_plan_id"]).endswith(":1")
+        for record in ticks_after_rejection
+    )
+    assert all(record["applied_control_source"] == "CONTROLLER_EXECUTION"
+               for record in ticks_after_rejection)
+
+
+def test_multi_candidate_selector_road_evaluates_all_samples_before_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    safe_road = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.4,
+    )
+    lower_margin_safe_road = RoadContainmentAssessment.safe(
+        sample_count=5,
+        min_margin_m=0.2,
+    )
+    unsafe_road = RoadContainmentAssessment.unsafe(
+        ("road_not_contained",),
+        sample_count=5,
+        min_margin_m=-0.5,
+        first_bad_sample_index=0,
+    )
+    assessed_candidate_indices = []
+
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.0, 0.4, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 2.5,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _MultiCandidateAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def assess_ego_transform(self, _transform):
+            return safe_road
+
+        @staticmethod
+        def _envelope(plan):
+            index = int(plan.selected_candidate_index)
+            if index == 0:
+                return RoadExecutionEnvelope(
+                    current_ego_road=safe_road,
+                    near_term_path_road=unsafe_road,
+                    full_path_road=unsafe_road,
+                    last_safe_waypoint_index=5,
+                    time_to_first_bad_s=0.5,
+                    distance_to_first_bad_m=1.0,
+                    target_speed_cap_mps=0.0,
+                    emergency_required=False,
+                )
+            if index == 1:
+                return RoadExecutionEnvelope(
+                    current_ego_road=safe_road,
+                    near_term_path_road=safe_road,
+                    full_path_road=safe_road,
+                    last_safe_waypoint_index=63,
+                    time_to_first_bad_s=None,
+                    distance_to_first_bad_m=None,
+                    target_speed_cap_mps=None,
+                    emergency_required=False,
+                )
+            return RoadExecutionEnvelope(
+                current_ego_road=safe_road,
+                near_term_path_road=lower_margin_safe_road,
+                full_path_road=unsafe_road,
+                last_safe_waypoint_index=32,
+                time_to_first_bad_s=3.2,
+                distance_to_first_bad_m=8.0,
+                target_speed_cap_mps=2.0,
+                emergency_required=False,
+            )
+
+        def assess_plan_road(self, *, plan, **_kwargs):
+            assessed_candidate_indices.append(plan.selected_candidate_index)
+            return self._envelope(plan)
+
+        def assess(self, *, plan, **_kwargs):
+            envelope = self._envelope(plan)
+            return types.SimpleNamespace(
+                road=envelope.current_ego_road,
+                obstacles=ObstacleAssessment.safe(evaluated_actor_count=0),
+                current_ego_road=envelope.current_ego_road,
+                proposed_path_road=envelope.full_path_road,
+                road_envelope=envelope,
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "multi-candidate.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--num-traj-samples",
+            "3",
+            "--trajectory-reachability-audit",
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "1.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: _TrackingFollower())
+    monkeypatch.setattr(
+        closed_loop,
+        "CarlaGroundTruthSafetyAdapter",
+        _MultiCandidateAdapter,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (
+            object(),
+            {
+                "cot": closed_loop.np.array(
+                    [["unsafe sample", "fully safe sample", "safe prefix sample"]],
+                    dtype=object,
+                )
+            },
+        ),
+    )
+    candidates = closed_loop.np.zeros((3, 64, 3), dtype=closed_loop.np.float64)
+    candidates[:, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    extraction_count = 0
+
+    def extract_candidates(_prediction):
+        nonlocal extraction_count
+        extraction_count += 1
+        if extraction_count == 1:
+            return candidates.copy()
+        invalid_candidates = candidates.copy()
+        invalid_candidates[:, :, 1] = 100.0
+        return invalid_candidates
+
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        extract_candidates,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    assert assessed_candidate_indices[:3] == [0, 1, 2]
+    records = _read_jsonl(telemetry_path)
+    evaluations = [
+        record
+        for record in records
+        if record["event_type"] == "candidate_evaluation"
+        and record["proposal_id"].endswith(":1")
+    ]
+    assert len(evaluations) == 3
+    assert [record["candidate_index"] for record in evaluations] == [0, 1, 2]
+    assert [record["admission_status"] for record in evaluations] == [
+        "REJECT_FALLBACK_STOP",
+        "ACCEPT_FULLY_SAFE",
+        "ACCEPT_SAFE_PREFIX",
+    ]
+    assert [record["selected"] for record in evaluations] == [False, True, False]
+
+    selection = next(
+        record for record in records if record["event_type"] == "candidate_selection"
+    )
+    assert selection["preselected_candidate_index"] == 0
+    assert selection["selected_candidate_index"] == 1
+    assert selection["selected_admitted"] is True
+    assert selection["selection_reason"] == "best_admitted_candidate"
+    assert selection["candidate_ranking_policy_requested"] == "current"
+    assert selection["candidate_ranking_policy_effective"] == "current"
+    assert selection["reachability_batch_complete"] is True
+    assert selection["reachability_shadow_selected_index"] is not None
+    assert selection["source_speed_mps"] == 0.0
+    assert selection["source_history_real_tick_count"] >= 1
+    assert all(
+        record["trajectory_reachability_profile"] is not None
+        and record["trajectory_reachability_error"] is None
+        for record in evaluations
+    )
+
+    proposal = next(
+        record for record in records if record["event_type"] == "alpamayo_proposal"
+    )
+    assert proposal["preselected_candidate_index"] == 0
+    assert proposal["selected_candidate_index"] == 1
+    assert proposal["coc_text_full"] == "fully safe sample"
+
+    admission = next(
+        record for record in records if record["event_type"] == "plan_admission"
+    )
+    assert admission["selected_candidate_index"] == 1
+    assert admission["admission_status"] == "ACCEPT_FULLY_SAFE"
+    ticks_after_invalid_proposal = [
+        record
+        for record in records
+        if record["event_type"] == "tick" and record["loop_tick_id"] >= 11
+    ]
+    assert ticks_after_invalid_proposal
+    assert all(
+        record["active_plan_id"].endswith("/candidate-1")
+        for record in ticks_after_invalid_proposal
+    )
+    assert all(
+        record["plan_admission_status"] == "ACCEPT_FULLY_SAFE"
+        for record in ticks_after_invalid_proposal
+    )
+
+
+def test_obstacle_override_is_the_only_control_applied_for_a_nominal_throttle(
+    monkeypatch,
+    tmp_path,
+):
+    class _TrackingFollower:
+        def compute_world_control(self, **_kwargs):
+            return 0.2, 0.6, 0.0, {
+                "controller_state": "TRACKING",
+                "target_speed_mps": 5.0,
+                "bypass_smoothing": False,
+            }
+
+        def reset_plan_progress(self, *_args):
+            pass
+
+    class _UnsafeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def assess(self, **_kwargs):
+            return types.SimpleNamespace(
+                road=RoadContainmentAssessment.safe(sample_count=5),
+                obstacles=ObstacleAssessment.unknown(("synthetic_obstacle",)),
+            )
+
+        def reset(self, *_args):
+            pass
+
+    telemetry_path = tmp_path / "safety.jsonl"
+    args = closed_loop.parse_args(
+        [
+            "--telemetry-jsonl",
+            str(telemetry_path),
+            "--max-episode-seconds",
+            "0.1",
+        ]
+    )
+    carla_if = _FakeCarlaInterface(fixed_delta_seconds=0.1)
+    carla_if.get_camera_images = lambda: closed_loop.np.zeros(
+        (4, 1, 1, 3),
+        dtype=closed_loop.np.uint8,
+    )
+    _install_common_fakes(monkeypatch, args, carla_if, num_frames=1)
+    monkeypatch.setattr(closed_loop.cfg, "NUM_CAMERAS", 4)
+    monkeypatch.setattr(closed_loop, "OfficialPIDFollower", lambda *_args: _TrackingFollower())
+    monkeypatch.setattr(closed_loop, "CarlaGroundTruthSafetyAdapter", _UnsafeAdapter)
+    monkeypatch.setattr(
+        closed_loop,
+        "run_inference",
+        lambda *_args, **_kwargs: (object(), {"cot": "Brake for the obstacle."}),
+    )
+    moving_points = closed_loop.np.zeros((1, 64, 3), dtype=closed_loop.np.float64)
+    moving_points[0, :, 0] = closed_loop.np.arange(1, 65) * 0.2
+    monkeypatch.setattr(
+        closed_loop,
+        "extract_trajectory_samples",
+        lambda _prediction: moving_points.copy(),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "create_visualization_frame",
+        lambda cam_img, *_args, **_kwargs: cam_img,
+    )
+
+    closed_loop.main()
+
+    assert carla_if.applied_controls == [(0.0, 0.0, 1.0)]
+    records = _read_jsonl(telemetry_path)
+    tick = next(record for record in records if record["event_type"] == "tick")
+    assert tick["requested_control"]["throttle"] == pytest.approx(0.6)
+    assert tick["nominal_control"]["throttle"] > 0.0
+    assert tick["applied_control"] == {
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 1.0,
+    }
+    assert tick["applied_control_source"] == "SAFETY_OVERRIDE"
+    assert tick["safety_override_applied"] is True
+    assert tick["safety_override_reason"] == "obstacle_assessment_unknown"
+    assert tick["direct_safety_trigger"] is True
+    assert tick["latch_only"] is False
+    assert tick["echoed_control"] == {
+        "echoed_steer": 0.0,
+        "echoed_throttle": 0.0,
+        "echoed_brake": 1.0,
+        "gear": 0,
+    }
+    assert tick["gear"] == 0
+    admissions = [
+        record for record in records if record["event_type"] == "plan_admission"
+    ]
+    assert len(admissions) == 1
+    assert admissions[0]["admission_status"] == "ACCEPT_FULLY_SAFE"
+    proposals = [
+        record for record in records if record["event_type"] == "alpamayo_proposal"
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["coc_text_full"] == "Brake for the obstacle."

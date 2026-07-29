@@ -57,6 +57,11 @@ class ClosedLoopPygameUI:
             if event.key == pygame.K_p and ctrl_pressed:
                 nav_state.toggle_pause()
                 continue
+            if (
+                nav_state.mode == "navigation"
+                and nav_state.navigation_source == "route"
+            ):
+                continue
             if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 try:
                     nav_state.submit_command(nav_state.input_text)
@@ -134,10 +139,27 @@ class ClosedLoopPygameUI:
         frame = telemetry.get("frame", 0)
         inference_time = telemetry.get("inference_time", 0.0)
         steer = telemetry.get("steering", 0.0)
+        admission = telemetry.get("plan_admission_status") or "WAITING"
+        near_road = telemetry.get("near_term_road_status") or "unknown"
+        full_road = telemetry.get("full_path_road_status") or "unknown"
+        road_cap = telemetry.get("road_speed_cap_mps")
+        road_cap_text = "none" if road_cap is None else f"{float(road_cap):.1f}m/s"
+        coc_audit = telemetry.get("coc_semantic_audit") or {}
+        verdict_counts = coc_audit.get("verdict_counts") or {}
+        coc_issue_count = sum(
+            int(verdict_counts.get(name, 0) or 0)
+            for name in (
+                "CONTRADICTED",
+                "POLICY_CONFLICT",
+                "TRAJECTORY_MISMATCH",
+            )
+        )
 
         status_text = (
             f"{status} | frame {frame} | {speed:.1f} km/h | "
-            f"steer {steer:.2f} | inference {inference_time:.2f}s"
+            f"steer {steer:.2f} | inference {inference_time:.2f}s | "
+            f"{admission} | road {near_road}/{full_road} | cap {road_cap_text} | "
+            f"CoC issues {coc_issue_count}"
         )
         self._draw_text(status_text, 18, y0 + 14, self.font, status_color)
         if nav_state.mode == "navigation":
@@ -149,7 +171,16 @@ class ClosedLoopPygameUI:
                 width=105,
                 color=(230, 230, 230),
             )
-            help_text = "Input: text | weight   Enter=apply, Ctrl+P=pause/resume, Esc=quit"
+            if nav_state.navigation_source == "route":
+                help_text = (
+                    "Route-derived navigation is read-only   "
+                    "Ctrl+P=pause/resume, Esc=quit"
+                )
+            else:
+                help_text = (
+                    "Input: text | weight   Enter=apply, "
+                    "Ctrl+P=pause/resume, Esc=quit"
+                )
         elif nav_state.mode == "vqa":
             question = nav_state.vqa_question or "(no VQA question)"
             answer = nav_state.vqa_answer or "(answer pending after Enter/resume)"
@@ -183,7 +214,12 @@ class ClosedLoopPygameUI:
         pygame.draw.rect(self.screen, (35, 35, 35), input_rect, border_radius=6)
         pygame.draw.rect(self.screen, (120, 120, 120), input_rect, width=1, border_radius=6)
         cursor = "_" if int(time.time() * 2) % 2 == 0 else ""
-        self._draw_text(nav_state.input_text + cursor, 28, y0 + 123, self.font, (255, 255, 255))
+        input_text = (
+            "(route authority: prompt editing disabled)"
+            if nav_state.navigation_source == "route"
+            else nav_state.input_text + cursor
+        )
+        self._draw_text(input_text, 28, y0 + 123, self.font, (255, 255, 255))
 
         if nav_state.last_error:
             self._draw_text(nav_state.last_error, 18, y0 + 160, self.small_font, (255, 100, 100))

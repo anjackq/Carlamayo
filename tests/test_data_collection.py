@@ -1,6 +1,7 @@
 import queue
 
 from module.data_collection import (
+    ExactFrameCollector,
     collect_synchronous_sensor_frame,
     frame_file_path,
     frame_is_complete,
@@ -35,3 +36,31 @@ def test_collect_synchronous_sensor_frame_keeps_only_exact_tick():
     )
 
     assert frame == {"camera": "current-camera", "lidar": "current-lidar"}
+
+    sensor_queue.put((11, "camera", "future-camera"))
+    next_frame = collect_synchronous_sensor_frame(
+        sensor_queue,
+        ["camera", "lidar"],
+        frame_id=11,
+        timeout=0.01,
+    )
+
+    assert next_frame == {"camera": "future-camera", "lidar": "future-lidar"}
+
+
+def test_exact_frame_collector_discards_old_packets_and_clears_pending_frames():
+    collector = ExactFrameCollector(max_pending_frames=2)
+    collector.put(4, "camera", "old")
+    collector.put(6, "camera", "future")
+    collector.put(5, "camera", "current")
+
+    assert collector.collect(5, ["camera"], timeout=0.01) == {
+        "camera": "current"
+    }
+    assert collector.stats()["dropped_old"] == 1
+    assert collector.stats()["pending_frames"] == 1
+
+    collector.clear()
+
+    assert collector.stats()["pending_frames"] == 0
+    assert collector.stats()["queued_packets"] == 0

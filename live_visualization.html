@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CARLA + Alpamayo live visualization</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101216;
+      color: #e9edf3;
+      font: 14px/1.4 system-ui, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 10px 14px;
+      background: #191d24;
+      border-bottom: 1px solid #303641;
+    }
+    h1 { margin: 0; font-size: 16px; }
+    .controls { display: flex; align-items: center; gap: 14px; }
+    #status { color: #8ad69b; white-space: nowrap; }
+    main { display: grid; min-height: calc(100vh - 48px); place-items: center; }
+    #preview {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: calc(100vh - 48px);
+      object-fit: contain;
+    }
+    #error {
+      display: none;
+      max-width: 600px;
+      padding: 24px;
+      color: #ffb4a9;
+      text-align: center;
+    }
+    a { color: #82b7ff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CARLA + Alpamayo live visualization</h1>
+    <div class="controls">
+      <a href="assets/carla_alpamayo_demo.gif" target="_blank">Animated GIF fallback</a>
+      <span id="status">Connecting…</span>
+    </div>
+  </header>
+  <main>
+    <img id="preview" alt="Latest CARLA simulation frame">
+    <div id="error">
+      Waiting for <code>carla_alpamayo_closed_loop_latest.jpg</code>.
+      Start the simulation and leave this page open.
+    </div>
+  </main>
+  <script>
+    const preview = document.querySelector("#preview");
+    const status = document.querySelector("#status");
+    const error = document.querySelector("#error");
+    let lastLoadedAt = 0;
+
+    function refresh() {
+      preview.src = `carla_alpamayo_closed_loop_latest.jpg?t=${Date.now()}`;
+    }
+
+    preview.addEventListener("load", () => {
+      lastLoadedAt = Date.now();
+      preview.style.display = "block";
+      error.style.display = "none";
+      status.textContent = `Live · ${new Date().toLocaleTimeString()}`;
+    });
+
+    preview.addEventListener("error", () => {
+      preview.style.display = "none";
+      error.style.display = "block";
+      status.textContent = lastLoadedAt ? "Preview temporarily unavailable" : "Waiting for first frame…";
+    });
+
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>

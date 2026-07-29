@@ -1,14 +1,19 @@
+import math
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from module.camera_geometry import FThetaProjection, PinholeProjection
 from module.visualization import (
     VideoRecorder,
     create_open_loop_visualization_frame,
     create_visualization_frame,
     project_trajectory_to_image,
+    project_world_polyline_to_image,
+    project_world_points_to_camera,
+    project_world_trajectory_to_image,
     save_open_loop_video,
 )
 
@@ -40,6 +45,149 @@ def test_project_trajectory_to_image_rejects_invalid_rank():
 
     with pytest.raises(ValueError, match=r"Expected trajectory with ndim 2 or 3"):
         project_trajectory_to_image(image, trajectory)
+
+
+def test_exact_world_projection_uses_carla_camera_axes():
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [
+            [10.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0],
+            [10.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    pixels, valid = project_world_points_to_camera(points, np.eye(4), intrinsic)
+
+    np.testing.assert_allclose(pixels[:3], [[80.0, 60.0], [90.0, 60.0], [80.0, 50.0]])
+    assert valid.tolist() == [True, True, True, False]
+
+
+def test_world_projection_uses_model_facing_projection_object():
+    projection = PinholeProjection(
+        width=160,
+        height=120,
+        fx=100.0,
+        fy=100.0,
+        cx=80.0,
+        cy=60.0,
+    )
+    points = np.array(
+        [[10.0, 0.0, 0.0], [10.0, 1.0, 0.0], [10.0, 0.0, 1.0]]
+    )
+
+    pixels, valid = project_world_points_to_camera(
+        points,
+        np.eye(4),
+        projection,
+    )
+
+    np.testing.assert_allclose(
+        pixels,
+        [[80.0, 60.0], [90.0, 60.0], [80.0, 50.0]],
+        atol=1e-9,
+    )
+    assert valid.all()
+
+
+def test_ftheta_world_projection_matches_known_angles():
+    projection = FThetaProjection(
+        width=100,
+        height=80,
+        cx=50.0,
+        cy=40.0,
+        angle_to_radius_coefficients=(0.0, 50.0),
+        radius_to_angle_coefficients=(0.0, 1.0 / 50.0),
+    )
+    points = np.array(
+        [
+            [10.0, 0.0, 0.0],
+            [10.0, 10.0 * math.tan(0.4), 0.0],
+            [10.0, 0.0, 10.0 * math.tan(0.2)],
+        ]
+    )
+
+    pixels, valid = project_world_points_to_camera(
+        points,
+        np.eye(4),
+        projection,
+    )
+
+    np.testing.assert_allclose(
+        pixels,
+        [[50.0, 40.0], [70.0, 40.0], [50.0, 30.0]],
+        atol=1e-6,
+    )
+    assert valid.all()
+
+
+def test_calibrated_world_trajectory_draws_on_the_current_image():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array([[2.0, 0.0, 0.0], [5.0, 0.2, 0.0], [8.0, 0.4, 0.0]])
+
+    rendered = project_world_trajectory_to_image(image, points, np.eye(4), intrinsic)
+
+    assert rendered.shape == image.shape
+    assert rendered[..., 1].max() == 255
+
+
+def test_calibrated_world_trajectory_distinguishes_safe_future_and_first_bad():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [
+            [2.0, 0.0, 0.0],
+            [4.0, 1.0, 0.0],
+            [6.0, 3.0, 0.0],
+            [8.0, 6.0, 0.0],
+        ]
+    )
+
+    rendered = project_world_trajectory_to_image(
+        image,
+        points,
+        np.eye(4),
+        intrinsic,
+        last_safe_waypoint_index=1,
+    )
+
+    assert np.any(np.all(rendered == (0, 255, 80), axis=2))
+    assert np.any(np.all(rendered == (255, 210, 0), axis=2))
+    assert np.any(np.all(rendered == (255, 0, 0), axis=2))
+
+
+def test_diagnostic_world_polyline_uses_distinct_color_and_dash_pattern():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    intrinsic = np.array(
+        [[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.array(
+        [[2.0, 0.0, 0.0], [4.0, 0.1, 0.0], [6.0, 0.2, 0.0], [8.0, 0.3, 0.0]]
+    )
+
+    rendered = project_world_polyline_to_image(
+        image,
+        points,
+        np.eye(4),
+        intrinsic,
+        color=(255, 80, 255),
+        dashed=True,
+    )
+
+    assert np.any(np.all(rendered == (255, 80, 255), axis=2))
 
 
 def test_create_visualization_frame_preserves_rgb_shape_and_adds_overlay():
@@ -89,6 +237,23 @@ def test_video_recorder_no_frames_does_not_create_output(tmp_path):
     VideoRecorder(output_path).save()
 
     assert not output_path.exists()
+
+
+def test_video_recorder_streams_frames_and_publishes_preview(tmp_path):
+    output_path = tmp_path / "streamed.mp4"
+    preview_path = tmp_path / "latest.jpg"
+    recorder = VideoRecorder(output_path, fps=5, preview_path=preview_path)
+
+    recorder.add_frame(np.zeros((80, 120, 3), dtype=np.uint8))
+
+    assert recorder.frame_count == 1
+    assert preview_path.exists()
+    assert preview_path.stat().st_size > 0
+
+    recorder.save()
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
 
 
 def test_save_open_loop_video_writes_nonempty_video(tmp_path):

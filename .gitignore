@@ -57,6 +57,8 @@ cover/
 
 # Django stuff:
 *.log
+slurm-*.out
+slurm-*.err
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -162,10 +164,29 @@ a1_5_carla_venv/
 # CARLA/Alpamayo generated validation artifacts
 carla_data*/
 carla_alpamayo_*.mp4
+.carla_alpamayo_*.opencv-tmp.mp4
+carla_alpamayo_*_latest.jpg
+carlamayo_runtime*.jsonl
 *.avi
 *.mov
 *.mkv
 *.webm
+
+# Local model weights and experiment outputs
+/checkpoints/
+/outputs/
+/runs/
+/wandb/
+*.camera-profile.json
+*.camera-fixture.npz
+camera_profiles/
+camera_fixtures/
+camera-comparisons/
+camera_comparisons/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
 
 # Spyder project settings
 .spyderproject

@@ -1,0 +1,3636 @@
+{
+  "candidate_lane_facts": [
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "section_id": 0
+    }
+  ],
+  "ego_lane_fact": {
+    "is_junction": false,
+    "lane_id": 3,
+    "road_id": 28,
+    "section_id": 0
+  },
+  "ego_xyz": [
+    -6.209767818450928,
+    -46.03957748413086,
+    0.0017954063368961215
+  ],
+  "ego_yaw_deg": 91.66123962402344,
+  "expected": {
+    "current_route_status": "MATCH",
+    "full_path_route_status": "MATCH",
+    "near_term_route_status": "MATCH",
+    "tracker_status": "AVAILABLE",
+    "wrong_branch_status": "DEVIATE"
+  },
+  "expected_identity_route_index": 32,
+  "integrity_sha256": "2cd7c6fabce1e912c94fdb0b887b34336889faf9b63b766c25244b068ff20a26",
+  "junction_topology_overlap_case": {
+    "candidate_lane_facts": [
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      }
+    ],
+    "current_route_index": 52,
+    "expected": {
+      "full_path_route_status": "MATCH",
+      "near_term_route_status": "MATCH",
+      "reason_code": "junction_topology_overlap_canonicalized",
+      "unrelated_branch_status": "DEVIATE"
+    },
+    "first_overlap_waypoint_index": 44,
+    "selected_candidate_index": 1,
+    "selected_trajectory_world": [
+      [
+        -7.938786411968721,
+        -28.456238669268966,
+        0.0017099189572036266
+      ],
+      [
+        -7.938812218488576,
+        -28.456096619262734,
+        0.0017099189572036266
+      ],
+      [
+        -7.938833831516565,
+        -28.455977651612404,
+        0.0017099189572036266
+      ],
+      [
+        -7.938854419998492,
+        -28.4558643231805,
+        0.0017099189572036266
+      ],
+      [
+        -7.938882435327205,
+        -28.455710113511145,
+        0.0017099189572036266
+      ],
+      [
+        -7.938922791490424,
+        -28.45548797321791,
+        0.0017099189572036266
+      ],
+      [
+        -7.938976469989974,
+        -28.455192498825916,
+        0.0017099189572036266
+      ],
+      [
+        -7.939043135910821,
+        -28.454825532977214,
+        0.0017099189572036266
+      ],
+      [
+        -7.93912235493803,
+        -28.45438946541524,
+        0.0017099189572036266
+      ],
+      [
+        -7.939213995352982,
+        -28.45388502035316,
+        0.0017099189572036266
+      ],
+      [
+        -7.939319902460156,
+        -28.453302039272923,
+        0.0017099189572036266
+      ],
+      [
+        -7.939438740438527,
+        -28.452647874745505,
+        0.0017099189572036266
+      ],
+      [
+        -7.939567083607143,
+        -28.45194138381941,
+        0.0017099189572036266
+      ],
+      [
+        -7.939704620150728,
+        -28.451184283712777,
+        0.0017099189572036266
+      ],
+      [
+        -7.939849857789334,
+        -28.450384790238324,
+        0.0017099189572036266
+      ],
+      [
+        -7.940002015031844,
+        -28.449547206972124,
+        0.0017099189572036266
+      ],
+      [
+        -7.940162642742608,
+        -28.44866299933934,
+        0.0017099189572036266
+      ],
+      [
+        -7.940333630225531,
+        -28.447721770353045,
+        0.0017099189572036266
+      ],
+      [
+        -7.940512707584298,
+        -28.44673601928149,
+        0.0017099189572036266
+      ],
+      [
+        -7.940700233860623,
+        -28.445703776233824,
+        0.0017099189572036266
+      ],
+      [
+        -7.94089619974266,
+        -28.444625099152052,
+        0.0017099189572036266
+      ],
+      [
+        -7.9410986176754355,
+        -28.443510936533585,
+        0.0017099189572036266
+      ],
+      [
+        -7.94130949177556,
+        -28.442350267164457,
+        0.0017099189572036266
+      ],
+      [
+        -7.94153157342889,
+        -28.441127959289794,
+        0.0017099189572036266
+      ],
+      [
+        -7.941776622085463,
+        -28.43977931124191,
+        0.0017099189572036266
+      ],
+      [
+        -7.942082420797076,
+        -28.438096437633337,
+        0.0017099189572036266
+      ],
+      [
+        -7.94253595550887,
+        -28.435600825244304,
+        0.0017099189572036266
+      ],
+      [
+        -7.943253392163519,
+        -28.43165382866548,
+        0.0017099189572036266
+      ],
+      [
+        -7.944329029013703,
+        -28.425738104074554,
+        0.0017099189572036266
+      ],
+      [
+        -7.945823761533506,
+        -28.41752143254783,
+        0.0017099189572036266
+      ],
+      [
+        -7.947762733721627,
+        -28.406870062128956,
+        0.0017099189572036266
+      ],
+      [
+        -7.9501455046260565,
+        -28.39379278961441,
+        0.0017099189572036266
+      ],
+      [
+        -7.952980183922246,
+        -28.37825429336129,
+        0.0017099189572036266
+      ],
+      [
+        -7.9563074637317674,
+        -28.36004385048984,
+        0.0017099189572036266
+      ],
+      [
+        -7.960217084919362,
+        -28.338687912285526,
+        0.0017099189572036266
+      ],
+      [
+        -7.964849896110418,
+        -28.313442614188485,
+        0.0017099189572036266
+      ],
+      [
+        -7.970401019573809,
+        -28.283282045578193,
+        0.0017099189572036266
+      ],
+      [
+        -7.977119290358041,
+        -28.246913929045128,
+        0.0017099189572036266
+      ],
+      [
+        -7.985284229004733,
+        -28.202914582303467,
+        0.0017099189572036266
+      ],
+      [
+        -7.995188965666689,
+        -28.149841228985974,
+        0.0017099189572036266
+      ],
+      [
+        -8.007133504534346,
+        -28.086282525683544,
+        0.0017099189572036266
+      ],
+      [
+        -8.021403409076163,
+        -28.010973517863373,
+        0.0017099189572036266
+      ],
+      [
+        -8.03825788437571,
+        -27.92286927583686,
+        0.0017099189572036266
+      ],
+      [
+        -8.05793856645171,
+        -27.82112104782178,
+        0.0017099189572036266
+      ],
+      [
+        -8.08066776019512,
+        -27.70505873502027,
+        0.0017099189572036266
+      ],
+      [
+        -8.106672618564557,
+        -27.574110229603665,
+        0.0017099189572036266
+      ],
+      [
+        -8.136188004072137,
+        -27.427757226313712,
+        0.0017099189572036266
+      ],
+      [
+        -8.169460703293142,
+        -27.265503517090583,
+        0.0017099189572036266
+      ],
+      [
+        -8.206753046995644,
+        -27.086960279418843,
+        0.0017099189572036266
+      ],
+      [
+        -8.248328350647895,
+        -26.89188420179285,
+        0.0017099189572036266
+      ],
+      [
+        -8.294450704553793,
+        -26.68012383203316,
+        0.0017099189572036266
+      ],
+      [
+        -8.345417630206077,
+        -26.451547119175913,
+        0.0017099189572036266
+      ],
+      [
+        -8.401626007169586,
+        -26.20581640052677,
+        0.0017099189572036266
+      ],
+      [
+        -8.463633053256627,
+        -25.942247544757972,
+        0.0017099189572036266
+      ],
+      [
+        -8.532121076812869,
+        -25.65991816625165,
+        0.0017099189572036266
+      ],
+      [
+        -8.607794491154031,
+        -25.357937762204493,
+        0.0017099189572036266
+      ],
+      [
+        -8.69140362227193,
+        -25.035836359211252,
+        0.0017099189572036266
+      ],
+      [
+        -8.783660859254022,
+        -24.693665836519784,
+        0.0017099189572036266
+      ],
+      [
+        -8.885227271867564,
+        -24.331764139526697,
+        0.0017099189572036266
+      ],
+      [
+        -8.99681193234577,
+        -23.950538030039024,
+        0.0017099189572036266
+      ],
+      [
+        -9.119184493500043,
+        -23.55034299919417,
+        0.0017099189572036266
+      ],
+      [
+        -9.253077555114995,
+        -23.13151665981349,
+        0.0017099189572036266
+      ],
+      [
+        -9.399175128132601,
+        -22.694470671263794,
+        0.0017099189572036266
+      ],
+      [
+        -9.55822030142204,
+        -22.23980819737504,
+        0.0017099189572036266
+      ]
+    ],
+    "source_commit": "04cd5ae",
+    "source_job_id": 22922863,
+    "source_loop_tick_id": 344,
+    "source_request_id": 35,
+    "source_simulation_time_s": 48.6065682717599,
+    "waypoint_times_s": [
+      48.7065682717599,
+      48.8065682717599,
+      48.906568271759895,
+      49.006568271759896,
+      49.1065682717599,
+      49.2065682717599,
+      49.3065682717599,
+      49.406568271759895,
+      49.506568271759896,
+      49.6065682717599,
+      49.7065682717599,
+      49.8065682717599,
+      49.906568271759895,
+      50.006568271759896,
+      50.1065682717599,
+      50.2065682717599,
+      50.3065682717599,
+      50.406568271759895,
+      50.506568271759896,
+      50.6065682717599,
+      50.7065682717599,
+      50.8065682717599,
+      50.906568271759895,
+      51.006568271759896,
+      51.1065682717599,
+      51.2065682717599,
+      51.3065682717599,
+      51.406568271759895,
+      51.506568271759896,
+      51.6065682717599,
+      51.7065682717599,
+      51.8065682717599,
+      51.906568271759895,
+      52.006568271759896,
+      52.1065682717599,
+      52.2065682717599,
+      52.3065682717599,
+      52.406568271759895,
+      52.506568271759896,
+      52.6065682717599,
+      52.7065682717599,
+      52.8065682717599,
+      52.906568271759895,
+      53.006568271759896,
+      53.1065682717599,
+      53.2065682717599,
+      53.3065682717599,
+      53.406568271759895,
+      53.506568271759896,
+      53.6065682717599,
+      53.7065682717599,
+      53.8065682717599,
+      53.906568271759895,
+      54.006568271759896,
+      54.1065682717599,
+      54.2065682717599,
+      54.3065682717599,
+      54.406568271759895,
+      54.506568271759896,
+      54.6065682717599,
+      54.7065682717599,
+      54.8065682717599,
+      54.906568271759895,
+      55.006568271759896
+    ]
+  },
+  "previous_connector_overlap_case": {
+    "candidate_lane_facts": [
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -5,
+        "road_id": 1624,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1577,
+        "section_id": 0
+      },
+      {
+        "is_junction": true,
+        "lane_id": -3,
+        "road_id": 1608,
+        "section_id": 0
+      }
+    ],
+    "current_route_index": 66,
+    "expected": {
+      "full_path_route_status": "MATCH",
+      "near_term_route_status": "MATCH",
+      "reason_code": "junction_topology_overlap_canonicalized",
+      "unrelated_branch_status": "DEVIATE"
+    },
+    "first_overlap_waypoint_index": 61,
+    "selected_candidate_index": 2,
+    "selected_trajectory_world": [
+      [
+        -12.195636979156019,
+        -19.872214576877145,
+        0.0016781424637883904
+      ],
+      [
+        -12.195668526345484,
+        -19.87216304726158,
+        0.0016781424637883904
+      ],
+      [
+        -12.19571587711109,
+        -19.872085703550333,
+        0.0016781424637883904
+      ],
+      [
+        -12.195758297590068,
+        -19.872016412781157,
+        0.0016781424637883904
+      ],
+      [
+        -12.19578213883105,
+        -19.871977469720402,
+        0.0016781424637883904
+      ],
+      [
+        -12.195800213749045,
+        -19.87194794548889,
+        0.0016781424637883904
+      ],
+      [
+        -12.195819130691811,
+        -19.87191704583008,
+        0.0016781424637883904
+      ],
+      [
+        -12.195829295359035,
+        -19.871900442459108,
+        0.0016781424637883904
+      ],
+      [
+        -12.195821596023398,
+        -19.87191301886006,
+        0.0016781424637883904
+      ],
+      [
+        -12.19578167289449,
+        -19.871978230838053,
+        0.0016781424637883904
+      ],
+      [
+        -12.195712372185653,
+        -19.87209142919638,
+        0.0016781424637883904
+      ],
+      [
+        -12.195620454017456,
+        -19.87224157170567,
+        0.0016781424637883904
+      ],
+      [
+        -12.195504270373128,
+        -19.87243135054087,
+        0.0016781424637883904
+      ],
+      [
+        -12.19537201500247,
+        -19.872647382179665,
+        0.0016781424637883904
+      ],
+      [
+        -12.195225051730281,
+        -19.872887439653514,
+        0.0016781424637883904
+      ],
+      [
+        -12.195060226752611,
+        -19.87315667564404,
+        0.0016781424637883904
+      ],
+      [
+        -12.194887815291466,
+        -19.87343830712648,
+        0.0016781424637883904
+      ],
+      [
+        -12.194720720212603,
+        -19.873711258271605,
+        0.0016781424637883904
+      ],
+      [
+        -12.194552882763064,
+        -19.873985426908582,
+        0.0016781424637883904
+      ],
+      [
+        -12.194390921524652,
+        -19.87425000146601,
+        0.0016781424637883904
+      ],
+      [
+        -12.194236428010967,
+        -19.87450238273562,
+        0.0016781424637883904
+      ],
+      [
+        -12.194096241429994,
+        -19.87473139694902,
+        0.0016781424637883904
+      ],
+      [
+        -12.194026440922727,
+        -19.874845427421928,
+        0.0016781424637883904
+      ],
+      [
+        -12.19410290923015,
+        -19.874720504808746,
+        0.0016781424637883904
+      ],
+      [
+        -12.194401193697525,
+        -19.87423323438772,
+        0.0016781424637883904
+      ],
+      [
+        -12.194937146358212,
+        -19.87335780206857,
+        0.0016781424637883904
+      ],
+      [
+        -12.195648520965035,
+        -19.872196016388045,
+        0.0016781424637883904
+      ],
+      [
+        -12.196493450428138,
+        -19.87081641928063,
+        0.0016781424637883904
+      ],
+      [
+        -12.19747761671987,
+        -19.869209926331244,
+        0.0016781424637883904
+      ],
+      [
+        -12.198723342679981,
+        -19.867177269186048,
+        0.0016781424637883904
+      ],
+      [
+        -12.200595995617508,
+        -19.864123481072195,
+        0.0016781424637883904
+      ],
+      [
+        -12.203621515167448,
+        -19.859194479765637,
+        0.0016781424637883904
+      ],
+      [
+        -12.208257600129933,
+        -19.851653361922544,
+        0.0016781424637883904
+      ],
+      [
+        -12.214782739439901,
+        -19.84106410736286,
+        0.0016781424637883904
+      ],
+      [
+        -12.223381595734937,
+        -19.827154732670255,
+        0.0016781424637883904
+      ],
+      [
+        -12.234233122635029,
+        -19.809676442216972,
+        0.0016781424637883904
+      ],
+      [
+        -12.247526145710344,
+        -19.78838111152759,
+        0.0016781424637883904
+      ],
+      [
+        -12.263391719760493,
+        -19.763131715244384,
+        0.0016781424637883904
+      ],
+      [
+        -12.281784062209406,
+        -19.734086999658178,
+        0.0016781424637883904
+      ],
+      [
+        -12.302460169763293,
+        -19.7017204488221,
+        0.0016781424637883904
+      ],
+      [
+        -12.325170885807546,
+        -19.66650757157266,
+        0.0016781424637883904
+      ],
+      [
+        -12.349920328157971,
+        -19.628524935041902,
+        0.0016781424637883904
+      ],
+      [
+        -12.377091380297019,
+        -19.58727857633135,
+        0.0016781424637883904
+      ],
+      [
+        -12.407389476230069,
+        -19.541815250301358,
+        0.0016781424637883904
+      ],
+      [
+        -12.441753657698102,
+        -19.49088305700113,
+        0.0016781424637883904
+      ],
+      [
+        -12.481329546636701,
+        -19.43299224327657,
+        0.0016781424637883904
+      ],
+      [
+        -12.527383555989006,
+        -19.366558227245793,
+        0.0016781424637883904
+      ],
+      [
+        -12.581356605424174,
+        -19.28984097409661,
+        0.0016781424637883904
+      ],
+      [
+        -12.644769264516306,
+        -19.201071147375323,
+        0.0016781424637883904
+      ],
+      [
+        -12.718863650936486,
+        -19.098934153928944,
+        0.0016781424637883904
+      ],
+      [
+        -12.804447721312348,
+        -18.982733680538086,
+        0.0016781424637883904
+      ],
+      [
+        -12.901809906254352,
+        -18.852429866837365,
+        0.0016781424637883904
+      ],
+      [
+        -13.010807964953898,
+        -18.70842638275671,
+        0.0016781424637883904
+      ],
+      [
+        -13.131039171765707,
+        -18.551338948524602,
+        0.0016781424637883904
+      ],
+      [
+        -13.262040342323608,
+        -18.381752700179078,
+        0.0016781424637883904
+      ],
+      [
+        -13.403380092938983,
+        -18.20004301066416,
+        0.0016781424637883904
+      ],
+      [
+        -13.554612772351106,
+        -18.006541434390336,
+        0.0016781424637883904
+      ],
+      [
+        -13.71531867716207,
+        -17.801580036177917,
+        0.0016781424637883904
+      ],
+      [
+        -13.885140089870509,
+        -17.585396881494624,
+        0.0016781424637883904
+      ],
+      [
+        -14.063703716528746,
+        -17.358216865473707,
+        0.0016781424637883904
+      ],
+      [
+        -14.250627509460266,
+        -17.12034590539783,
+        0.0016781424637883904
+      ],
+      [
+        -14.44560067403042,
+        -16.87205107327212,
+        0.0016781424637883904
+      ],
+      [
+        -14.648265604780676,
+        -16.613596221872836,
+        0.0016781424637883904
+      ],
+      [
+        -14.858246043730775,
+        -16.34523965515757,
+        0.0016781424637883904
+      ]
+    ],
+    "source_commit": "ab3fc15",
+    "source_job_id": 22923017,
+    "source_loop_tick_id": 404,
+    "source_request_id": 41,
+    "source_simulation_time_s": 54.22463586577214,
+    "waypoint_times_s": [
+      54.324635865772144,
+      54.424635865772146,
+      54.52463586577214,
+      54.62463586577214,
+      54.72463586577214,
+      54.824635865772144,
+      54.924635865772146,
+      55.02463586577214,
+      55.12463586577214,
+      55.22463586577214,
+      55.324635865772144,
+      55.424635865772146,
+      55.52463586577214,
+      55.62463586577214,
+      55.72463586577214,
+      55.824635865772144,
+      55.924635865772146,
+      56.02463586577214,
+      56.12463586577214,
+      56.22463586577214,
+      56.324635865772144,
+      56.424635865772146,
+      56.52463586577214,
+      56.62463586577214,
+      56.72463586577214,
+      56.824635865772144,
+      56.924635865772146,
+      57.02463586577214,
+      57.12463586577214,
+      57.22463586577214,
+      57.324635865772144,
+      57.424635865772146,
+      57.52463586577214,
+      57.62463586577214,
+      57.72463586577214,
+      57.824635865772144,
+      57.924635865772146,
+      58.02463586577214,
+      58.12463586577214,
+      58.22463586577214,
+      58.324635865772144,
+      58.424635865772146,
+      58.52463586577214,
+      58.62463586577214,
+      58.72463586577214,
+      58.824635865772144,
+      58.924635865772146,
+      59.02463586577214,
+      59.12463586577214,
+      59.22463586577214,
+      59.324635865772144,
+      59.424635865772146,
+      59.52463586577214,
+      59.62463586577214,
+      59.72463586577214,
+      59.824635865772144,
+      59.924635865772146,
+      60.02463586577214,
+      60.12463586577214,
+      60.22463586577214,
+      60.324635865772144,
+      60.424635865772146,
+      60.52463586577214,
+      60.62463586577214
+    ]
+  },
+  "route_points": [
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.530553817749023,
+        -79.0943374633789,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.555222511291504,
+        -78.09464263916016,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.579890727996826,
+        -77.0949478149414,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.604558944702148,
+        -76.09525299072266,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.629227638244629,
+        -75.0955581665039,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.653895854949951,
+        -74.09586334228516,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.678564071655273,
+        -73.0961685180664,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.703232765197754,
+        -72.09647369384766,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.727901458740234,
+        -71.0967788696289,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.752569675445557,
+        -70.09708404541016,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.777237892150879,
+        -69.0973892211914,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.801906585693359,
+        -68.09768676757812,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.826574802398682,
+        -67.09799194335938,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.851243019104004,
+        -66.09829711914062,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.875911712646484,
+        -65.09860229492188,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.900580406188965,
+        -64.09890747070312,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.925248622894287,
+        -63.099212646484375,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.949916839599609,
+        -62.099517822265625,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.97458553314209,
+        -61.09981918334961,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -5.999253749847412,
+        -60.10012435913086,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.023921966552734,
+        -59.10042953491211,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.048590660095215,
+        -58.100730895996094,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.073259353637695,
+        -57.101036071777344,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.097927570343018,
+        -56.101341247558594,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.12259578704834,
+        -55.101646423339844,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.14726448059082,
+        -54.101951599121094,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.171932697296143,
+        -53.10225296020508,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.196600914001465,
+        -52.10255813598633,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.221269607543945,
+        -51.10286331176758,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.245938301086426,
+        -50.10316848754883,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.270606517791748,
+        -49.10346984863281,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.29527473449707,
+        -48.10377502441406,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": 3,
+      "road_id": 28,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.319943428039551,
+        -47.10408020019531,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -6.367552757263184,
+        -45.17466735839844,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.367552757263184,
+        -45.17466735839844,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.392221450805664,
+        -44.17497253417969,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.416894435882568,
+        -43.17527389526367,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.446172714233398,
+        -42.1937370300293,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.485550403594971,
+        -41.212547302246094,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.5350341796875,
+        -40.2318229675293,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.594610214233398,
+        -39.251651763916016,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.66427755355835,
+        -38.27214813232422,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.744029521942139,
+        -37.29341506958008,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.833849906921387,
+        -36.315555572509766,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -6.933732032775879,
+        -35.33867263793945,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -7.043668746948242,
+        -34.36286926269531,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": 3,
+      "road_id": 1691,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -7.163651943206787,
+        -33.388248443603516,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": -3,
+      "road_id": 25,
+      "road_option": "STRAIGHT",
+      "section_id": 0,
+      "xyz": [
+        -7.368023872375488,
+        -31.889888763427734,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": -3,
+      "road_id": 25,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -7.368023872375488,
+        -31.889888763427734,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": -3,
+      "road_id": 25,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -7.513449668884277,
+        -30.918739318847656,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -7.722339153289795,
+        -29.629528045654297,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -7.722339153289795,
+        -29.629528045654297,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -7.889664649963379,
+        -28.705991744995117,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -8.095587730407715,
+        -27.820697784423828,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -8.347230911254883,
+        -26.947298049926758,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -8.643917083740234,
+        -26.088153839111328,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -8.984840393066406,
+        -25.245586395263672,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -9.369083404541016,
+        -24.42186737060547,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -9.79560661315918,
+        -23.61922836303711,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -10.26325798034668,
+        -22.839834213256836,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -10.770772933959961,
+        -22.085792541503906,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -11.316781997680664,
+        -21.35913848876953,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -11.899808883666992,
+        -20.66183853149414,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -12.518280029296875,
+        -19.995769500732422,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -13.170523643493652,
+        -19.36273765563965,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -3,
+      "road_id": 1577,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -13.854777336120605,
+        -18.764450073242188,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -5,
+      "road_id": 1624,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -14.616302490234375,
+        -18.144807815551758,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -5,
+      "road_id": 1624,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -15.431906700134277,
+        -17.463764190673828,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -16.78911018371582,
+        -16.1798038482666,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -16.78911018371582,
+        -16.1798038482666,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -17.486392974853516,
+        -15.490154266357422,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -18.19122886657715,
+        -14.808226585388184,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -18.90353012084961,
+        -14.134101867675781,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -19.623214721679688,
+        -13.467864990234375,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -20.350191116333008,
+        -12.809588432312012,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -21.08437156677246,
+        -12.159355163574219,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -21.825668334960938,
+        -11.517248153686523,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -22.57398796081543,
+        -10.883349418640137,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -23.329248428344727,
+        -10.257719039916992,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -24.091344833374023,
+        -9.640453338623047,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -24.860197067260742,
+        -9.031612396240234,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -25.635705947875977,
+        -8.431272506713867,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -26.41777801513672,
+        -7.83950662612915,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -27.20631980895996,
+        -7.2563982009887695,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -27.992359161376953,
+        -6.688892841339111,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -28.758779525756836,
+        -6.173521995544434,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -29.54694175720215,
+        -5.6920695304870605,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -30.3553524017334,
+        -5.24544620513916,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -31.18247413635254,
+        -4.834506988525391,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -32.026729583740234,
+        -4.4600324630737305,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -32.886512756347656,
+        -4.1227335929870605,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -33.76019287109375,
+        -3.823251724243164,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -34.64609909057617,
+        -3.562160015106201,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -35.54254913330078,
+        -3.3399529457092285,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -36.447837829589844,
+        -3.1570539474487305,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -37.36024475097656,
+        -3.0138111114501953,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -38.27803039550781,
+        -2.9104981422424316,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -39.19944381713867,
+        -2.8473100662231445,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -40.122737884521484,
+        -2.824367046356201,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -41.108428955078125,
+        -2.8287296295166016,
+        0.0
+      ]
+    },
+    {
+      "is_junction": true,
+      "lane_id": -1,
+      "road_id": 1608,
+      "road_option": "RIGHT",
+      "section_id": 1,
+      "xyz": [
+        -42.10848617553711,
+        -2.833871841430664,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": -1,
+      "road_id": 61,
+      "road_option": "RIGHT",
+      "section_id": 0,
+      "xyz": [
+        -43.350975036621094,
+        -2.8402605056762695,
+        0.0
+      ]
+    },
+    {
+      "is_junction": false,
+      "lane_id": -1,
+      "road_id": 61,
+      "road_option": "LANEFOLLOW",
+      "section_id": 0,
+      "xyz": [
+        -43.350975036621094,
+        -2.8402605056762695,
+        0.0
+      ]
+    }
+  ],
+  "schema_version": "carlamayo.route-transition-replay.v3",
+  "selected_candidate_index": 1,
+  "selected_coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4",
+  "selected_trajectory_world": [
+    [
+      -6.209770284096702,
+      -46.03949246943451,
+      0.0017954063368961198
+    ],
+    [
+      -6.209753679112927,
+      -46.04006499189505,
+      0.0017954063368961198
+    ],
+    [
+      -6.209718345659,
+      -46.041283155002226,
+      0.0017954063368961198
+    ],
+    [
+      -6.209660918865406,
+      -46.04326270503384,
+      0.0017954063368961198
+    ],
+    [
+      -6.209573357791766,
+      -46.04628025347187,
+      0.0017954063368961198
+    ],
+    [
+      -6.209444054009693,
+      -46.05073468674796,
+      0.0017954063368961198
+    ],
+    [
+      -6.209263460164987,
+      -46.05695277245356,
+      0.0017954063368961198
+    ],
+    [
+      -6.20902810998523,
+      -46.065050592953085,
+      0.0017954063368961198
+    ],
+    [
+      -6.208740460133149,
+      -46.07493935446077,
+      0.0017954063368961198
+    ],
+    [
+      -6.208412673441532,
+      -46.086196269870484,
+      0.0017954063368961198
+    ],
+    [
+      -6.208072200703336,
+      -46.097875841679404,
+      0.0017954063368961198
+    ],
+    [
+      -6.207760141281168,
+      -46.10856960067708,
+      0.0017954063368961198
+    ],
+    [
+      -6.207529894218363,
+      -46.11645350598354,
+      0.0017954063368961198
+    ],
+    [
+      -6.2074411390026185,
+      -46.119491301575856,
+      0.0017954063368961198
+    ],
+    [
+      -6.207550538990404,
+      -46.115746777142185,
+      0.0017954063368961198
+    ],
+    [
+      -6.207910859312151,
+      -46.10340705771463,
+      0.0017954063368961198
+    ],
+    [
+      -6.208570055547378,
+      -46.0808086205133,
+      0.0017954063368961198
+    ],
+    [
+      -6.209558419298586,
+      -46.04687862919481,
+      0.0017954063368961198
+    ],
+    [
+      -6.210875372572728,
+      -46.001592853608095,
+      0.0017954063368961198
+    ],
+    [
+      -6.212482534455499,
+      -45.946229211750676,
+      0.0017954063368961198
+    ],
+    [
+      -6.214308093307867,
+      -45.88324886076921,
+      0.0017954063368961198
+    ],
+    [
+      -6.216270686235127,
+      -45.81546943043286,
+      0.0017954063368961198
+    ],
+    [
+      -6.218291931698953,
+      -45.74562031419999,
+      0.0017954063368961198
+    ],
+    [
+      -6.220302751474269,
+      -45.6761319087532,
+      0.0017954063368961198
+    ],
+    [
+      -6.222253192369776,
+      -45.6087707414322,
+      0.0017954063368961198
+    ],
+    [
+      -6.22411607388267,
+      -45.54450277056839,
+      0.0017954063368961198
+    ],
+    [
+      -6.225886837740275,
+      -45.483506842527596,
+      0.0017954063368961198
+    ],
+    [
+      -6.227580518103574,
+      -45.42527812101078,
+      0.0017954063368961198
+    ],
+    [
+      -6.229225822797131,
+      -45.3688437451214,
+      0.0017954063368961198
+    ],
+    [
+      -6.230854383820894,
+      -45.31313767790861,
+      0.0017954063368961198
+    ],
+    [
+      -6.232495699640189,
+      -45.257174141759755,
+      0.0017954063368961198
+    ],
+    [
+      -6.234179067052037,
+      -45.19999233806066,
+      0.0017954063368961198
+    ],
+    [
+      -6.235936439455179,
+      -45.14056607182609,
+      0.0017954063368961198
+    ],
+    [
+      -6.23780370525047,
+      -45.07775244759843,
+      0.0017954063368961198
+    ],
+    [
+      -6.239818056858068,
+      -45.010354404335736,
+      0.0017954063368961198
+    ],
+    [
+      -6.242015429797875,
+      -44.93726035354319,
+      0.0017954063368961198
+    ],
+    [
+      -6.244423436809414,
+      -44.85768040613546,
+      0.0017954063368961198
+    ],
+    [
+      -6.247061450851715,
+      -44.77109610700083,
+      0.0017954063368961198
+    ],
+    [
+      -6.249934789814188,
+      -44.677433311754896,
+      0.0017954063368961198
+    ],
+    [
+      -6.25302773048216,
+      -44.57725554215924,
+      0.0017954063368961198
+    ],
+    [
+      -6.256311577274748,
+      -44.47150554646342,
+      0.0017954063368961198
+    ],
+    [
+      -6.259750600664795,
+      -44.361310243971225,
+      0.0017954063368961198
+    ],
+    [
+      -6.263309488825645,
+      -44.24774301862375,
+      0.0017954063368961198
+    ],
+    [
+      -6.266960233513543,
+      -44.131584445801494,
+      0.0017954063368961198
+    ],
+    [
+      -6.27068509590629,
+      -44.01325797825663,
+      0.0017954063368961198
+    ],
+    [
+      -6.274474254048507,
+      -43.89290703872473,
+      0.0017954063368961198
+    ],
+    [
+      -6.278323013969936,
+      -43.77049320879821,
+      0.0017954063368961198
+    ],
+    [
+      -6.282229248309001,
+      -43.645906708117764,
+      0.0017954063368961198
+    ],
+    [
+      -6.28618679779496,
+      -43.51907938018471,
+      0.0017954063368961198
+    ],
+    [
+      -6.290182888336728,
+      -43.390084079802264,
+      0.0017954063368961198
+    ],
+    [
+      -6.294197874468967,
+      -43.25915493973535,
+      0.0017954063368961198
+    ],
+    [
+      -6.2982113748367645,
+      -43.1266162315236,
+      0.0017954063368961198
+    ],
+    [
+      -6.302207869383635,
+      -42.99277805656541,
+      0.0017954063368961198
+    ],
+    [
+      -6.306180269561402,
+      -42.8578229146997,
+      0.0017954063368961198
+    ],
+    [
+      -6.310139197563756,
+      -42.72166190795191,
+      0.0017954063368961198
+    ],
+    [
+      -6.314116159301598,
+      -42.5837898131097,
+      0.0017954063368961198
+    ],
+    [
+      -6.318164427476015,
+      -42.44319685536751,
+      0.0017954063368961198
+    ],
+    [
+      -6.322362520403317,
+      -42.29844131894408,
+      0.0017954063368961198
+    ],
+    [
+      -6.326813442690591,
+      -42.14792095948711,
+      0.0017954063368961198
+    ],
+    [
+      -6.3316361705766475,
+      -41.9901561174974,
+      0.0017954063368961198
+    ],
+    [
+      -6.336948654928796,
+      -41.82416847031506,
+      0.0017954063368961198
+    ],
+    [
+      -6.342873945441483,
+      -41.6494940897517,
+      0.0017954063368961198
+    ],
+    [
+      -6.349547126026311,
+      -41.46598901186816,
+      0.0017954063368961198
+    ],
+    [
+      -6.35710597704293,
+      -41.27384613951405,
+      0.0017954063368961198
+    ]
+  ],
+  "source_commit": "23dba07",
+  "source_configuration": {
+    "camera_alignment": "projection-only",
+    "diffusion_temperature": 1.0,
+    "navigation_source": "route",
+    "num_traj_samples": 3,
+    "road_assessment_backend": "serial"
+  },
+  "source_job_id": 22921097,
+  "source_jobs": [
+    22921097,
+    22922863,
+    22923017
+  ],
+  "source_loop_tick_id": 304,
+  "source_request_id": 31,
+  "source_simulation_time_s": 47.02987868129276,
+  "telemetry_route_index": 33,
+  "waypoint_times_s": [
+    47.12987868129276,
+    47.22987868129276,
+    47.329878681292755,
+    47.429878681292756,
+    47.52987868129276,
+    47.62987868129276,
+    47.72987868129276,
+    47.829878681292755,
+    47.929878681292756,
+    48.02987868129276,
+    48.12987868129276,
+    48.22987868129276,
+    48.329878681292755,
+    48.429878681292756,
+    48.52987868129276,
+    48.62987868129276,
+    48.72987868129276,
+    48.829878681292755,
+    48.929878681292756,
+    49.02987868129276,
+    49.12987868129276,
+    49.22987868129276,
+    49.329878681292755,
+    49.429878681292756,
+    49.52987868129276,
+    49.62987868129276,
+    49.72987868129276,
+    49.829878681292755,
+    49.929878681292756,
+    50.02987868129276,
+    50.12987868129276,
+    50.22987868129276,
+    50.329878681292755,
+    50.429878681292756,
+    50.52987868129276,
+    50.62987868129276,
+    50.72987868129276,
+    50.829878681292755,
+    50.929878681292756,
+    51.02987868129276,
+    51.12987868129276,
+    51.22987868129276,
+    51.329878681292755,
+    51.429878681292756,
+    51.52987868129276,
+    51.62987868129276,
+    51.72987868129276,
+    51.829878681292755,
+    51.929878681292756,
+    52.02987868129276,
+    52.12987868129276,
+    52.22987868129276,
+    52.329878681292755,
+    52.429878681292756,
+    52.52987868129276,
+    52.62987868129276,
+    52.72987868129276,
+    52.829878681292755,
+    52.929878681292756,
+    53.02987868129276,
+    53.12987868129276,
+    53.22987868129276,
+    53.329878681292755,
+    53.429878681292756
+  ]
+}

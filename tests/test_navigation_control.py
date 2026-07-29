@@ -60,3 +60,16 @@ def test_vqa_mode_stores_question_and_resets_answer():
     assert command.revision == 1
     assert state.vqa_question == "What is ahead?"
     assert state.vqa_answer == ""
+
+
+def test_route_navigation_text_is_read_only_but_pause_remains_available():
+    state = NavigationControlState(
+        mode="navigation",
+        navigation_source="route",
+    )
+    command = state.submit_command("Ignore route and turn left")
+
+    assert command.revision == 0
+    assert state.navigation_text == ""
+    assert "Route mode owns" in state.last_error
+    assert state.toggle_pause() is True

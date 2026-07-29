@@ -1,0 +1,35 @@
+{
+  "source_job_id": 22850702,
+  "scenario": {
+    "map": "Town03",
+    "ego_spawn_index": 0,
+    "scenario_seed": 2
+  },
+  "planning_lateral_clearance_m": 0.25,
+  "proposals": [
+    {
+      "proposal_number": 12,
+      "current_buffered_margin_m": -0.0005075758529748953,
+      "near_buffered_margin_m": -0.191189692767612,
+      "full_buffered_margin_m": -0.43626233100020606,
+      "full_surface_safe": false,
+      "expected_admission": "ACCEPT_RECOVERY_PREFIX"
+    },
+    {
+      "proposal_number": 14,
+      "current_buffered_margin_m": -0.025558254297736616,
+      "near_buffered_margin_m": -0.042367121033683786,
+      "full_buffered_margin_m": -0.22200465528122715,
+      "full_surface_safe": true,
+      "expected_admission": "ACCEPT_RECOVERY_PREFIX"
+    },
+    {
+      "proposal_number": 15,
+      "current_buffered_margin_m": -0.025558254297736616,
+      "near_buffered_margin_m": -0.024462431216055958,
+      "full_buffered_margin_m": -0.025068816949870287,
+      "full_surface_safe": true,
+      "expected_admission": "ACCEPT_RECOVERY_PREFIX"
+    }
+  ]
+}

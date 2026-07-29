@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "fixture_id": "job_22863138_proposal15_candidate2_boundary_recovery",
+  "source_job_id": "22863138",
+  "source_loop_tick_id": 144,
+  "source_plan_id": "proposal-15/candidate-2",
+  "source_carla_frame_id": 16280,
+  "source_simulation_time_s": 25.471768020186573,
+  "source_ego_speed_mps": 0.23393411854193166,
+  "source_containment": {
+    "current_physical_status": "SAFE",
+    "current_physical_margin_m": 0.11317400278765599,
+    "current_clearance_status": "UNSAFE",
+    "current_clearance_margin_m": -0.136825997212344,
+    "near_term_physical_status": "SAFE",
+    "near_term_physical_margin_m": 0.21808714139013508,
+    "near_term_buffered_status": "UNSAFE",
+    "near_term_buffered_margin_m": -0.031912858609864925,
+    "near_term_end_clearance_status": "SAFE",
+    "near_term_end_clearance_margin_m": 0.01637
+  },
+  "trajectory_facts": {
+    "terminal_stop_index": null,
+    "near_term_recovery_path_length_m": 0.19456298692320165,
+    "near_term_recovery_displacement_m": 0.19455,
+    "first_physical_bad_distance_m": 3.264673220391806,
+    "first_physical_bad_time_s": 5.6
+  },
+  "expected_policy": {
+    "recovery_mode": "BOUNDARY_CLEARANCE",
+    "admission_status": "ACCEPT_RECOVERY_PREFIX",
+    "maximum_authorized_waypoint_index": 16,
+    "maximum_speed_cap_mps": 0.75,
+    "emergency_required": false
+  },
+  "coc_sha256": "dbd83d03e80f249b49111e27798593c2ee56888eb0a40e4a2537e1424c058af4"
+}

@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 import re
 
 import torch
@@ -34,6 +35,32 @@ VQA_ANSWER_TERMINATORS = (
 )
 
 
+def require_cuda_runtime():
+    """Fail before model loading when PyTorch cannot use an NVIDIA GPU."""
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable to PyTorch, and Alpamayo cannot run on CPU. "
+            "Verify that this process is inside a GPU allocation, that `nvidia-smi` "
+            "can access the assigned GPU, and that another process (such as CARLA) "
+            "does not already own an Exclusive_Process GPU. "
+            f"CUDA_VISIBLE_DEVICES={visible_devices}."
+        )
+
+    try:
+        probe = torch.empty(1, device="cuda")
+        del probe
+    except Exception as exc:
+        raise RuntimeError(
+            "PyTorch detected CUDA but could not create a CUDA tensor. Check the "
+            "NVIDIA driver and whether another process owns an Exclusive_Process GPU. "
+            f"CUDA_VISIBLE_DEVICES={visible_devices}."
+        ) from exc
+
+    return torch.cuda.get_device_name(0)
+
+
 def configure_cuda_linalg_library(library: str | None):
     """Set PyTorch's preferred CUDA linalg backend when supported."""
 
@@ -59,6 +86,7 @@ def configure_cuda_linalg_library(library: str | None):
 
 def load_model(use_quantization: bool, device_map="auto"):
     """Load Alpamayo model and processor."""
+    require_cuda_runtime()
     if use_quantization:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -102,13 +130,84 @@ def _prime_oom_pipeline(model):
         pipeline.start_iteration()
 
 
-def prepare_model_input(images_array, history_xyz, history_rot):
-    """Convert CARLA data to model input format."""
+def _configured_camera_ids():
+    camera_ids = tuple(int(spec["alpamayo_id"]) for spec in cfg.CAMERA_SPECS)
+    camera_names = tuple(str(spec["name"]) for spec in cfg.CAMERA_SPECS)
+    expected_names = (
+        "cam_front_left",
+        "cam_front_wide",
+        "cam_front_right",
+        "cam_front_tele",
+    )
+    if camera_ids != (0, 1, 2, 6):
+        raise ValueError(
+            "CAMERA_SPECS must be ordered as Alpamayo cameras [0, 1, 2, 6]"
+        )
+    if camera_names != expected_names:
+        raise ValueError(
+            "CAMERA_SPECS must be ordered as front-left, front-wide, "
+            "front-right, front-tele"
+        )
+    return camera_ids
+
+
+def prepare_model_input(
+    images_array,
+    history_xyz,
+    history_rot,
+    *,
+    camera_indices=None,
+):
+    """Validate and convert synchronized CARLA data to Alpamayo tensors."""
+
+    images_array = np.asarray(images_array)
+    history_xyz = np.asarray(history_xyz)
+    history_rot = np.asarray(history_rot)
+    configured_camera_ids = _configured_camera_ids()
+    if camera_indices is None:
+        camera_ids = configured_camera_ids
+    else:
+        if isinstance(camera_indices, torch.Tensor):
+            camera_indices = camera_indices.detach().cpu().tolist()
+        camera_ids = tuple(int(camera_id) for camera_id in camera_indices)
+        if camera_ids != configured_camera_ids:
+            raise ValueError(
+                "camera_indices must match configured Alpamayo order "
+                f"{list(configured_camera_ids)}; got {list(camera_ids)}"
+            )
+
+    if images_array.ndim != 5 or images_array.shape[:2] != (
+        len(camera_ids),
+        cfg.NUM_FRAMES,
+    ):
+        raise ValueError(
+            "images_array must have shape "
+            f"({len(camera_ids)}, {cfg.NUM_FRAMES}, H, W, C); got {images_array.shape}"
+        )
+    if images_array.shape[-1] != cfg.IMG_CHANNELS:
+        raise ValueError(
+            f"images_array must have {cfg.IMG_CHANNELS} channels; got {images_array.shape[-1]}"
+        )
+    if images_array.dtype != np.uint8:
+        raise TypeError(f"images_array must use uint8 pixels; got {images_array.dtype}")
+    if history_xyz.shape != (cfg.NUM_HISTORY, 3):
+        raise ValueError(
+            f"history_xyz must have shape ({cfg.NUM_HISTORY}, 3); got {history_xyz.shape}"
+        )
+    if history_rot.shape != (cfg.NUM_HISTORY, 3, 3):
+        raise ValueError(
+            "history_rot must have shape "
+            f"({cfg.NUM_HISTORY}, 3, 3); got {history_rot.shape}"
+        )
+    if not np.isfinite(history_xyz).all() or not np.isfinite(history_rot).all():
+        raise ValueError("ego history must contain only finite values")
+
     images = torch.from_numpy(images_array).permute(0, 1, 4, 2, 3).contiguous()
     hist_xyz = torch.from_numpy(history_xyz).float().unsqueeze(0).unsqueeze(0)
     hist_rot = torch.from_numpy(history_rot).float().unsqueeze(0).unsqueeze(0)
     return {
         "image_frames": images,
+        "camera_indices": torch.tensor(camera_ids, dtype=torch.long),
         "ego_history_xyz": hist_xyz,
         "ego_history_rot": hist_rot,
     }
@@ -120,6 +219,8 @@ def run_inference(
     data,
     navigation_text: str | None = None,
     navigation_weight: float = 1.0,
+    num_traj_samples: int | None = None,
+    diffusion_temperature: float = 1.0,
     vlm_generate_timing: VlmGenerateTiming | None = None,
     disable_unused_generate_logits: bool = True,
     vlm_image_pixels: int | None = None,
@@ -133,10 +234,21 @@ def run_inference(
     nav_text = navigation_text.strip() if isinstance(navigation_text, str) else ""
     if not math.isfinite(float(navigation_weight)) or float(navigation_weight) < 0:
         raise ValueError("navigation_weight must be a non-negative finite number")
+    if num_traj_samples is None:
+        num_traj_samples = cfg.NUM_TRAJ_SAMPLES
+    if isinstance(num_traj_samples, bool) or int(num_traj_samples) != num_traj_samples:
+        raise ValueError("num_traj_samples must be a positive integer")
+    num_traj_samples = int(num_traj_samples)
+    if num_traj_samples <= 0:
+        raise ValueError("num_traj_samples must be a positive integer")
+    diffusion_temperature = float(diffusion_temperature)
+    if not math.isfinite(diffusion_temperature) or diffusion_temperature <= 0.0:
+        raise ValueError("diffusion_temperature must be finite and greater than zero")
 
     messages = helper.create_message(
         data["image_frames"].flatten(0, 1),
         camera_indices=data.get("camera_indices"),
+        num_frames_per_camera=int(data["image_frames"].shape[1]),
         nav_text=nav_text or None,
     )
 
@@ -164,7 +276,10 @@ def run_inference(
     }
     model_inputs = helper.to_device(model_inputs, "cuda")
 
-    diffusion_kwargs = {"inference_step": 10}
+    diffusion_kwargs = {
+        "inference_step": 10,
+        "temperature": diffusion_temperature,
+    }
     inference_fn = model.sample_trajectories_from_data_with_vlm_rollout
     use_cfg_nav = False
     if nav_text and not math.isclose(float(navigation_weight), 1.0):
@@ -191,7 +306,7 @@ def run_inference(
             data=model_inputs,
             top_p=0.98,
             temperature=0.6,
-            num_traj_samples=cfg.NUM_TRAJ_SAMPLES,
+            num_traj_samples=num_traj_samples,
             diffusion_kwargs=diffusion_kwargs,
             max_generation_length=256,
             return_extra=True,
@@ -200,7 +315,13 @@ def run_inference(
     return pred_xyz, extra
 
 
-def _extract_text_field(extra, key):
+def _extract_text_field(
+    extra,
+    key,
+    *,
+    candidate_index=0,
+    preserve_whitespace=False,
+):
     if not isinstance(extra, dict):
         return ""
     if key not in extra:
@@ -210,25 +331,45 @@ def _extract_text_field(extra, key):
     if value is None:
         return ""
 
+    selected_candidate = False
     while True:
         if isinstance(value, str):
-            return str(value).strip()
+            text = str(value)
+            return text if preserve_whitespace else text.strip()
         if isinstance(value, (list, tuple)):
             if len(value) == 0:
                 return ""
-            value = value[0]
+            if len(value) == 1:
+                value = value[0]
+            else:
+                selection = int(candidate_index) if not selected_candidate else 0
+                value = value[min(max(0, selection), len(value) - 1)]
+                selected_candidate = True
             continue
         if isinstance(value, np.ndarray):
             if value.size == 0:
                 return ""
-            value = value.flat[0]
+            while (
+                isinstance(value, np.ndarray)
+                and value.ndim > 0
+                and value.shape[0] == 1
+            ):
+                value = value[0]
+            if isinstance(value, np.ndarray):
+                selection = int(candidate_index) if not selected_candidate else 0
+                value = value.flat[min(max(0, selection), value.size - 1)]
+                selected_candidate = True
             continue
         if hasattr(value, "numel") and hasattr(value, "reshape"):
             if int(value.numel()) == 0:
                 return ""
-            value = value.reshape(-1)[0].item()
+            flat = value.reshape(-1)
+            selection = int(candidate_index) if not selected_candidate else 0
+            value = flat[min(max(0, selection), int(value.numel()) - 1)].item()
+            selected_candidate = True
             continue
-        return str(value).strip()
+        text = str(value)
+        return text if preserve_whitespace else text.strip()
 
 
 def _clean_generated_answer_text(text):
@@ -306,8 +447,29 @@ def _generate_vqa_text_with_partial_answer_fallback(
     }
 
 
-def extract_cot_text(extra):
-    return _extract_text_field(extra, "cot")
+def extract_cot_text(extra, candidate_index=0):
+    """Return the complete extracted CoT field for one trajectory candidate."""
+
+    return _extract_text_field(
+        extra,
+        "cot",
+        candidate_index=candidate_index,
+        preserve_whitespace=True,
+    )
+
+
+def extract_cot_texts(extra, candidate_count):
+    """Return the CoT associated with every generated trajectory candidate."""
+
+    if isinstance(candidate_count, bool) or int(candidate_count) != candidate_count:
+        raise ValueError("candidate_count must be a non-negative integer")
+    candidate_count = int(candidate_count)
+    if candidate_count < 0:
+        raise ValueError("candidate_count must be a non-negative integer")
+    return [
+        extract_cot_text(extra, candidate_index=candidate_index)
+        for candidate_index in range(candidate_count)
+    ]
 
 
 def extract_answer_text(extra):
@@ -339,6 +501,7 @@ def run_vqa(
         data["image_frames"].flatten(0, 1),
         question=question,
         camera_indices=data.get("camera_indices"),
+        num_frames_per_camera=int(data["image_frames"].shape[1]),
     )
     inputs = processor.apply_chat_template(
         messages,
