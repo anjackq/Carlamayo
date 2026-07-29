@@ -179,6 +179,72 @@ class OfficialPIDFollower:
         return float(min(intended_peak, float(cfg.PID_LAUNCH_SPEED_MPS)))
 
     @staticmethod
+    def _apply_low_speed_longitudinal_governor(
+        *,
+        enabled,
+        current_speed_mps,
+        target_speed_mps,
+        throttle,
+        brake,
+        road_speed_limited,
+        terminal_stop_index,
+    ):
+        """Bound non-safety low-speed tracking without weakening stop commands."""
+
+        raw_throttle = float(throttle)
+        raw_brake = float(brake)
+        inactive = {
+            "active": False,
+            "mode": "INACTIVE",
+            "raw_throttle": raw_throttle,
+            "raw_brake": raw_brake,
+        }
+        if (
+            not enabled
+            or road_speed_limited
+            or terminal_stop_index is not None
+            or target_speed_mps
+            < float(cfg.PID_LOW_SPEED_GOVERNOR_MIN_TARGET_MPS)
+            or target_speed_mps
+            > float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_TARGET_MPS)
+        ):
+            return raw_throttle, raw_brake, inactive
+
+        overspeed_mps = max(0.0, float(current_speed_mps) - float(target_speed_mps))
+        throttle_out = min(
+            max(0.0, raw_throttle),
+            float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_THROTTLE),
+        )
+        brake_out = max(0.0, raw_brake)
+        mode = "THROTTLE_LIMITED" if throttle_out < raw_throttle else "TRACKING"
+
+        if raw_brake > 0.0:
+            throttle_out = 0.0
+            if overspeed_mps <= float(
+                cfg.PID_LOW_SPEED_GOVERNOR_COAST_OVERSPEED_MPS
+            ):
+                brake_out = 0.0
+                mode = "COAST"
+            elif overspeed_mps <= float(
+                cfg.PID_LOW_SPEED_GOVERNOR_SOFT_BRAKE_OVERSPEED_MPS
+            ):
+                brake_out = min(
+                    raw_brake,
+                    float(cfg.PID_LOW_SPEED_GOVERNOR_MAX_BRAKE),
+                )
+                mode = "SOFT_BRAKE"
+            else:
+                mode = "PASSTHROUGH_LARGE_OVERSPEED"
+
+        return throttle_out, brake_out, {
+            "active": True,
+            "mode": mode,
+            "raw_throttle": raw_throttle,
+            "raw_brake": raw_brake,
+            "overspeed_mps": overspeed_mps,
+        }
+
+    @staticmethod
     def _full_brake(mode, *, controller_state="FALLBACK", **debug):
         return 0.0, 0.0, 1.0, {
             "mode": mode,
@@ -378,6 +444,7 @@ class OfficialPIDFollower:
         capture_origin_world=None,
         target_speed_cap_mps=None,
         maximum_authorized_waypoint_index=None,
+        enable_low_speed_longitudinal_governor=False,
     ):
         """Track a timestamped fixed-world path without re-anchoring it to ego.
 
@@ -611,6 +678,17 @@ class OfficialPIDFollower:
         brake = float(control.brake)
         if target_speed_mps <= float(cfg.PID_STOP_SPEED_THRESHOLD_MPS):
             throttle = 0.0
+        throttle, brake, low_speed_governor = (
+            self._apply_low_speed_longitudinal_governor(
+                enabled=bool(enable_low_speed_longitudinal_governor),
+                current_speed_mps=current_speed,
+                target_speed_mps=target_speed_mps,
+                throttle=throttle,
+                brake=brake,
+                road_speed_limited=road_speed_limited,
+                terminal_stop_index=terminal_stop_index,
+            )
+        )
         return float(control.steer), throttle, brake, {
             "mode": "fixed_world_pid",
             "controller_state": controller_state,
@@ -643,5 +721,12 @@ class OfficialPIDFollower:
             "road_speed_cap_mps": target_speed_cap_mps,
             "road_speed_limited": road_speed_limited,
             "maximum_authorized_waypoint_index": maximum_authorized_waypoint_index,
+            "low_speed_longitudinal_governor_enabled": bool(
+                enable_low_speed_longitudinal_governor
+            ),
+            "low_speed_longitudinal_governor": low_speed_governor,
+            "direct_longitudinal_control": bool(
+                low_speed_governor["active"]
+            ),
             "bypass_smoothing": False,
         }

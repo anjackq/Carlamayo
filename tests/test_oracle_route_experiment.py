@@ -28,6 +28,7 @@ def test_oracle_cli_requires_external_telemetry_and_valid_route_api(tmp_path):
 
     assert args.target_speed_mps == pytest.approx(2.0)
     assert args.capture_inference_fixture is None
+    assert args.low_speed_longitudinal_governor is False
 
 
 def test_oracle_cli_capture_options_are_paired(tmp_path):

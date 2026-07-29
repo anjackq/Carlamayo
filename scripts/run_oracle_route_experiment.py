@@ -82,6 +82,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--comfortable-deceleration-mps2", type=float, default=2.5)
     parser.add_argument("--max-episode-seconds", type=float, default=20.0)
     parser.add_argument("--plan-refresh-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--low-speed-longitudinal-governor",
+        action="store_true",
+        help="Enable the opt-in 0.5-2.0 m/s longitudinal tracking governor.",
+    )
     parser.add_argument("--scenario-seed", type=int, default=0)
     parser.add_argument("--stop-at-destination", action="store_true")
     parser.add_argument(
@@ -310,6 +315,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             maximum_acceleration_mps2=args.maximum_acceleration_mps2,
             comfortable_deceleration_mps2=args.comfortable_deceleration_mps2,
             stop_at_destination=args.stop_at_destination,
+            low_speed_longitudinal_governor=bool(
+                args.low_speed_longitudinal_governor
+            ),
             scenario_seed=args.scenario_seed,
             route_startup_facts=route_facts,
             camera_alignment=carla_if.get_camera_alignment_metadata(),
@@ -489,6 +497,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     capture_origin_world=plan.capture_pose_world[:3, 3],
                     target_speed_cap_mps=speed_cap,
                     maximum_authorized_waypoint_index=authorized_index,
+                    enable_low_speed_longitudinal_governor=bool(
+                        args.low_speed_longitudinal_governor
+                    ),
                 )
             nominal_dict, _ = smooth_controller_control(
                 steering_raw=steering_raw,
@@ -500,6 +511,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 constrained_deceleration=(
                     controller_debug.get("controller_state")
                     in {"ROAD_CONSTRAINED_DECELERATING", "ROUTE_POLICY_CONSTRAINT"}
+                ),
+                direct_longitudinal=bool(
+                    controller_debug.get("direct_longitudinal_control", False)
                 ),
             )
             nominal = ControlCommand(**nominal_dict)

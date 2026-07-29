@@ -189,6 +189,86 @@ def test_road_speed_cap_overrides_launch_floor(follower):
     assert brake == pytest.approx(0.0)
 
 
+def test_low_speed_governor_limits_throttle_and_uses_direct_longitudinal(follower):
+    points = _straight_path(0.1)
+    follower.pid.run_step = lambda *_args: types.SimpleNamespace(
+        steer=0.1,
+        throttle=0.6,
+        brake=0.0,
+    )
+
+    _, throttle, brake, debug = follower.compute_world_control(
+        plan_id="low-speed-throttle",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=0.0,
+        enable_low_speed_longitudinal_governor=True,
+    )
+
+    assert debug["target_speed_mps"] == pytest.approx(1.0)
+    assert throttle == pytest.approx(cfg.PID_LOW_SPEED_GOVERNOR_MAX_THROTTLE)
+    assert brake == pytest.approx(0.0)
+    assert debug["low_speed_longitudinal_governor"]["active"] is True
+    assert debug["low_speed_longitudinal_governor"]["mode"] == "THROTTLE_LIMITED"
+    assert debug["direct_longitudinal_control"] is True
+
+
+def test_low_speed_governor_coasts_instead_of_wheel_locking_brake(follower):
+    points = _straight_path(0.1)
+    follower.pid.run_step = lambda *_args: types.SimpleNamespace(
+        steer=0.1,
+        throttle=0.0,
+        brake=0.8,
+    )
+
+    _, throttle, brake, debug = follower.compute_world_control(
+        plan_id="low-speed-coast",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=1.4,
+        enable_low_speed_longitudinal_governor=True,
+    )
+
+    assert (throttle, brake) == pytest.approx((0.0, 0.0))
+    assert debug["low_speed_longitudinal_governor"]["mode"] == "COAST"
+
+
+def test_low_speed_governor_never_weakens_terminal_or_road_braking(follower):
+    points = _straight_path(0.1)
+    points[40:] = points[39]
+
+    _, _, _, terminal_debug = follower.compute_world_control(
+        plan_id="low-speed-terminal",
+        wp_world=points,
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=1.0,
+        terminal_stop_index=40,
+        enable_low_speed_longitudinal_governor=True,
+    )
+    assert terminal_debug["low_speed_longitudinal_governor"]["active"] is False
+
+    follower.pid.run_step = lambda *_args: types.SimpleNamespace(
+        steer=0.1,
+        throttle=0.0,
+        brake=0.8,
+    )
+    _, _, road_brake, road_debug = follower.compute_world_control(
+        plan_id="low-speed-road-cap",
+        wp_world=_straight_path(0.2),
+        waypoint_times_s=_times(),
+        current_simulation_time_s=0.0,
+        speed_mps=1.5,
+        target_speed_cap_mps=1.0,
+        maximum_authorized_waypoint_index=30,
+        enable_low_speed_longitudinal_governor=True,
+    )
+    assert road_brake == pytest.approx(0.8)
+    assert road_debug["low_speed_longitudinal_governor"]["active"] is False
+
+
 def test_controller_target_never_exceeds_last_safe_waypoint(follower):
     points = _straight_path(0.5)
 

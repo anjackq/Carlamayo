@@ -82,3 +82,30 @@ def test_road_constrained_brake_cuts_throttle_without_longitudinal_ema():
         "steering_ema_smoothing",
         "road_deceleration_bypass_longitudinal_ema",
     )
+
+
+def test_low_speed_governor_bypasses_only_longitudinal_ema():
+    nominal, postprocessing = smooth_controller_control(
+        steering_raw=0.4,
+        throttle_raw=0.25,
+        brake_raw=0.0,
+        previous_nominal={
+            "steering": -0.2,
+            "throttle": 0.0,
+            "brake": 1.0,
+        },
+        alpha=0.25,
+        direct_longitudinal=True,
+    )
+
+    assert nominal == pytest.approx(
+        {
+            "steering": -0.05,
+            "throttle": 0.25,
+            "brake": 0.0,
+        }
+    )
+    assert postprocessing == (
+        "steering_ema_smoothing",
+        "low_speed_direct_longitudinal_control",
+    )

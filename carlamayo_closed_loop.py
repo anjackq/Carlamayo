@@ -284,6 +284,7 @@ def smooth_controller_control(
     alpha,
     bypass_smoothing=False,
     constrained_deceleration=False,
+    direct_longitudinal=False,
 ):
     """Smooth controller intent without feeding safety overrides back into it."""
 
@@ -312,6 +313,24 @@ def smooth_controller_control(
             (
                 "steering_ema_smoothing",
                 "road_deceleration_bypass_longitudinal_ema",
+            ),
+        )
+    if direct_longitudinal:
+        throttle = float(np.clip(throttle_raw, 0.0, 1.0))
+        brake = float(np.clip(brake_raw, 0.0, 1.0))
+        if throttle >= brake:
+            brake = 0.0
+        else:
+            throttle = 0.0
+        return (
+            {
+                "steering": float(np.clip(steering, -1.0, 1.0)),
+                "throttle": throttle,
+                "brake": brake,
+            },
+            (
+                "steering_ema_smoothing",
+                "low_speed_direct_longitudinal_control",
             ),
         )
     throttle = (1.0 - alpha) * previous_nominal["throttle"] + alpha * throttle_raw
@@ -550,6 +569,14 @@ def parse_args(argv=None):
             "Opt-in research mode: allow excessive lateral displacement only "
             "after the 1.5 s execution horizon, while retaining exact road and "
             "route authorization. Strict lateral validation remains the default."
+        ),
+    )
+    parser.add_argument(
+        "--low-speed-longitudinal-governor",
+        action="store_true",
+        help=(
+            "Opt-in research governor for non-safety trajectory tracking at "
+            "0.5-2.0 m/s. Explicit stops and road/route constraints bypass it."
         ),
     )
     parser.add_argument(
@@ -4185,6 +4212,9 @@ def main():
             route_lateral_safe_prefix=bool(
                 getattr(args, "route_lateral_safe_prefix", False)
             ),
+            low_speed_longitudinal_governor=bool(
+                getattr(args, "low_speed_longitudinal_governor", False)
+            ),
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
             navigation_context=(
@@ -5483,6 +5513,13 @@ def main():
                             maximum_authorized_waypoint_index=(
                                 controller_authorized_waypoint_index
                             ),
+                            enable_low_speed_longitudinal_governor=bool(
+                                getattr(
+                                    args,
+                                    "low_speed_longitudinal_governor",
+                                    False,
+                                )
+                            ),
                         )
                         )
                         route_cap_is_binding = (
@@ -5531,6 +5568,9 @@ def main():
                                 "ROAD_CONSTRAINED_DECELERATING",
                                 "ROUTE_POLICY_CONSTRAINT",
                             }
+                        ),
+                        direct_longitudinal=bool(
+                            ctrl_debug.get("direct_longitudinal_control", False)
                         ),
                     )
                 except Exception as exc:

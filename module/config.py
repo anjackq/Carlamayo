@@ -246,6 +246,16 @@ PID_LAUNCH_ENGAGE_SPEED_MPS = 2.0  # below this actual speed the launch floor ma
 PID_LAUNCH_SPEED_MPS = 2.5  # upper bound on the launch-floor target speed
 PID_LAUNCH_MIN_INTENT_MPS = 0.5  # plan must intend at least this near-horizon speed
 PID_LAUNCH_HORIZON_S = 1.5  # near-horizon window used to judge plan launch intent
+# Opt-in low-speed longitudinal governor. CARLA's official longitudinal PID
+# operates on km/h error; below roughly 2 m/s it otherwise alternates maximum
+# throttle and wheel-locking brake commands. The governor limits propulsion,
+# coasts through small overspeed, and bounds moderate corrective braking.
+PID_LOW_SPEED_GOVERNOR_MIN_TARGET_MPS = 0.5
+PID_LOW_SPEED_GOVERNOR_MAX_TARGET_MPS = 2.0
+PID_LOW_SPEED_GOVERNOR_MAX_THROTTLE = 0.25
+PID_LOW_SPEED_GOVERNOR_COAST_OVERSPEED_MPS = 0.5
+PID_LOW_SPEED_GOVERNOR_SOFT_BRAKE_OVERSPEED_MPS = 1.0
+PID_LOW_SPEED_GOVERNOR_MAX_BRAKE = 0.08
 PID_LAT_KP = 1.1
 PID_LAT_KI = 0.02
 PID_LAT_KD = 0.15
