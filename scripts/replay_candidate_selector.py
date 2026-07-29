@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare current and route-first selection on frozen candidate audits."""
+"""Compare current, route-first, and reachability-first frozen selection."""
 
 from __future__ import annotations
 
@@ -36,6 +36,19 @@ _ROUTE_RANK = {
     "UNKNOWN": 2,
     None: 3,
 }
+_PHYSICAL_RANK = {
+    "REACHABLE": 0,
+    "TOO_LONG": 1,
+    "TOO_SHORT_TO_STOP": 1,
+    None: 2,
+}
+_PRIOR_RANK = {
+    "CONSISTENT": 0,
+    "STOP_PRIOR": 1,
+    "ACCELERATION_PRIOR": 1,
+    "DECELERATION_PRIOR": 1,
+    None: 2,
+}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -60,6 +73,38 @@ def _route_fields(candidate: dict[str, Any]) -> tuple[str | None, bool | None, f
         None if status is None else str(status),
         None if branch is None else bool(branch),
         None if cross_track is None else float(cross_track),
+    )
+
+
+def _near_route_status(candidate: dict[str, Any]) -> str | None:
+    route = candidate.get("route_assessment")
+    if not isinstance(route, dict):
+        return None
+    status = route.get("near_term_route_status")
+    return None if status is None else str(status)
+
+
+def _reachability_fields(
+    candidate: dict[str, Any],
+) -> tuple[str | None, str | None, str | None, float | None]:
+    profile = candidate.get("reachability_profile")
+    if not isinstance(profile, dict):
+        return None, None, None, None
+    near_physical = profile.get("near_physical_status")
+    full_physical = profile.get("physical_status")
+    prior = profile.get("near_source_speed_prior_status")
+    required_acceleration = profile.get(
+        "near_required_constant_acceleration_mps2"
+    )
+    return (
+        None if near_physical is None else str(near_physical),
+        None if full_physical is None else str(full_physical),
+        None if prior is None else str(prior),
+        (
+            None
+            if required_acceleration is None
+            else float(required_acceleration)
+        ),
     )
 
 
@@ -130,6 +175,61 @@ def route_first_key(candidate: dict[str, Any]) -> tuple[float, ...]:
     )
 
 
+def reachability_first_key(candidate: dict[str, Any]) -> tuple[float, ...]:
+    """Rank empty-road route/reachability facts without promoting a stop."""
+
+    full_route_status, branch_match, cross_track = _route_fields(candidate)
+    near_route_status = _near_route_status(candidate)
+    motion_class, _ = _motion_fields(candidate)
+    near_physical, full_physical, prior, required_acceleration = (
+        _reachability_fields(candidate)
+    )
+    valid_rank = 0 if candidate.get("valid") else 1
+    explicit_stop_rank = 1 if motion_class == "EXPLICIT_STOP" else 0
+    branch_rank = (
+        0 if branch_match is True else 1 if branch_match is False else 2
+    )
+    return (
+        float(valid_rank),
+        float(_ROUTE_RANK[near_route_status]),
+        float(explicit_stop_rank),
+        float(_PHYSICAL_RANK[near_physical]),
+        float(_ROUTE_RANK[full_route_status]),
+        float(branch_rank),
+        float(_PHYSICAL_RANK[full_physical]),
+        float(_MOTION_RANK[motion_class]),
+        float(_PRIOR_RANK[prior]),
+        float(
+            math.inf
+            if required_acceleration is None
+            else abs(required_acceleration)
+        ),
+        float(math.inf if cross_track is None else cross_track),
+        -float(candidate.get("forward_progress_m") or 0.0),
+        float(candidate["candidate_index"]),
+    )
+
+
+def _selection_facts(candidate: dict[str, Any]) -> dict[str, Any]:
+    full_route_status, branch_match, _ = _route_fields(candidate)
+    near_physical, full_physical, prior, required_acceleration = (
+        _reachability_fields(candidate)
+    )
+    motion_class, _ = _motion_fields(candidate)
+    return {
+        "candidate_index": int(candidate["candidate_index"]),
+        "valid": bool(candidate.get("valid")),
+        "motion_class": motion_class,
+        "near_route_status": _near_route_status(candidate),
+        "full_route_status": full_route_status,
+        "branch_match": branch_match,
+        "near_physical_status": near_physical,
+        "full_physical_status": full_physical,
+        "near_source_speed_prior_status": prior,
+        "near_required_constant_acceleration_mps2": required_acceleration,
+    }
+
+
 def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
     candidates = list(event.get("candidate_audits") or ())
     if not candidates:
@@ -150,6 +250,20 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         route_first_key(candidate)[:-1] == best_without_index
         for candidate in route_ranked
     )
+    reachability_ranked = sorted(candidates, key=reachability_first_key)
+    reachability_first = int(reachability_ranked[0]["candidate_index"])
+    reachability_best_without_index = reachability_first_key(
+        reachability_ranked[0]
+    )[:-1]
+    reachability_ties = sum(
+        reachability_first_key(candidate)[:-1]
+        == reachability_best_without_index
+        for candidate in reachability_ranked
+    )
+    reachability_evaluable = any(
+        _reachability_fields(candidate)[0] is not None
+        for candidate in candidates
+    )
     match_candidates = [
         int(candidate["candidate_index"])
         for candidate in candidates
@@ -157,6 +271,25 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         and _route_fields(candidate)[1] is True
         and candidate.get("valid")
     ]
+    reachable_route_prefix_candidates = [
+        int(candidate["candidate_index"])
+        for candidate in candidates
+        if candidate.get("valid")
+        and _near_route_status(candidate) == "MATCH"
+        and _reachability_fields(candidate)[0] == "REACHABLE"
+    ]
+    full_branch_reachable_candidates = [
+        int(candidate["candidate_index"])
+        for candidate in candidates
+        if candidate.get("valid")
+        and _route_fields(candidate)[0] == "MATCH"
+        and _route_fields(candidate)[1] is True
+        and _reachability_fields(candidate)[0] == "REACHABLE"
+        and _reachability_fields(candidate)[1] == "REACHABLE"
+    ]
+    candidates_by_index = {
+        int(candidate["candidate_index"]): candidate for candidate in candidates
+    }
     return {
         "event_type": "selector_replay",
         "schema_version": 1,
@@ -165,15 +298,48 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         "seed": int(event["seed"]),
         "current_selected_index": int(current.selected_index),
         "route_first_selected_index": route_first,
+        "reachability_first_selected_index": reachability_first,
         "model_first_selected_index": min(
             int(candidate["candidate_index"]) for candidate in candidates
         ),
         "route_evaluable": route_evaluable,
         "route_first_unambiguous": ties == 1,
+        "reachability_evaluable": reachability_evaluable,
+        "reachability_first_unambiguous": reachability_ties == 1,
         "current_matches_route_first": int(current.selected_index) == route_first,
+        "current_matches_reachability_first": (
+            int(current.selected_index) == reachability_first
+        ),
         "route_match_candidate_indices": match_candidates,
+        "reachable_route_prefix_candidate_indices": (
+            reachable_route_prefix_candidates
+        ),
+        "full_branch_reachable_candidate_indices": (
+            full_branch_reachable_candidates
+        ),
         "current_selected_wrong_when_match_available": bool(
             match_candidates and int(current.selected_index) not in match_candidates
+        ),
+        "reachability_selected_wrong_when_match_available": bool(
+            match_candidates and reachability_first not in match_candidates
+        ),
+        "current_selected_wrong_when_reachable_route_prefix_available": bool(
+            reachable_route_prefix_candidates
+            and int(current.selected_index)
+            not in reachable_route_prefix_candidates
+        ),
+        "reachability_selected_wrong_when_reachable_route_prefix_available": bool(
+            reachable_route_prefix_candidates
+            and reachability_first not in reachable_route_prefix_candidates
+        ),
+        "current_selected_facts": _selection_facts(
+            candidates_by_index[int(current.selected_index)]
+        ),
+        "route_first_selected_facts": _selection_facts(
+            candidates_by_index[route_first]
+        ),
+        "reachability_first_selected_facts": _selection_facts(
+            candidates_by_index[reachability_first]
         ),
         "current_selection": _json_safe(current.to_json_dict()),
         "route_first_ranking": [
@@ -185,6 +351,16 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
             for candidate in route_ranked
+        ],
+        "reachability_first_ranking": [
+            {
+                "candidate_index": int(candidate["candidate_index"]),
+                "ranking_key": [
+                    None if not math.isfinite(value) else value
+                    for value in reachability_first_key(candidate)
+                ],
+            }
+            for candidate in reachability_ranked
         ],
     }
 
@@ -199,10 +375,118 @@ def summarize(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     wrong = sum(
         record["current_selected_wrong_when_match_available"] for record in records
     )
+    reachability_wrong = sum(
+        record["reachability_selected_wrong_when_match_available"]
+        for record in records
+    )
+    reachability_evaluable = [
+        record for record in records if record["reachability_evaluable"]
+    ]
+    reachability_unambiguous = [
+        record
+        for record in reachability_evaluable
+        if record["reachability_first_unambiguous"]
+    ]
+    reachable_prefix_available = [
+        record
+        for record in records
+        if record["reachable_route_prefix_candidate_indices"]
+    ]
+    route_match_available = [
+        record for record in records if record["route_match_candidate_indices"]
+    ]
+    full_branch_reachable_available = [
+        record
+        for record in records
+        if record["full_branch_reachable_candidate_indices"]
+    ]
+    current_reachable_wrong = sum(
+        record[
+            "current_selected_wrong_when_reachable_route_prefix_available"
+        ]
+        for record in records
+    )
+    reachability_reachable_wrong = sum(
+        record[
+            "reachability_selected_wrong_when_reachable_route_prefix_available"
+        ]
+        for record in records
+    )
+    selector_fact_counts: dict[str, Counter[str]] = {}
+    selector_motion_counts: dict[str, Counter[str]] = {}
+    selector_prior_counts: dict[str, Counter[str]] = {}
+    for selector in ("current", "route_first", "reachability_first"):
+        facts_key = f"{selector}_selected_facts"
+        selector_fact_counts[selector] = Counter(
+            str(record[facts_key].get("near_physical_status"))
+            for record in records
+        )
+        selector_motion_counts[selector] = Counter(
+            str(record[facts_key].get("motion_class")) for record in records
+        )
+        selector_prior_counts[selector] = Counter(
+            str(record[facts_key].get("near_source_speed_prior_status"))
+            for record in records
+        )
     fixture_counts = Counter(str(record.get("fixture_label")) for record in records)
+    fixture_summaries: dict[str, dict[str, Any]] = {}
+    for fixture in sorted(fixture_counts):
+        subset = [
+            record
+            for record in records
+            if str(record.get("fixture_label")) == fixture
+        ]
+        fixture_summaries[fixture] = {
+            "batches": len(subset),
+            "selection_changes": sum(
+                not record["current_matches_reachability_first"]
+                for record in subset
+            ),
+            "reachable_route_prefix_available": sum(
+                bool(record["reachable_route_prefix_candidate_indices"])
+                for record in subset
+            ),
+            "current_wrong_when_reachable_route_prefix_available": sum(
+                record[
+                    "current_selected_wrong_when_reachable_route_prefix_available"
+                ]
+                for record in subset
+            ),
+            "reachability_wrong_when_reachable_route_prefix_available": sum(
+                record[
+                    "reachability_selected_wrong_when_reachable_route_prefix_available"
+                ]
+                for record in subset
+            ),
+            "current_selected_near_physical_status_counts": dict(
+                sorted(
+                    Counter(
+                        str(
+                            record["current_selected_facts"].get(
+                                "near_physical_status"
+                            )
+                        )
+                        for record in subset
+                    ).items()
+                )
+            ),
+            "reachability_selected_near_physical_status_counts": dict(
+                sorted(
+                    Counter(
+                        str(
+                            record["reachability_first_selected_facts"].get(
+                                "near_physical_status"
+                            )
+                        )
+                        for record in subset
+                    ).items()
+                )
+            ),
+        }
     return {
         "batches": len(records),
         "fixture_batch_counts": dict(sorted(fixture_counts.items())),
+        "fixture_summaries": fixture_summaries,
         "route_evaluable_batches": len(route_evaluable),
         "route_first_unambiguous_batches": len(unambiguous),
         "current_route_first_accuracy": (
@@ -211,7 +495,60 @@ def summarize(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             if unambiguous
             else None
         ),
+        "full_route_match_available_batches": len(route_match_available),
         "current_wrong_when_route_match_available": wrong,
+        "reachability_wrong_when_route_match_available": reachability_wrong,
+        "reachability_evaluable_batches": len(reachability_evaluable),
+        "reachability_first_unambiguous_batches": len(
+            reachability_unambiguous
+        ),
+        "current_reachability_first_accuracy": (
+            sum(
+                record["current_matches_reachability_first"]
+                for record in reachability_unambiguous
+            )
+            / len(reachability_unambiguous)
+            if reachability_unambiguous
+            else None
+        ),
+        "reachability_selection_change_count": sum(
+            not record["current_matches_reachability_first"]
+            for record in reachability_evaluable
+        ),
+        "reachable_route_prefix_available_batches": len(
+            reachable_prefix_available
+        ),
+        "current_wrong_when_reachable_route_prefix_available": (
+            current_reachable_wrong
+        ),
+        "reachability_wrong_when_reachable_route_prefix_available": (
+            reachability_reachable_wrong
+        ),
+        "full_branch_reachable_available_batches": len(
+            full_branch_reachable_available
+        ),
+        "current_wrong_when_full_branch_reachable_available": sum(
+            int(record["current_selected_index"])
+            not in record["full_branch_reachable_candidate_indices"]
+            for record in full_branch_reachable_available
+        ),
+        "reachability_wrong_when_full_branch_reachable_available": sum(
+            int(record["reachability_first_selected_index"])
+            not in record["full_branch_reachable_candidate_indices"]
+            for record in full_branch_reachable_available
+        ),
+        "selected_near_physical_status_counts": {
+            selector: dict(sorted(counts.items()))
+            for selector, counts in selector_fact_counts.items()
+        },
+        "selected_motion_class_counts": {
+            selector: dict(sorted(counts.items()))
+            for selector, counts in selector_motion_counts.items()
+        },
+        "selected_near_source_prior_counts": {
+            selector: dict(sorted(counts.items()))
+            for selector, counts in selector_prior_counts.items()
+        },
     }
 
 
