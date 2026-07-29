@@ -419,6 +419,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     prompt_revision=int(navigation_context.conditioning_epoch),
                     respawn_revision=0,
                     navigation_context=navigation_context,
+                    # This trajectory is sampled from the authorized CARLA
+                    # route itself. Natural junction curvature may exceed the
+                    # Alpamayo generic lateral prior after the execution
+                    # horizon; exact road and route gates below remain binding.
+                    allow_far_lateral_route_prefix=True,
                 )
                 last_plan_time = simulation_time
                 _append(
