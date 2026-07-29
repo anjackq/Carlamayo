@@ -303,6 +303,58 @@ Private replay outputs remain outside Git:
 /home/aqiu/carlamayo-runs/22927187/policy-audit-reachability-v4.jsonl
 ```
 
+## Follow-up — Frozen reachability-aware selector
+
+The selector replay now includes a diagnostic-only reachability-first ranking.
+It preserves generic validity and route authority ahead of reachability, does
+not hard-reject a source-speed-prior mismatch, and uses reachability only to
+prefer a physically executable alternative. Because these fixtures represent
+verified empty-road scenes, an `EXPLICIT_STOP` cannot outrank an available
+non-stop candidate merely by being easier to execute.
+
+Across the 96 junction batches (288 candidates), the ablation changed the
+selection in 20 batches:
+
+| Metric | Current selector | Reachability-first |
+|---|---:|---:|
+| Selected near-prefix `REACHABLE` | 32/96 | 43/96 |
+| Misses when a route-matching reachable prefix exists | 9/40 | 0/40 |
+| Misses when a full route match exists | 0/16 | 0/16 |
+| Misses when a full-branch reachable candidate exists | 0/15 | 0/15 |
+| Selected motion class | 96 `MOVING` | 96 `MOVING` |
+
+The largest useful change is at junction entry with the 4 m/s history: the
+current selector misses a reachable route prefix in 6 of 12 batches where one
+exists, while reachability-first selects one in all 12. This is a candidate
+ranking defect that can be corrected when K=3 supplies an alternative.
+
+The straight negative-control contains 80 batches. The guarded ranking changes
+30 selections and raises selected near-prefix reachability from 61/80 to 78/80
+without changing the selected motion-class distribution:
+
+```text
+current:      61 MOVING, 15 DELAYED_START, 4 EXPLICIT_STOP
+reachability: 61 MOVING, 15 DELAYED_START, 4 EXPLICIT_STOP
+```
+
+An initial unguarded key selected one additional `EXPLICIT_STOP` at the 1 m/s
+fixture because that stop was reachable while the moving alternative was too
+long. The final empty-road explicit-stop guard removes that regression.
+
+The result is promising but cannot solve missing model coverage. Only 40/96
+junction batches contain any near-term route-matching reachable candidate, and
+only 15/96 contain a reachable candidate that matches the full junction
+branch. In the other batches, ranking cannot manufacture a correct trajectory.
+Production selection therefore remains unchanged until this preference is
+implemented behind an opt-in synchronous flag and passes closed-loop gates.
+
+Private replay outputs remain outside Git:
+
+```text
+/home/aqiu/carlamayo-runs/22927250/selector-replay-reachability-v6.jsonl
+/home/aqiu/carlamayo-runs/22927187/selector-replay-reachability-v6.jsonl
+```
+
 ## Gate decisions
 
 ### Promote
@@ -319,6 +371,7 @@ Private replay outputs remain outside Git:
 - `--route-lateral-safe-prefix`.
 - `--low-speed-longitudinal-governor`.
 - Frozen policy audit and oracle route runner.
+- Reachability-first selector replay.
 
 ### Do not promote
 
