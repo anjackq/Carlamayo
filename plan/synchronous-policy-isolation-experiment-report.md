@@ -246,6 +246,63 @@ does not introduce a safety regression in the smoke test, but it does not pass
 the route-completion gate. Keep it opt-in until a multi-seed closed-loop test
 shows a material behavior improvement.
 
+## Follow-up — Source-speed reachability audit
+
+The frozen-input audit now adds an immutable, diagnostic-only reachability
+profile. It does not change candidate validity, ranking, admission, handoff, or
+control. For both the 1.5-second prefix and full 6.4-second prediction it
+records:
+
+- path length and terminal displacement;
+- minimum stopping distance at the source speed;
+- maximum reachable distance at 2.0 m/s² acceleration;
+- required constant acceleration;
+- physical status: `REACHABLE`, `TOO_LONG`, or `TOO_SHORT_TO_STOP`;
+- source-speed prior: `CONSISTENT`, `ACCELERATION_PRIOR`,
+  `DECELERATION_PRIOR`, or `STOP_PRIOR`.
+
+The bounds use 2.5 m/s² comfortable deceleration, 0.5 m distance tolerance, and
+0.75 m/s² as the diagnostic source-speed-prior tolerance.
+
+Replaying the 288 junction candidates from job `22927250` gives:
+
+| Fixture | Near-prefix TOO_LONG | Near acceleration prior | Mean required near acceleration | Full branch coverage at K |
+|---|---:|---:|---:|---:|
+| approach, 2 m/s | 43/48 | 48/48 | 3.01 m/s² | 18.75% |
+| entry, 2 m/s | 44/48 | 48/48 | 2.98 m/s² | 0% |
+| active, 2 m/s | 45/48 | 47/48 | 2.99 m/s² | 0% |
+| approach, 4 m/s | 4/48 | 37/48 | 1.20 m/s² | 81.25% |
+| entry, 4 m/s | 33/48 | 48/48 | 2.64 m/s² | 12.50% |
+| active, 4 m/s | 42/48 | 48/48 | 3.02 m/s² | 25.00% |
+
+The model is not merely choosing a wrong legal branch. At junction entry and
+active-turn positions, most predictions require a near-term acceleration
+outside the experiment's reachable envelope and simultaneously fail full route
+branch matching.
+
+The matched straight controls provide useful contrast:
+
+| Fixture | Near-prefix TOO_LONG | K-level physical coverage | K-level source-speed consistency |
+|---|---:|---:|---:|
+| stationary | 0/48 | 100% | 100% |
+| 0.5 m/s | 16/48 | 100% | 0% |
+| 1.0 m/s | 29/48 | 93.75% | 0% |
+| 2.0 m/s accelerating history | 2/48 | 100% | 18.75% |
+| 5.0 m/s | 0/48 | 100% | 93.75% |
+
+This supports a cross-modal conditioning diagnosis: Alpamayo often applies a
+higher-speed prior to low-speed images/history, and that mismatch becomes most
+severe at the right-turn junction. The audit remains diagnostic until a
+separate selector experiment proves that using it cannot suppress a necessary
+traffic stop or other valid acceleration behavior.
+
+Private replay outputs remain outside Git:
+
+```text
+/home/aqiu/carlamayo-runs/22927250/policy-audit-reachability-v4.jsonl
+/home/aqiu/carlamayo-runs/22927187/policy-audit-reachability-v4.jsonl
+```
+
 ## Gate decisions
 
 ### Promote
@@ -271,14 +328,16 @@ shows a material behavior improvement.
 
 ## Next synchronous patches
 
-1. Add a frozen junction metric that compares predicted arc length and terminal
-   displacement against the source-speed reachable envelope. Keep it
-   diagnostic first; do not spatially snap Alpamayo output to the route.
-2. Test whether selector ranking can reject `EXPLICIT_STOP` and
+1. Test whether selector ranking can reject `EXPLICIT_STOP` and
    `DELAYED_START` only when a route-matching moving candidate exists. It must
    never invent motion when every candidate stops or when scene truth requires
    stopping.
-3. If Alpamayo continues to provide no route-matching candidate at active
+2. Add reachability-aware ranking only as a frozen ablation: prefer a
+   route-matching, physically reachable candidate over a physically impossible
+   alternative, but do not reject all candidates solely for source-speed prior
+   mismatch.
+3. If Alpamayo continues to provide no route-matching and physically reachable
+   candidate at active
    junction positions, evaluate a separate architecture in which CARLA route
    geometry owns lateral control and Alpamayo supplies longitudinal/behavioral
    intent. Report this as a change in Alpamayo's control role, not as a
