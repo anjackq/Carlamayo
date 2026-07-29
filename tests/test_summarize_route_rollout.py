@@ -158,3 +158,117 @@ def test_route_summary_can_be_json_serialized():
         ]
     )
     json.dumps(summary)
+
+
+def test_route_summary_reports_reachability_selector_and_sync_contract():
+    context = {
+        **_context(40.0),
+        "distance_to_maneuver_m": 0.0,
+        "maneuver_phase": "ACTIVE",
+        "text": "Follow the current lane through the right turn.",
+    }
+    events = [
+        {
+            "event_type": "episode_start",
+            "run_id": "reachability-test",
+            "scenario_seed": 0,
+            "execution": "sync",
+            "candidate_ranking_policy": "reachability-first",
+            "trajectory_reachability_audit": True,
+            "route_startup_facts": {"route_length_m": 100.0},
+            "navigation_context": context,
+        },
+        {
+            "event_type": "alpamayo_proposal",
+            "proposal_id": "proposal-1",
+            "navigation_context": context,
+        },
+        {
+            "event_type": "candidate_selection",
+            "proposal_id": "proposal-1",
+            "selected_candidate_index": 1,
+            "current_shadow_selected_index": 0,
+            "reachability_shadow_selected_index": 1,
+            "shadow_selection_changed": True,
+            "near_executable_candidate_indices": [1],
+            "full_turn_executable_candidate_indices": [1],
+            "candidate_ranking_fallback_reason": None,
+        },
+        {
+            "event_type": "candidate_evaluation",
+            "proposal_id": "proposal-1",
+            "candidate_plan_id": "proposal-1/candidate-1",
+            "selected": True,
+            "admitted": True,
+            "motion_class": "MOVING",
+            "near_physical_status": "REACHABLE",
+            "trajectory_reachability_profile": {
+                "near_physical_status": "REACHABLE",
+                "near_source_speed_prior_status": "CONSISTENT",
+            },
+            "trajectory_reachability_compute_ms": 0.2,
+            "candidate_route_assessment": {
+                "current_route_status": "MATCH",
+                "near_term_route_status": "MATCH",
+            },
+        },
+        {
+            "event_type": "plan_handoff",
+            "candidate_plan_id": "proposal-1/candidate-1",
+            "status": "ACTIVATE_FRESH",
+            "activate_candidate": True,
+            "retain_active": False,
+        },
+        {
+            "event_type": "inference_result",
+            "source_simulation_time_s": 4.0,
+            "arrival_simulation_time_s": 4.0,
+        },
+        _tick(
+            1,
+            40.0,
+            0.0,
+            applied_control={"throttle": 0.0, "brake": 0.9},
+            controller_debug={
+                "low_speed_longitudinal_governor": {
+                    "mode": "COAST",
+                }
+            },
+        ),
+        _tick(
+            2,
+            40.5,
+            0.6,
+            applied_control={"throttle": 0.2, "brake": 0.0},
+            controller_debug={
+                "low_speed_longitudinal_governor": {
+                    "mode": "THROTTLE_LIMITED",
+                }
+            },
+        ),
+    ]
+
+    summary = summarize_route_rollout(events)
+    policy = summary["candidate_policy"]
+
+    assert policy["near_executable_coverage_at_k"] == 1.0
+    assert policy["full_turn_executable_coverage_at_k"] == 1.0
+    assert policy["current_near_conditional_misses"] == 1
+    assert policy["reachability_near_conditional_misses"] == 0
+    assert policy["effective_near_conditional_misses"] == 0
+    assert policy["phase"]["RIGHT/ACTIVE"]["requests"] == 1
+    assert policy["selected_activated_count"] == 1
+    assert summary["motion"]["stop_go_restart_count"] == 1
+    assert summary["motion"]["hard_brake_ticks"] == 1
+    assert summary["controller"]["low_speed_governor_mode_counts"] == {
+        "COAST": 1,
+        "THROTTLE_LIMITED": 1,
+    }
+    assert (
+        summary["synchronous_contract"][
+            "maximum_inference_simulation_duration_s"
+        ]
+        == 0.0
+    )
+    assert summary["gates"]["synchronous_inference_paused"]
+    assert summary["gates"]["effective_near_selector_recall"]

@@ -53,7 +53,14 @@ echo "CARLA RPC port: ${CARLAMAYO_CARLA_PORT}"
 echo "Traffic Manager port: ${CARLAMAYO_TRAFFIC_MANAGER_PORT}"
 nvidia-smi
 
-CARLAMAYO_CARLA_LOG="$CARLAMAYO_REPO_ROOT/carla-server-${SLURM_JOB_ID}.log"
+if [[ -n "${SLURM_ARRAY_JOB_ID:-}" && -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    CARLAMAYO_RUN_KEY="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+else
+    CARLAMAYO_RUN_KEY="${SLURM_JOB_ID}"
+fi
+CARLAMAYO_RUN_ROOT="${CARLAMAYO_RUN_ROOT:-/home/aqiu/carlamayo-runs/${CARLAMAYO_RUN_KEY}}"
+mkdir -p "$CARLAMAYO_RUN_ROOT"
+CARLAMAYO_CARLA_LOG="$CARLAMAYO_RUN_ROOT/carla-server.log"
 CARLAMAYO_CARLA_PID=""
 
 cleanup() {
@@ -104,10 +111,25 @@ from module.inference import require_cuda_runtime
 print(f"Alpamayo CUDA device: {require_cuda_runtime()}")
 PY
 
-CARLAMAYO_RUN_ROOT="/home/aqiu/carlamayo-runs/${SLURM_JOB_ID}"
-mkdir -p "$CARLAMAYO_RUN_ROOT"
 export CARLAMAYO_OUTPUT_VIDEO="$CARLAMAYO_RUN_ROOT/carla_alpamayo_closed_loop_result.mp4"
 export CARLAMAYO_LIVE_PREVIEW_IMAGE="$CARLAMAYO_RUN_ROOT/carla_alpamayo_closed_loop_latest.jpg"
+
+{
+    echo "experiment_id=${CARLAMAYO_EXPERIMENT_ID:-}"
+    echo "experiment_arm=${CARLAMAYO_EXPERIMENT_ARM:-}"
+    echo "scenario_seed=${CARLAMAYO_EXPERIMENT_SEED:-}"
+    echo "git_commit=$(git rev-parse HEAD)"
+    echo "git_dirty=$(test -n "$(git status --porcelain)" && echo true || echo false)"
+    echo "camera_profile=${CARLAMAYO_CAMERA_PROFILE:-}"
+    if [[ -n "${CARLAMAYO_CAMERA_PROFILE:-}" ]]; then
+        echo "camera_profile_sha256=$(sha256sum "$CARLAMAYO_CAMERA_PROFILE" | awk '{print $1}')"
+    fi
+    echo "node=$(hostname)"
+    echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
+    printf "arguments="
+    printf "%q " "$@"
+    printf "\n"
+} >"$CARLAMAYO_RUN_ROOT/experiment-manifest.txt"
 
 echo "Starting CarlaMayo closed-loop synchronized safety run."
 echo "Artifacts: ${CARLAMAYO_RUN_ROOT}"
