@@ -41,12 +41,14 @@ from module.carla_route_adapter import (
 from module.carla_scene_truth import capture_scene_truth_snapshot
 from module.candidate_selector import (
     CandidateEvaluation,
+    CandidateRankingPolicy,
     rank_candidate_evaluations,
 )
 from module.geometry import pose_matrix_from_state
 from module.navigation_control import NavigationControlState
 from module.coc_semantic_audit import audit_coc_semantics
 from module.route_navigation import (
+    NavigationAction,
     RouteNavigationTracker,
     RouteTrackerStatus,
 )
@@ -82,6 +84,9 @@ from module.trajectory_runtime import (
     compute_trajectory_motion_profile,
     validate_plan_alignment,
     validate_plan_for_execution,
+)
+from module.trajectory_reachability import (
+    compute_trajectory_reachability_profile,
 )
 from module.vlm_generate_optimization import VlmGenerateTiming
 from module.visualization import VideoRecorder, create_visualization_frame
@@ -580,6 +585,24 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--trajectory-reachability-audit",
+        action="store_true",
+        help=(
+            "Compute source-synchronized physical reachability facts for every "
+            "trajectory candidate. Diagnostic-only unless "
+            "--candidate-ranking-policy reachability-first is selected."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-ranking-policy",
+        choices=tuple(policy.value for policy in CandidateRankingPolicy),
+        default=CandidateRankingPolicy.CURRENT.value,
+        help=(
+            "Candidate ranking policy. Default: current. "
+            "reachability-first is a synchronous empty-road route experiment."
+        ),
+    )
+    parser.add_argument(
         "--carla-python-api-path",
         default=None,
         metavar="PATH",
@@ -755,6 +778,34 @@ def parse_args(argv=None):
         parser.error("--ego-spawn-index must be nonnegative.")
     if args.num_traj_samples < 1 or args.num_traj_samples > 16:
         parser.error("--num-traj-samples must be within [1, 16].")
+    if args.async_mode and (
+        args.trajectory_reachability_audit
+        or args.candidate_ranking_policy
+        != CandidateRankingPolicy.CURRENT.value
+    ):
+        parser.error(
+            "trajectory reachability audit/ranking is synchronous-only and "
+            "cannot be combined with --async."
+        )
+    if (
+        args.candidate_ranking_policy
+        == CandidateRankingPolicy.REACHABILITY_FIRST.value
+    ):
+        args.trajectory_reachability_audit = True
+        if not args.empty_road:
+            parser.error(
+                "reachability-first ranking requires --empty-road."
+            )
+        if args.mode != "navigation" or args.navigation_source != "route":
+            parser.error(
+                "reachability-first ranking requires --mode navigation and "
+                "--navigation-source route."
+            )
+        if args.num_traj_samples < 2:
+            parser.error(
+                "reachability-first ranking requires "
+                "--num-traj-samples >= 2."
+            )
     if not math.isfinite(args.diffusion_temperature) or args.diffusion_temperature <= 0.0:
         parser.error("--diffusion-temperature must be finite and greater than zero.")
     if args.camera_alignment != "baseline" and not args.camera_profile:
@@ -828,6 +879,11 @@ def main():
     else:
         print(f"Quantization: {'ON (4-bit)' if args.quantization else 'OFF (full-precision)'}")
     print(f"Execution: {'ASYNC' if args.async_mode else 'SYNC'}")
+    print(f"Candidate ranking policy: {args.candidate_ranking_policy}")
+    print(
+        "Trajectory reachability audit: "
+        f"{'ON' if args.trajectory_reachability_audit else 'OFF'}"
+    )
     print(f"Inference mode: {args.mode}")
     print(f"Navigation source: {args.navigation_source}")
     print(
@@ -1919,6 +1975,30 @@ def main():
                 rejection_reason = None
                 motion_profile = None
                 motion_profile_compute_ms = None
+                reachability_profile = None
+                reachability_error = None
+                reachability_compute_ms = None
+                if args.trajectory_reachability_audit:
+                    reachability_started_s = time.perf_counter()
+                    try:
+                        reachability_profile = (
+                            compute_trajectory_reachability_profile(
+                                points,
+                                result.get("source_ego_history_xyz"),
+                                source_speed_mps=result.get(
+                                    "source_speed_mps"
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        reachability_error = (
+                            f"{type(exc).__name__}:{exc}"
+                        )
+                    finally:
+                        reachability_compute_ms = (
+                            time.perf_counter()
+                            - reachability_started_s
+                        ) * 1000.0
                 try:
                     plan, _validity = _build_and_validate_fixed_plan(
                         result,
@@ -1953,6 +2033,11 @@ def main():
                         "evaluation": None,
                         "motion_profile": motion_profile,
                         "motion_profile_compute_ms": motion_profile_compute_ms,
+                        "reachability_profile": reachability_profile,
+                        "reachability_error": reachability_error,
+                        "reachability_compute_ms": (
+                            reachability_compute_ms
+                        ),
                         "route_assessment": None,
                         "semantic_audit": None,
                         "semantic_audit_error": result.get(
@@ -2127,6 +2212,9 @@ def main():
                     else None
                 )
                 route_assessment = record["route_assessment"]
+                reachability_profile = record[
+                    "reachability_profile"
+                ]
                 record["evaluation"] = CandidateEvaluation(
                     candidate_index=candidate_index,
                     plan_id=record["candidate_proposal"]["proposal_id"],
@@ -2162,6 +2250,11 @@ def main():
                         if envelope is not None
                         else None
                     ),
+                    near_term_route_status=(
+                        route_assessment.near_term_route_status.value
+                        if route_assessment is not None
+                        else None
+                    ),
                     full_path_route_status=(
                         route_assessment.full_path_route_status.value
                         if route_assessment is not None
@@ -2180,12 +2273,40 @@ def main():
                         )
                         else None
                     ),
+                    near_physical_status=(
+                        reachability_profile.near_physical_status.value
+                        if reachability_profile is not None
+                        else None
+                    ),
+                    full_physical_status=(
+                        reachability_profile.physical_status.value
+                        if reachability_profile is not None
+                        else None
+                    ),
+                    near_source_speed_prior_status=(
+                        reachability_profile.near_source_speed_prior_status.value
+                        if reachability_profile is not None
+                        else None
+                    ),
+                    near_required_constant_acceleration_mps2=(
+                        reachability_profile.near_required_constant_acceleration_mps2
+                        if reachability_profile is not None
+                        else None
+                    ),
                 )
 
-            prefer_moving = _verified_empty_road()
+            arriving = bool(
+                current_navigation_context is not None
+                and current_navigation_context.action
+                is NavigationAction.ARRIVE
+            )
+            prefer_moving = bool(_verified_empty_road() and not arriving)
             ranking_started_s = time.perf_counter()
-            selection = rank_candidate_evaluations(
-                [record["evaluation"] for record in candidate_records],
+            evaluations = [
+                record["evaluation"] for record in candidate_records
+            ]
+            current_selection = rank_candidate_evaluations(
+                evaluations,
                 navigation_text=(
                     result.get("navigation_text")
                     if result.get("mode", args.mode) == "navigation"
@@ -2193,6 +2314,29 @@ def main():
                 ),
                 prefer_moving=prefer_moving,
                 current_speed_mps=float(state["speed"]),
+                ranking_policy=CandidateRankingPolicy.CURRENT,
+            )
+            reachability_selection = None
+            if args.trajectory_reachability_audit:
+                reachability_selection = rank_candidate_evaluations(
+                    evaluations,
+                    navigation_text=(
+                        result.get("navigation_text")
+                        if result.get("mode", args.mode) == "navigation"
+                        else None
+                    ),
+                    prefer_moving=prefer_moving,
+                    current_speed_mps=float(state["speed"]),
+                    ranking_policy=(
+                        CandidateRankingPolicy.REACHABILITY_FIRST
+                    ),
+                )
+            selection = (
+                reachability_selection
+                if args.candidate_ranking_policy
+                == CandidateRankingPolicy.REACHABILITY_FIRST.value
+                and reachability_selection is not None
+                else current_selection
             )
             ranking_ms = (
                 time.perf_counter() - ranking_started_s
@@ -2200,6 +2344,65 @@ def main():
             selection_compute_ms = (
                 time.perf_counter() - selection_started_s
             ) * 1000.0
+            accepted_admissions = {
+                PlanAdmissionStatus.ACCEPT_FULLY_SAFE,
+                PlanAdmissionStatus.ACCEPT_SAFE_PREFIX,
+                PlanAdmissionStatus.ACCEPT_RECOVERY_PREFIX,
+            }
+            near_executable_candidate_indices = []
+            full_turn_executable_candidate_indices = []
+            for record in candidate_records:
+                evaluation = record["evaluation"]
+                route_assessment = record["route_assessment"]
+                reachability_profile = record[
+                    "reachability_profile"
+                ]
+                envelope = record["envelope"]
+                non_stop_for_route = bool(
+                    arriving
+                    or evaluation.motion_class != "EXPLICIT_STOP"
+                )
+                near_executable = bool(
+                    record["plan"] is not None
+                    and record["admission"] in accepted_admissions
+                    and route_assessment is not None
+                    and route_assessment.near_term_route_status
+                    is RouteStatus.MATCH
+                    and reachability_profile is not None
+                    and reachability_profile.near_physical_status.value
+                    == "REACHABLE"
+                    and non_stop_for_route
+                )
+                full_turn_executable = bool(
+                    near_executable
+                    and envelope is not None
+                    and envelope.full_path_road.status
+                    is AssessmentStatus.SAFE
+                    and route_assessment.full_path_route_status
+                    is RouteStatus.MATCH
+                    and route_assessment.branch_match is True
+                    and reachability_profile.physical_status.value
+                    == "REACHABLE"
+                )
+                record["near_executable"] = near_executable
+                record["full_turn_executable"] = (
+                    full_turn_executable
+                )
+                if near_executable:
+                    near_executable_candidate_indices.append(
+                        evaluation.candidate_index
+                    )
+                if full_turn_executable:
+                    full_turn_executable_candidate_indices.append(
+                        evaluation.candidate_index
+                    )
+            reachability_batch_complete = bool(
+                candidate_records
+                and all(
+                    record["reachability_profile"] is not None
+                    for record in candidate_records
+                )
+            )
             stats_fields = {
                 "validation_ms": None,
                 "densify_heading_ms": None,
@@ -2301,6 +2504,25 @@ def main():
                         if record["motion_profile"] is not None
                         else None
                     ),
+                    trajectory_reachability_profile=(
+                        record["reachability_profile"].to_json_dict()
+                        if record["reachability_profile"] is not None
+                        else None
+                    ),
+                    trajectory_reachability_error=record[
+                        "reachability_error"
+                    ],
+                    trajectory_reachability_compute_ms=record[
+                        "reachability_compute_ms"
+                    ],
+                    source_speed_mps=result.get("source_speed_mps"),
+                    source_history_real_tick_count=result.get(
+                        "source_history_real_tick_count"
+                    ),
+                    near_executable=record["near_executable"],
+                    full_turn_executable=record[
+                        "full_turn_executable"
+                    ],
                     first_lateral_limit_violation_index=(
                         record["plan"].first_lateral_limit_violation_index
                         if record["plan"] is not None
@@ -2336,6 +2558,55 @@ def main():
                 layer="ALPAMAYO_PROPOSAL",
                 proposal_id=proposal["proposal_id"],
                 preselected_candidate_index=proposal["preselected_index"],
+                candidate_ranking_policy_requested=(
+                    args.candidate_ranking_policy
+                ),
+                candidate_ranking_policy_effective=(
+                    selection.effective_ranking_policy.value
+                ),
+                candidate_ranking_fallback_reason=(
+                    selection.ranking_fallback_reason
+                ),
+                current_shadow_selected_index=(
+                    current_selection.selected_index
+                ),
+                reachability_shadow_selected_index=(
+                    reachability_selection.selected_index
+                    if reachability_selection is not None
+                    else None
+                ),
+                reachability_shadow_effective_policy=(
+                    reachability_selection
+                    .effective_ranking_policy.value
+                    if reachability_selection is not None
+                    else None
+                ),
+                shadow_selection_changed=(
+                    reachability_selection is not None
+                    and current_selection.selected_index
+                    != reachability_selection.selected_index
+                ),
+                reachability_batch_complete=(
+                    reachability_batch_complete
+                ),
+                near_executable_candidate_indices=(
+                    near_executable_candidate_indices
+                ),
+                full_turn_executable_candidate_indices=(
+                    full_turn_executable_candidate_indices
+                ),
+                selected_near_executable=(
+                    selection.selected_index
+                    in near_executable_candidate_indices
+                ),
+                selected_full_turn_executable=(
+                    selection.selected_index
+                    in full_turn_executable_candidate_indices
+                ),
+                source_speed_mps=result.get("source_speed_mps"),
+                source_history_real_tick_count=result.get(
+                    "source_history_real_tick_count"
+                ),
                 selection_compute_ms=selection_compute_ms,
                 candidate_validation_ms=candidate_validation_ms,
                 road_batch_wall_ms=road_batch_wall_ms,
@@ -3851,6 +4122,18 @@ def main():
             """Build model input from the current complete temporal frame buffer."""
 
             images_array, history_xyz, history_rot, source_entry = _current_input_arrays()
+            source_conditioning = None
+            if args.trajectory_reachability_audit:
+                source_conditioning = {
+                    "ego_history_xyz": np.asarray(
+                        history_xyz,
+                        dtype=np.float64,
+                    ).copy(),
+                    "speed_mps": float(state["speed"]),
+                    "history_real_tick_count": int(
+                        len(carla_if.history_buffer)
+                    ),
+                }
             return (
                 prepare_model_input(
                     images_array,
@@ -3859,6 +4142,7 @@ def main():
                     camera_indices=source_entry["camera_ids"],
                 ),
                 source_entry,
+                source_conditioning,
             )
 
         def _capture_source_scene_truth(source_entry):
@@ -4192,6 +4476,8 @@ def main():
         emit_runtime_event(
             "episode_start",
             mode=args.mode,
+            experiment_id=os.environ.get("CARLAMAYO_EXPERIMENT_ID"),
+            experiment_arm=os.environ.get("CARLAMAYO_EXPERIMENT_ARM"),
             scenario="empty_road" if args.empty_road else "normal_traffic",
             scenario_seed=args.scenario_seed,
             ego_spawn_index=args.ego_spawn_index,
@@ -4214,6 +4500,12 @@ def main():
             ),
             low_speed_longitudinal_governor=bool(
                 getattr(args, "low_speed_longitudinal_governor", False)
+            ),
+            trajectory_reachability_audit=bool(
+                args.trajectory_reachability_audit
+            ),
+            candidate_ranking_policy=(
+                args.candidate_ranking_policy
             ),
             navigation_text=nav_state.navigation_text if args.mode == "navigation" else None,
             navigation_weight=nav_state.navigation_weight if args.mode == "navigation" else None,
@@ -4888,8 +5180,13 @@ def main():
                 ):
                     source_entry = frame_buffer[-1]
                     model_input_error = None
+                    source_conditioning = None
                     try:
-                        model_data, source_entry = _prepare_current_model_input()
+                        (
+                            model_data,
+                            source_entry,
+                            source_conditioning,
+                        ) = _prepare_current_model_input()
                     except Exception as exc:
                         model_data = None
                         model_input_error = f"{type(exc).__name__}:{exc}"
@@ -5074,6 +5371,23 @@ def main():
                                 "navigation_context": current_navigation_context,
                                 "scene_truth_snapshot": scene_truth_snapshot,
                                 "scene_truth_error": scene_truth_error,
+                                "source_ego_history_xyz": (
+                                    source_conditioning["ego_history_xyz"]
+                                    if source_conditioning is not None
+                                    else None
+                                ),
+                                "source_speed_mps": (
+                                    source_conditioning["speed_mps"]
+                                    if source_conditioning is not None
+                                    else None
+                                ),
+                                "source_history_real_tick_count": (
+                                    source_conditioning[
+                                        "history_real_tick_count"
+                                    ]
+                                    if source_conditioning is not None
+                                    else None
+                                ),
                                 "prompt_revision": nav_state.revision,
                                 "respawn_revision": respawn_revision,
                             }
@@ -5778,6 +6092,9 @@ def main():
                         coc_issue_count=coc_issue_count,
                         last_safe_waypoint_index=relative_last_safe_index,
                         camera_alignment_mode=args.camera_alignment,
+                        candidate_ranking_policy=(
+                            args.candidate_ranking_policy
+                        ),
                         proposal_world_trajectory=proposal_world_trajectory,
                         proposal_source_frame_id=(
                             latest_visual_proposal_plan.source_frame_id

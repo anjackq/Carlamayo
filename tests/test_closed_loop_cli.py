@@ -49,6 +49,76 @@ def test_road_assessment_backend_defaults_remain_serial():
 
     assert args.road_assessment_backend == "serial"
     assert args.road_assessment_workers is None
+    assert args.candidate_ranking_policy == "current"
+    assert args.trajectory_reachability_audit is False
+
+
+def test_reachability_audit_is_sync_only():
+    with pytest.raises(SystemExit) as exc_info:
+        closed_loop.parse_args(
+            ["--async", "--trajectory-reachability-audit"]
+        )
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--candidate-ranking-policy", "reachability-first"],
+        [
+            "--empty-road",
+            "--candidate-ranking-policy",
+            "reachability-first",
+        ],
+        [
+            "--empty-road",
+            "--mode",
+            "navigation",
+            "--navigation-text",
+            "Turn right.",
+            "--candidate-ranking-policy",
+            "reachability-first",
+        ],
+    ],
+)
+def test_reachability_ranking_requires_sync_empty_road_route(arguments):
+    with pytest.raises(SystemExit) as exc_info:
+        closed_loop.parse_args(arguments)
+
+    assert exc_info.value.code == 2
+
+
+def test_reachability_ranking_enables_audit_for_route_experiment(tmp_path):
+    api_path = tmp_path / "PythonAPI" / "carla"
+    marker = (
+        api_path
+        / "agents"
+        / "navigation"
+        / "global_route_planner.py"
+    )
+    marker.parent.mkdir(parents=True)
+    marker.write_text("# test marker\n", encoding="utf-8")
+
+    args = closed_loop.parse_args(
+        [
+            "--empty-road",
+            "--mode",
+            "navigation",
+            "--navigation-source",
+            "route",
+            "--route-destination=-43.350975,-2.8402605,0",
+            "--carla-python-api-path",
+            str(api_path),
+            "--num-traj-samples",
+            "3",
+            "--candidate-ranking-policy",
+            "reachability-first",
+        ]
+    )
+
+    assert args.candidate_ranking_policy == "reachability-first"
+    assert args.trajectory_reachability_audit is True
 
 
 def test_process_road_backend_resolves_default_workers_from_cpu_affinity(

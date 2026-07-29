@@ -19,6 +19,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from module.candidate_selector import (  # noqa: E402
     CandidateEvaluation,
+    CandidateRankingPolicy,
     rank_candidate_evaluations,
 )
 
@@ -36,21 +37,6 @@ _ROUTE_RANK = {
     "UNKNOWN": 2,
     None: 3,
 }
-_PHYSICAL_RANK = {
-    "REACHABLE": 0,
-    "TOO_LONG": 1,
-    "TOO_SHORT_TO_STOP": 1,
-    None: 2,
-}
-_PRIOR_RANK = {
-    "CONSISTENT": 0,
-    "STOP_PRIOR": 1,
-    "ACCELERATION_PRIOR": 1,
-    "DECELERATION_PRIOR": 1,
-    None: 2,
-}
-
-
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     events = []
     with path.open("r", encoding="utf-8") as stream:
@@ -134,7 +120,11 @@ def _json_safe(value: Any) -> Any:
 
 def _evaluation(candidate: dict[str, Any]) -> CandidateEvaluation:
     route_status, branch_match, cross_track = _route_fields(candidate)
+    near_route_status = _near_route_status(candidate)
     motion_class, initial_speed = _motion_fields(candidate)
+    near_physical, full_physical, prior, required_acceleration = (
+        _reachability_fields(candidate)
+    )
     valid = bool(candidate.get("valid"))
     return CandidateEvaluation(
         candidate_index=int(candidate["candidate_index"]),
@@ -153,9 +143,14 @@ def _evaluation(candidate: dict[str, Any]) -> CandidateEvaluation:
         stopping_reserve_status="UNBOUNDED" if valid else None,
         stopping_reserve_m=None,
         time_to_first_bad_s=None,
+        near_term_route_status=near_route_status,
         full_path_route_status=route_status,
         route_branch_match=branch_match,
         route_cross_track_error_m=cross_track,
+        near_physical_status=near_physical,
+        full_physical_status=full_physical,
+        near_source_speed_prior_status=prior,
+        near_required_constant_acceleration_mps2=required_acceleration,
     )
 
 
@@ -170,41 +165,6 @@ def route_first_key(candidate: dict[str, Any]) -> tuple[float, ...]:
         float(branch_rank),
         float(math.inf if cross_track is None else cross_track),
         float(_MOTION_RANK[motion_class]),
-        -float(candidate.get("forward_progress_m") or 0.0),
-        float(candidate["candidate_index"]),
-    )
-
-
-def reachability_first_key(candidate: dict[str, Any]) -> tuple[float, ...]:
-    """Rank empty-road route/reachability facts without promoting a stop."""
-
-    full_route_status, branch_match, cross_track = _route_fields(candidate)
-    near_route_status = _near_route_status(candidate)
-    motion_class, _ = _motion_fields(candidate)
-    near_physical, full_physical, prior, required_acceleration = (
-        _reachability_fields(candidate)
-    )
-    valid_rank = 0 if candidate.get("valid") else 1
-    explicit_stop_rank = 1 if motion_class == "EXPLICIT_STOP" else 0
-    branch_rank = (
-        0 if branch_match is True else 1 if branch_match is False else 2
-    )
-    return (
-        float(valid_rank),
-        float(_ROUTE_RANK[near_route_status]),
-        float(explicit_stop_rank),
-        float(_PHYSICAL_RANK[near_physical]),
-        float(_ROUTE_RANK[full_route_status]),
-        float(branch_rank),
-        float(_PHYSICAL_RANK[full_physical]),
-        float(_MOTION_RANK[motion_class]),
-        float(_PRIOR_RANK[prior]),
-        float(
-            math.inf
-            if required_acceleration is None
-            else abs(required_acceleration)
-        ),
-        float(math.inf if cross_track is None else cross_track),
         -float(candidate.get("forward_progress_m") or 0.0),
         float(candidate["candidate_index"]),
     )
@@ -237,11 +197,13 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
     route_evaluable = any(
         _route_fields(candidate)[0] is not None for candidate in candidates
     )
+    evaluations = [_evaluation(candidate) for candidate in candidates]
     current = rank_candidate_evaluations(
-        [_evaluation(candidate) for candidate in candidates],
+        evaluations,
         navigation_text=event.get("navigation_text"),
         prefer_moving=True,
         current_speed_mps=event.get("actual_speed_mps"),
+        ranking_policy=CandidateRankingPolicy.CURRENT,
     )
     route_ranked = sorted(candidates, key=route_first_key)
     route_first = int(route_ranked[0]["candidate_index"])
@@ -250,15 +212,23 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         route_first_key(candidate)[:-1] == best_without_index
         for candidate in route_ranked
     )
-    reachability_ranked = sorted(candidates, key=reachability_first_key)
-    reachability_first = int(reachability_ranked[0]["candidate_index"])
-    reachability_best_without_index = reachability_first_key(
-        reachability_ranked[0]
-    )[:-1]
+    reachability_selection = rank_candidate_evaluations(
+        evaluations,
+        navigation_text=event.get("navigation_text"),
+        prefer_moving=True,
+        current_speed_mps=event.get("actual_speed_mps"),
+        ranking_policy=CandidateRankingPolicy.REACHABILITY_FIRST,
+    )
+    reachability_first = int(reachability_selection.selected_index)
+    reachability_ranked = list(
+        reachability_selection.ranked_candidates
+    )
+    reachability_best_without_index = (
+        reachability_ranked[0].ranking_key[:-1]
+    )
     reachability_ties = sum(
-        reachability_first_key(candidate)[:-1]
-        == reachability_best_without_index
-        for candidate in reachability_ranked
+        ranked.ranking_key[:-1] == reachability_best_without_index
+        for ranked in reachability_ranked
     )
     reachability_evaluable = any(
         _reachability_fields(candidate)[0] is not None
@@ -354,13 +324,15 @@ def replay_batch(event: dict[str, Any]) -> dict[str, Any]:
         ],
         "reachability_first_ranking": [
             {
-                "candidate_index": int(candidate["candidate_index"]),
+                "candidate_index": int(
+                    ranked.evaluation.candidate_index
+                ),
                 "ranking_key": [
                     None if not math.isfinite(value) else value
-                    for value in reachability_first_key(candidate)
+                    for value in ranked.ranking_key
                 ],
             }
-            for candidate in reachability_ranked
+            for ranked in reachability_ranked
         ],
     }
 

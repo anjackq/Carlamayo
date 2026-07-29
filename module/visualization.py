@@ -321,6 +321,7 @@ def create_visualization_frame(
     active_plan_id=None,
     route_reference_world=None,
     actual_history_world=None,
+    candidate_ranking_policy="current",
 ):
     """Create a frame that distinguishes prediction, policy, and execution."""
     calibrated_overlay_available = (
@@ -396,7 +397,8 @@ def create_visualization_frame(
     info_text = (
         f"Frame: {frame_count} | Inference: {inference_time:.2f}s | "
         f"Speed: {speed_kmh:.1f} km/h | Steer: {steering:.2f} | "
-        f"CAMERA INPUT: {camera_input_label}"
+        f"CAMERA INPUT: {camera_input_label} | "
+        f"RANKING: {str(candidate_ranking_policy).upper()}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 1.0

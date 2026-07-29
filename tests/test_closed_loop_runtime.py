@@ -56,6 +56,7 @@ class _FakeCarlaInterface:
         self.npc_spawn_requests = []
         self.setup_cameras_count = 0
         self.setup_collision_sensor_count = 0
+        self.history_buffer = []
         self._on_tick = on_tick
         self._fail_on_tick = fail_on_tick
 
@@ -112,8 +113,9 @@ class _FakeCarlaInterface:
     def get_ego_state(self):
         return {"speed": 0.0}
 
-    def update_history(self, _state):
-        pass
+    def update_history(self, state):
+        self.history_buffer.append(dict(state))
+        self.history_buffer = self.history_buffer[-16:]
 
     def get_collision_count(self):
         return 0
@@ -128,7 +130,13 @@ class _FakeCarlaInterface:
         return [closed_loop.np.zeros((1, 1, 3), dtype=closed_loop.np.uint8)]
 
     def get_history_in_local_frame(self):
-        return object(), object()
+        return (
+            closed_loop.np.zeros((16, 3), dtype=closed_loop.np.float32),
+            closed_loop.np.zeros(
+                (16, 3, 3),
+                dtype=closed_loop.np.float32,
+            ),
+        )
 
     def apply_control(self, steering, throttle, brake):
         self.applied_controls.append((steering, throttle, brake))
@@ -1464,6 +1472,7 @@ def test_multi_candidate_selector_road_evaluates_all_samples_before_handoff(
             "--empty-road",
             "--num-traj-samples",
             "3",
+            "--trajectory-reachability-audit",
             "--telemetry-jsonl",
             str(telemetry_path),
             "--max-episode-seconds",
@@ -1546,6 +1555,17 @@ def test_multi_candidate_selector_road_evaluates_all_samples_before_handoff(
     assert selection["selected_candidate_index"] == 1
     assert selection["selected_admitted"] is True
     assert selection["selection_reason"] == "best_admitted_candidate"
+    assert selection["candidate_ranking_policy_requested"] == "current"
+    assert selection["candidate_ranking_policy_effective"] == "current"
+    assert selection["reachability_batch_complete"] is True
+    assert selection["reachability_shadow_selected_index"] is not None
+    assert selection["source_speed_mps"] == 0.0
+    assert selection["source_history_real_tick_count"] >= 1
+    assert all(
+        record["trajectory_reachability_profile"] is not None
+        and record["trajectory_reachability_error"] is None
+        for record in evaluations
+    )
 
     proposal = next(
         record for record in records if record["event_type"] == "alpamayo_proposal"

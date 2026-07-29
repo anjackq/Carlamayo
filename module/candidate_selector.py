@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Iterable
 
 
@@ -39,9 +40,33 @@ _MOTION_QUALITY = {
     "CREEP_OR_STALL": 2,
     "EXPLICIT_STOP": 3,
 }
+_ROUTE_QUALITY = {
+    "MATCH": 0,
+    "DEVIATE": 1,
+    "UNKNOWN": 2,
+    None: 3,
+}
+_PHYSICAL_REACHABILITY_QUALITY = {
+    "REACHABLE": 0,
+    "TOO_LONG": 1,
+    "TOO_SHORT_TO_STOP": 1,
+    None: 2,
+}
+_SOURCE_SPEED_PRIOR_QUALITY = {
+    "CONSISTENT": 0,
+    "STOP_PRIOR": 1,
+    "ACCELERATION_PRIOR": 1,
+    "DECELERATION_PRIOR": 1,
+    None: 2,
+}
 _RIGHT_RE = re.compile(r"\bright\b", re.IGNORECASE)
 _LEFT_RE = re.compile(r"\bleft\b", re.IGNORECASE)
 ROUTE_LATERAL_DEADBAND_M = 0.75
+
+
+class CandidateRankingPolicy(str, Enum):
+    CURRENT = "current"
+    REACHABILITY_FIRST = "reachability-first"
 
 
 def _finite_or_none(value: Any, name: str) -> float | None:
@@ -74,9 +99,14 @@ class CandidateEvaluation:
     stopping_reserve_status: str | None = None
     stopping_reserve_m: float | None = None
     time_to_first_bad_s: float | None = None
+    near_term_route_status: str | None = None
     full_path_route_status: str | None = None
     route_branch_match: bool | None = None
     route_cross_track_error_m: float | None = None
+    near_physical_status: str | None = None
+    full_physical_status: str | None = None
+    near_source_speed_prior_status: str | None = None
+    near_required_constant_acceleration_mps2: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.candidate_index, bool) or int(self.candidate_index) < 0:
@@ -151,18 +181,16 @@ class CandidateEvaluation:
             "time_to_first_bad_s",
             _finite_or_none(self.time_to_first_bad_s, "time_to_first_bad_s"),
         )
-        route_status = (
-            None
-            if self.full_path_route_status is None
-            else str(self.full_path_route_status).strip().upper() or None
-        )
-        if route_status is not None and route_status not in {
-            "MATCH",
-            "DEVIATE",
-            "UNKNOWN",
-        }:
-            raise ValueError(f"unknown full_path_route_status: {route_status}")
-        object.__setattr__(self, "full_path_route_status", route_status)
+        for attribute in ("near_term_route_status", "full_path_route_status"):
+            raw_status = getattr(self, attribute)
+            route_status = (
+                None
+                if raw_status is None
+                else str(raw_status).strip().upper() or None
+            )
+            if route_status not in _ROUTE_QUALITY:
+                raise ValueError(f"unknown {attribute}: {route_status}")
+            object.__setattr__(self, attribute, route_status)
         object.__setattr__(
             self,
             "route_branch_match",
@@ -180,10 +208,52 @@ class CandidateEvaluation:
                 "route_cross_track_error_m",
             ),
         )
+        for attribute in ("near_physical_status", "full_physical_status"):
+            raw_status = getattr(self, attribute)
+            physical_status = (
+                None
+                if raw_status is None
+                else str(raw_status).strip().upper() or None
+            )
+            if physical_status not in _PHYSICAL_REACHABILITY_QUALITY:
+                raise ValueError(f"unknown {attribute}: {physical_status}")
+            object.__setattr__(self, attribute, physical_status)
+        prior_status = (
+            None
+            if self.near_source_speed_prior_status is None
+            else str(self.near_source_speed_prior_status).strip().upper() or None
+        )
+        if prior_status not in _SOURCE_SPEED_PRIOR_QUALITY:
+            raise ValueError(
+                "unknown near_source_speed_prior_status: "
+                f"{prior_status}"
+            )
+        object.__setattr__(
+            self,
+            "near_source_speed_prior_status",
+            prior_status,
+        )
+        object.__setattr__(
+            self,
+            "near_required_constant_acceleration_mps2",
+            _finite_or_none(
+                self.near_required_constant_acceleration_mps2,
+                "near_required_constant_acceleration_mps2",
+            ),
+        )
 
     @property
     def admitted(self) -> bool:
         return self.admission_status in ACCEPTED_ADMISSION_STATUSES
+
+    @property
+    def reachability_complete(self) -> bool:
+        return bool(
+            self.near_physical_status is not None
+            and self.full_physical_status is not None
+            and self.near_source_speed_prior_status is not None
+            and self.near_required_constant_acceleration_mps2 is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -191,10 +261,16 @@ class RankedCandidate:
     """One candidate plus the transparent lexicographic ranking terms."""
 
     evaluation: CandidateEvaluation
+    ranking_policy: CandidateRankingPolicy
     category_rank: int
     reserve_fragility_rank: int
+    near_route_rank: int
     motion_quality_rank: int
     stop_penalty: int
+    near_physical_reachability_rank: int
+    full_physical_reachability_rank: int
+    source_speed_prior_rank: int
+    absolute_required_acceleration_rank: float
     admission_quality_rank: int
     negative_stopping_reserve_m: float
     negative_time_to_first_bad_s: float
@@ -205,7 +281,7 @@ class RankedCandidate:
     negative_forward_progress_m: float
 
     @property
-    def ranking_key(self) -> tuple[float, ...]:
+    def current_ranking_key(self) -> tuple[float, ...]:
         return (
             float(self.category_rank),
             float(self.reserve_fragility_rank),
@@ -220,6 +296,35 @@ class RankedCandidate:
             float(self.negative_forward_progress_m),
             float(self.evaluation.candidate_index),
         )
+
+    @property
+    def reachability_ranking_key(self) -> tuple[float, ...]:
+        return (
+            float(self.category_rank),
+            float(self.reserve_fragility_rank),
+            float(self.near_route_rank),
+            float(self.stop_penalty),
+            float(self.near_physical_reachability_rank),
+            float(self.admission_quality_rank),
+            float(self.route_mismatch_rank),
+            float(self.full_physical_reachability_rank),
+            float(self.motion_quality_rank),
+            float(self.source_speed_prior_rank),
+            float(self.absolute_required_acceleration_rank),
+            float(self.negative_stopping_reserve_m),
+            float(self.negative_time_to_first_bad_s),
+            float(self.negative_full_path_margin),
+            float(self.speed_continuity_rank_mps),
+            float(self.continuity_rank_m),
+            float(self.negative_forward_progress_m),
+            float(self.evaluation.candidate_index),
+        )
+
+    @property
+    def ranking_key(self) -> tuple[float, ...]:
+        if self.ranking_policy is CandidateRankingPolicy.REACHABILITY_FIRST:
+            return self.reachability_ranking_key
+        return self.current_ranking_key
 
     def to_json_dict(self) -> dict[str, Any]:
         evaluation = self.evaluation
@@ -239,19 +344,49 @@ class RankedCandidate:
             "stopping_reserve_status": evaluation.stopping_reserve_status,
             "stopping_reserve_m": evaluation.stopping_reserve_m,
             "time_to_first_bad_s": evaluation.time_to_first_bad_s,
+            "near_term_route_status": evaluation.near_term_route_status,
             "full_path_route_status": evaluation.full_path_route_status,
             "route_branch_match": evaluation.route_branch_match,
             "route_cross_track_error_m": evaluation.route_cross_track_error_m,
+            "near_physical_status": evaluation.near_physical_status,
+            "full_physical_status": evaluation.full_physical_status,
+            "near_source_speed_prior_status": (
+                evaluation.near_source_speed_prior_status
+            ),
+            "near_required_constant_acceleration_mps2": (
+                evaluation.near_required_constant_acceleration_mps2
+            ),
+            "reachability_complete": evaluation.reachability_complete,
+            "ranking_policy": self.ranking_policy.value,
             "category_rank": self.category_rank,
             "reserve_fragility_rank": self.reserve_fragility_rank,
+            "near_route_rank": self.near_route_rank,
             "motion_quality_rank": self.motion_quality_rank,
             "stop_penalty": self.stop_penalty,
+            "near_physical_reachability_rank": (
+                self.near_physical_reachability_rank
+            ),
+            "full_physical_reachability_rank": (
+                self.full_physical_reachability_rank
+            ),
+            "source_speed_prior_rank": self.source_speed_prior_rank,
+            "absolute_required_acceleration_rank": (
+                self.absolute_required_acceleration_rank
+            ),
             "admission_quality_rank": self.admission_quality_rank,
             "speed_continuity_rank_mps": self.speed_continuity_rank_mps,
             "route_mismatch_rank": self.route_mismatch_rank,
             "ranking_key": [
                 value if math.isfinite(value) else None
                 for value in self.ranking_key
+            ],
+            "current_ranking_key": [
+                value if math.isfinite(value) else None
+                for value in self.current_ranking_key
+            ],
+            "reachability_ranking_key": [
+                value if math.isfinite(value) else None
+                for value in self.reachability_ranking_key
             ],
         }
 
@@ -264,6 +399,13 @@ class CandidateSelection:
     desired_turn: str | None
     selection_reason: str
     ranked_candidates: tuple[RankedCandidate, ...]
+    requested_ranking_policy: CandidateRankingPolicy = (
+        CandidateRankingPolicy.CURRENT
+    )
+    effective_ranking_policy: CandidateRankingPolicy = (
+        CandidateRankingPolicy.CURRENT
+    )
+    ranking_fallback_reason: str | None = None
 
     @property
     def selected(self) -> RankedCandidate:
@@ -280,6 +422,11 @@ class CandidateSelection:
             "selected_admitted": self.selected_admitted,
             "desired_turn": self.desired_turn,
             "selection_reason": self.selection_reason,
+            "requested_ranking_policy": (
+                self.requested_ranking_policy.value
+            ),
+            "effective_ranking_policy": self.effective_ranking_policy.value,
+            "ranking_fallback_reason": self.ranking_fallback_reason,
             "candidate_evaluations": [
                 candidate.to_json_dict() for candidate in self.ranked_candidates
             ],
@@ -326,6 +473,9 @@ def rank_candidate_evaluations(
     navigation_text: str | None,
     prefer_moving: bool,
     current_speed_mps: float | None = None,
+    ranking_policy: CandidateRankingPolicy | str = (
+        CandidateRankingPolicy.CURRENT
+    ),
 ) -> CandidateSelection:
     """Rank all evaluated candidates with safety eligibility first.
 
@@ -340,6 +490,18 @@ def rank_candidate_evaluations(
     indices = [candidate.candidate_index for candidate in candidates]
     if len(set(indices)) != len(indices):
         raise ValueError("candidate indices must be unique")
+    try:
+        requested_policy = CandidateRankingPolicy(ranking_policy)
+    except ValueError as exc:
+        raise ValueError(f"unknown candidate ranking policy: {ranking_policy}") from exc
+    ranking_fallback_reason = None
+    effective_policy = requested_policy
+    if (
+        requested_policy is CandidateRankingPolicy.REACHABILITY_FIRST
+        and not all(candidate.reachability_complete for candidate in candidates)
+    ):
+        effective_policy = CandidateRankingPolicy.CURRENT
+        ranking_fallback_reason = "incomplete_reachability_batch"
 
     desired_turn = navigation_turn_direction(navigation_text)
     current_speed = _finite_or_none(current_speed_mps, "current_speed_mps")
@@ -404,13 +566,36 @@ def rank_candidate_evaluations(
                 candidate.representative_lateral_m,
                 desired_turn,
             )
+        near_route_rank = _ROUTE_QUALITY[candidate.near_term_route_status]
+        near_physical_rank = _PHYSICAL_REACHABILITY_QUALITY[
+            candidate.near_physical_status
+        ]
+        full_physical_rank = _PHYSICAL_REACHABILITY_QUALITY[
+            candidate.full_physical_status
+        ]
+        source_prior_rank = _SOURCE_SPEED_PRIOR_QUALITY[
+            candidate.near_source_speed_prior_status
+        ]
+        required_acceleration_rank = (
+            abs(candidate.near_required_constant_acceleration_mps2)
+            if candidate.near_required_constant_acceleration_mps2 is not None
+            else float("inf")
+        )
         ranked.append(
             RankedCandidate(
                 evaluation=candidate,
+                ranking_policy=effective_policy,
                 category_rank=category,
                 reserve_fragility_rank=reserve_fragility,
+                near_route_rank=near_route_rank,
                 motion_quality_rank=motion_quality,
                 stop_penalty=stop_penalty,
+                near_physical_reachability_rank=near_physical_rank,
+                full_physical_reachability_rank=full_physical_rank,
+                source_speed_prior_rank=source_prior_rank,
+                absolute_required_acceleration_rank=(
+                    required_acceleration_rank
+                ),
                 admission_quality_rank=admission_quality,
                 negative_stopping_reserve_m=reserve_rank,
                 negative_time_to_first_bad_s=time_rank,
@@ -439,12 +624,16 @@ def rank_candidate_evaluations(
         desired_turn=desired_turn,
         selection_reason=reason,
         ranked_candidates=ranked_candidates,
+        requested_ranking_policy=requested_policy,
+        effective_ranking_policy=effective_policy,
+        ranking_fallback_reason=ranking_fallback_reason,
     )
 
 
 __all__ = [
     "ACCEPTED_ADMISSION_STATUSES",
     "CandidateEvaluation",
+    "CandidateRankingPolicy",
     "CandidateSelection",
     "RankedCandidate",
     "navigation_turn_direction",

@@ -2,6 +2,7 @@ import pytest
 
 from module.candidate_selector import (
     CandidateEvaluation,
+    CandidateRankingPolicy,
     navigation_turn_direction,
     rank_candidate_evaluations,
 )
@@ -23,8 +24,13 @@ def _candidate(
     reserve=None,
     time_to_bad=None,
     route_status=None,
+    near_route_status=None,
     branch_match=None,
     route_cross_track=None,
+    near_physical=None,
+    full_physical=None,
+    near_prior=None,
+    required_acceleration=None,
 ):
     return CandidateEvaluation(
         candidate_index=index,
@@ -41,9 +47,16 @@ def _candidate(
         stopping_reserve_status=reserve_status,
         stopping_reserve_m=reserve,
         time_to_first_bad_s=time_to_bad,
+        near_term_route_status=near_route_status,
         full_path_route_status=route_status,
         route_branch_match=branch_match,
         route_cross_track_error_m=route_cross_track,
+        near_physical_status=near_physical,
+        full_physical_status=full_physical,
+        near_source_speed_prior_status=near_prior,
+        near_required_constant_acceleration_mps2=(
+            required_acceleration
+        ),
     )
 
 
@@ -308,3 +321,240 @@ def test_invalid_duplicate_candidate_indices_are_rejected():
             navigation_text=None,
             prefer_moving=False,
         )
+
+
+def test_reachability_policy_prefers_reachable_authorized_candidate():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                motion="MOVING",
+                reserve_status="UNBOUNDED",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="TOO_LONG",
+                full_physical="TOO_LONG",
+                near_prior="ACCELERATION_PRIOR",
+                required_acceleration=3.0,
+                continuity=0.01,
+            ),
+            _candidate(
+                1,
+                motion="MOVING",
+                reserve_status="UNBOUNDED",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="REACHABLE",
+                full_physical="REACHABLE",
+                near_prior="CONSISTENT",
+                required_acceleration=0.1,
+                continuity=3.0,
+            ),
+        ],
+        navigation_text="Turn right.",
+        prefer_moving=True,
+        current_speed_mps=2.0,
+        ranking_policy=CandidateRankingPolicy.REACHABILITY_FIRST,
+    )
+
+    assert selection.selected_index == 1
+    assert (
+        selection.effective_ranking_policy
+        is CandidateRankingPolicy.REACHABILITY_FIRST
+    )
+    assert selection.ranking_fallback_reason is None
+
+
+def test_reachability_policy_never_promotes_rejected_candidate():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                admission="ACCEPT_SAFE_PREFIX",
+                near_route_status="MATCH",
+                route_status="DEVIATE",
+                branch_match=False,
+                near_physical="TOO_LONG",
+                full_physical="TOO_LONG",
+                near_prior="ACCELERATION_PRIOR",
+                required_acceleration=3.0,
+                reserve_status="ROBUST",
+            ),
+            _candidate(
+                1,
+                admission="REJECT_RETAIN_ACTIVE",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="REACHABLE",
+                full_physical="REACHABLE",
+                near_prior="CONSISTENT",
+                required_acceleration=0.0,
+                reserve_status="UNBOUNDED",
+            ),
+        ],
+        navigation_text="Turn right.",
+        prefer_moving=True,
+        current_speed_mps=2.0,
+        ranking_policy="reachability-first",
+    )
+
+    assert selection.selected_index == 0
+    assert selection.selected_admitted
+
+
+def test_reachability_policy_empty_road_stop_guard_precedes_reachability():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                motion="MOVING",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="TOO_LONG",
+                full_physical="REACHABLE",
+                near_prior="ACCELERATION_PRIOR",
+                required_acceleration=2.6,
+            ),
+            _candidate(
+                1,
+                stop=True,
+                motion="EXPLICIT_STOP",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="REACHABLE",
+                full_physical="REACHABLE",
+                near_prior="STOP_PRIOR",
+                required_acceleration=-1.0,
+            ),
+        ],
+        navigation_text="Turn right.",
+        prefer_moving=True,
+        current_speed_mps=1.0,
+        ranking_policy="reachability-first",
+    )
+
+    assert selection.selected_index == 0
+
+
+def test_reachability_policy_allows_arrival_stop_when_motion_is_neutral():
+    selection = rank_candidate_evaluations(
+        [
+            _candidate(
+                0,
+                motion="MOVING",
+                admission="ACCEPT_SAFE_PREFIX",
+                near_route_status="MATCH",
+                route_status="DEVIATE",
+                branch_match=False,
+                near_physical="TOO_LONG",
+                full_physical="TOO_LONG",
+                near_prior="ACCELERATION_PRIOR",
+                required_acceleration=2.6,
+            ),
+            _candidate(
+                1,
+                stop=True,
+                motion="EXPLICIT_STOP",
+                near_route_status="MATCH",
+                route_status="MATCH",
+                branch_match=True,
+                near_physical="REACHABLE",
+                full_physical="REACHABLE",
+                near_prior="STOP_PRIOR",
+                required_acceleration=-1.0,
+            ),
+        ],
+        navigation_text="Stop at the destination.",
+        prefer_moving=False,
+        current_speed_mps=1.0,
+        ranking_policy="reachability-first",
+    )
+
+    assert selection.selected_index == 1
+
+
+def test_incomplete_reachability_batch_falls_back_to_current_key():
+    candidates = [
+        _candidate(
+            0,
+            admission="ACCEPT_FULLY_SAFE",
+            continuity=0.01,
+        ),
+        _candidate(
+            1,
+            admission="ACCEPT_SAFE_PREFIX",
+            near_route_status="MATCH",
+            route_status="MATCH",
+            branch_match=True,
+            near_physical="REACHABLE",
+            full_physical="REACHABLE",
+            near_prior="CONSISTENT",
+            required_acceleration=0.0,
+            continuity=3.0,
+        ),
+    ]
+    current = rank_candidate_evaluations(
+        candidates,
+        navigation_text=None,
+        prefer_moving=False,
+    )
+    reachability = rank_candidate_evaluations(
+        candidates,
+        navigation_text=None,
+        prefer_moving=False,
+        ranking_policy="reachability-first",
+    )
+
+    assert reachability.selected_index == current.selected_index == 0
+    assert (
+        reachability.effective_ranking_policy
+        is CandidateRankingPolicy.CURRENT
+    )
+    assert (
+        reachability.ranking_fallback_reason
+        == "incomplete_reachability_batch"
+    )
+
+
+def test_current_policy_key_is_unchanged_by_additive_reachability_facts():
+    baseline = _candidate(
+        0,
+        motion="MOVING",
+        reserve_status="ROBUST",
+        reserve=4.0,
+        time_to_bad=5.0,
+    )
+    audited = _candidate(
+        0,
+        motion="MOVING",
+        reserve_status="ROBUST",
+        reserve=4.0,
+        time_to_bad=5.0,
+        near_route_status="MATCH",
+        near_physical="TOO_LONG",
+        full_physical="TOO_LONG",
+        near_prior="ACCELERATION_PRIOR",
+        required_acceleration=3.0,
+    )
+    before = rank_candidate_evaluations(
+        [baseline],
+        navigation_text=None,
+        prefer_moving=True,
+        current_speed_mps=2.0,
+    )
+    after = rank_candidate_evaluations(
+        [audited],
+        navigation_text=None,
+        prefer_moving=True,
+        current_speed_mps=2.0,
+    )
+
+    assert (
+        before.selected.current_ranking_key
+        == after.selected.current_ranking_key
+    )
