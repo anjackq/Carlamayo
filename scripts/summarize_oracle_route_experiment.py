@@ -60,6 +60,27 @@ def _stop_go_cycles(speeds: Sequence[float], *, target_speed_mps: float) -> int:
     return cycles
 
 
+def _longest_post_launch_stop_ticks(
+    speeds: Sequence[float],
+    *,
+    target_speed_mps: float,
+) -> int:
+    moving_threshold = min(0.5, max(0.2, target_speed_mps * 0.4))
+    launched = False
+    current = 0
+    longest = 0
+    for speed in speeds:
+        if not launched:
+            launched = speed >= moving_threshold
+            continue
+        if speed <= 0.1:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
 def summarize(events: Sequence[dict[str, Any]], *, source: str | None = None) -> dict[str, Any]:
     start = next(
         (event for event in events if event.get("event_type") == "episode_start"),
@@ -134,6 +155,50 @@ def summarize(events: Sequence[dict[str, Any]], *, source: str | None = None) ->
         (int(event.get("collision_count") or 0) for event in ticks),
         default=int(summary.get("collision_count") or 0),
     )
+    governor_modes = Counter(
+        str(mode)
+        for event in ticks
+        if (
+            mode := _nested_status(
+                event,
+                "controller_debug",
+                "low_speed_longitudinal_governor",
+                "mode",
+            )
+        )
+        is not None
+    )
+    applied_controls = [
+        event.get("applied_control")
+        for event in ticks
+        if isinstance(event.get("applied_control"), dict)
+    ]
+    throttle_ticks = sum(
+        (_finite(control.get("throttle")) or 0.0) > 1e-6
+        for control in applied_controls
+    )
+    brake_ticks = sum(
+        (_finite(control.get("brake")) or 0.0) > 1e-6
+        for control in applied_controls
+    )
+    hard_brake_ticks = sum(
+        (_finite(control.get("brake")) or 0.0) >= 0.2
+        for control in applied_controls
+    )
+    timed_speeds: list[tuple[float, float]] = []
+    for event in ticks:
+        time_value = _finite(event.get("simulation_time_s"))
+        speed_value = _finite(event.get("speed_mps"))
+        if time_value is not None and speed_value is not None:
+            timed_speeds.append((time_value, speed_value))
+    accelerations = [
+        (current_speed - previous_speed) / (current_time - previous_time)
+        for (previous_time, previous_speed), (current_time, current_speed) in zip(
+            timed_speeds,
+            timed_speeds[1:],
+        )
+        if current_time > previous_time
+    ]
     fixture = summary.get("camera_fixture")
     return {
         "source": source,
@@ -162,6 +227,21 @@ def summarize(events: Sequence[dict[str, Any]], *, source: str | None = None) ->
             speeds,
             target_speed_mps=target_speed,
         ),
+        "longest_post_launch_stop_ticks": _longest_post_launch_stop_ticks(
+            speeds,
+            target_speed_mps=target_speed,
+        ),
+        "peak_acceleration_mps2": max(accelerations) if accelerations else None,
+        "peak_deceleration_mps2": (
+            min(accelerations) if accelerations else None
+        ),
+        "applied_throttle_ticks": throttle_ticks,
+        "applied_brake_ticks": brake_ticks,
+        "applied_hard_brake_ticks": hard_brake_ticks,
+        "low_speed_longitudinal_governor": bool(
+            start.get("low_speed_longitudinal_governor", False)
+        ),
+        "low_speed_governor_mode_counts": dict(sorted(governor_modes.items())),
         "controller_state_counts": dict(sorted(controller_states.items())),
         "current_ego_road_status_counts": dict(sorted(road_current_statuses.items())),
         "near_term_route_status_counts": dict(sorted(route_near_statuses.items())),

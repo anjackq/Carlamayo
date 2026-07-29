@@ -9,6 +9,7 @@ def test_oracle_summary_reports_control_and_capture_facts():
             "trajectory_source": "oracle_route",
             "scenario_seed": 0,
             "target_speed_mps": 1.0,
+            "low_speed_longitudinal_governor": True,
         },
         {
             "event_type": "tick",
@@ -20,6 +21,10 @@ def test_oracle_summary_reports_control_and_capture_facts():
             "road_envelope": {"current_ego_road": {"status": "SAFE"}},
             "route_candidate_assessment": {"near_term_route_status": "MATCH"},
             "safety_decision": {"safety_override_applied": False},
+            "applied_control": {"throttle": 0.25, "brake": 0.0},
+            "controller_debug": {
+                "low_speed_longitudinal_governor": {"mode": "TRACKING"}
+            },
         },
         {
             "event_type": "tick",
@@ -31,6 +36,10 @@ def test_oracle_summary_reports_control_and_capture_facts():
             "road_envelope": {"current_ego_road": {"status": "SAFE"}},
             "route_candidate_assessment": {"near_term_route_status": "MATCH"},
             "safety_decision": {"safety_override_applied": True},
+            "applied_control": {"throttle": 0.0, "brake": 1.0},
+            "controller_debug": {
+                "low_speed_longitudinal_governor": {"mode": "COAST"}
+            },
         },
         {
             "event_type": "episode_summary",
@@ -52,6 +61,14 @@ def test_oracle_summary_reports_control_and_capture_facts():
     assert result["safety_override_ticks"] == 1
     assert result["fixture_captured"] is True
     assert result["fixture_id"] == "abc"
+    assert result["low_speed_longitudinal_governor"] is True
+    assert result["low_speed_governor_mode_counts"] == {
+        "COAST": 1,
+        "TRACKING": 1,
+    }
+    assert result["applied_throttle_ticks"] == 1
+    assert result["applied_brake_ticks"] == 1
+    assert result["applied_hard_brake_ticks"] == 1
 
 
 def test_oracle_summary_counts_a_restart_after_a_full_stop():
@@ -72,3 +89,4 @@ def test_oracle_summary_counts_a_restart_after_a_full_stop():
     result = summarize(events)
 
     assert result["stop_go_cycle_count"] == 1
+    assert result["longest_post_launch_stop_ticks"] == 1
